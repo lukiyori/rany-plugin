@@ -24,6 +24,11 @@ conversation. Both are snowflakes; a wake-up notice from RANY prints them togeth
 5. `comment_task({ guildId, taskId, content })` with what you actually did: the change, the
    result of running it, and anything you deliberately left alone. If you could not do it, that
    comment is where you say why and what you need — silence on a task reads as it being ignored.
+6. **Move the card.** `set_task_status({ guildId, taskId, statusId })` using the ids `get_task`
+   returned: a `done` status when the work is finished, `in_progress` when you have taken it on but
+   it will outlast this turn, `waiting` when you are blocked on someone's answer. A task reported
+   finished in a comment while the board still says open leaves the board lying to everyone who
+   reads it — and the board is what people trust, not the comment thread.
 
 The comment is posted as the persona, under its own name. It is visible to everyone who can see
 the task, so write it for them, not as a log for yourself: short, concrete, no internal paths.

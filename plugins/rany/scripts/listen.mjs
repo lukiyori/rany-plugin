@@ -262,7 +262,8 @@ function classify(type, d) {
       `  task ${d.id} in guild ${guildId} — "${d.title ?? '(untitled)'}"`,
       ``,
       `Read it with the rany MCP tool get_task({guildId:"${guildId}", taskId:"${d.id}"}), do the work`,
-      `in this project, and report what you did with comment_task on the same task. If it is not`,
+      `in this project, report what you did with comment_task, and move the card with`,
+      `set_task_status (get_task lists the board's statuses and their categories). If it is not`,
       `about this project, say so in the comment instead of guessing.`,
     ].join('\n')
   }
