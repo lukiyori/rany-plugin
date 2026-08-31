@@ -53,6 +53,10 @@ const saidFile = join(projectState, 'said.json')
  */
 const bindFile = join(homedir(), '.rany-plugin', 'bindings.json')
 
+/** RANY's notification bot (db/0251 seeds it at the reserved id 1). Its DMs restate events the
+ *  gateway already delivered, so they are never a reason to wake. */
+const SYSTEM_BOT_ID = '1'
+
 /** Compare paths, not strings. Windows hands the same directory back as `E:\Works\x` or `E:/Works/x`
  *  depending on who asked, and a case difference in a drive letter is not a different repository —
  *  a binding that fails on punctuation is worse than no binding at all. */
@@ -405,6 +409,16 @@ function classify(type, d) {
   // it was added to. Always its own conversation, never eavesdropping.
   if (!isGuild && recipients.includes(personaUserId)) {
     if (!config.wake.sessions) return null
+    // ...unless RANY's own notification bot wrote it. Those DMs mirror events the gateway ALREADY
+    // delivered (a task assignment arrives as TASK_UPDATED, which is routed by board), so waking on
+    // them announces the same thing twice — and, being a DM rather than a guild event, the second
+    // copy carries no board and cannot be routed at all. That is how one assignment came to wake
+    // every open session on the machine while the task itself was routed correctly: the notice and
+    // the routing were two different events. A notification is not a conversation.
+    if (String(d.authorId ?? '') === SYSTEM_BOT_ID) {
+      logRoute('MESSAGE_CREATED', { channelId: d.channelId, authorId: d.authorId }, 'skip (notification bot)')
+      return null
+    }
     return [
       `RANY: a message in your persona's own chat (channel ${d.channelId}).`,
       `  user ${d.authorId}: ${d.content ?? ''}`,
