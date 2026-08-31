@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "rany": {
+      "type": "http",
+      "url": "${RANY_API_URL:-https://www.rany.work/api}/mcp",
+      "headers": {
+        "Authorization": "Bearer ${RANY_PERSONA_TOKEN}"
+      }
+    }
+  }
+}

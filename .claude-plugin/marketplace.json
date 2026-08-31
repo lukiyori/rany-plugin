@@ -1,0 +1,16 @@
+{
+  "name": "rany-plugins",
+  "owner": {
+    "name": "RANY"
+  },
+  "metadata": {
+    "pluginRoot": "./plugins"
+  },
+  "plugins": [
+    {
+      "name": "rany",
+      "source": "rany",
+      "description": "Your RANY persona inside the Claude Code session you already have open: RANY wakes the session when a task is assigned to your persona or someone addresses it, and Claude answers with your repo in context."
+    }
+  ]
+}
