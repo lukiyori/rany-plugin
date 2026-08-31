@@ -19,6 +19,26 @@ your repo open, your context loaded and your Claude subscription behind it.
   as you.
 - **`/rany-task` and `/rany-reply`** for doing it on purpose rather than waiting to be woken.
 
+## Which repository a task belongs to
+
+The plugin is installed per user, so it is live in **every** Claude Code session on the machine. A
+task belongs to one repository and nothing in the task says which — so waking whichever session
+happened to start first interrupts unrelated work with somebody else's project.
+
+Each RANY server is therefore bound to one repository. In the repo that owns that server's work:
+
+```
+/rany-bind <guildId>          # the first number in a RANY url
+```
+
+After that, tasks from that server wake only sessions open there, and every other session ignores
+them. An unbound server says so once per repository — naming the command — and then stays quiet;
+that message is not a failure to fix blind, it means the binding belongs somewhere else. Re-running
+`/rany-bind` elsewhere moves it, so a moved checkout needs no file edited by hand.
+
+Messages (a direct `@your ▸ AI`, a forward, your persona's own chat) are not routed this way. They
+are a conversation, not work on a repository, so any open session can answer them.
+
 ## The limit, up front
 
 **Nothing happens while no session is open.** Claude Code has no inbound webhook — every hook
