@@ -64,9 +64,10 @@ function loadBindings() {
 }
 
 /**
- * Which repository claims this id, if any. An id may be a BOARD or a GUILD: a board is the precise
- * unit, but not every event carries one — a guild mention or a task comment names only the guild — and
- * a guild binding is the honest answer for a server that is one project.
+ * Which repository claims this id, if any. One map holds both kinds, because RANY makes them the same
+ * number: a guild's DEFAULT board carries the guild's own id. What the id MEANS is decided by the
+ * caller — tasks look up the board and only the board; guild conversations, which carry no board id at
+ * all, look up the guild. Never one falling back to the other: see the task branch for why.
  */
 function claimedBy(id) {
   return id ? loadBindings()[String(id)] : undefined
@@ -304,11 +305,14 @@ function classify(type, d) {
     // Keyed by BOARD, not guild: a guild is a company or a community and holds many projects, while
     // a board is the closest thing RANY has to one. (They coincide while a guild has only its
     // default board, which is exactly the case that would make a guild binding look correct.)
-    // The board is the precise unit, but a GUILD binding is accepted as a fallback: someone whose
-    // server is one project binds the server and expects that to hold, and an id copied from RANY is
-    // easy to mistake for the other kind. A board binding still wins where both exist.
+    // BOARD ONLY. There is deliberately no guild fallback here, and the reason is a trap in the data:
+    // a guild's DEFAULT board carries the guild's own id (`tasks.task_boards.id = guild_id` for it).
+    // So "I bound the board" and "I bound the server" are the same keystrokes, and a guild fallback
+    // would make binding the default board silently claim every board added to that server later —
+    // waking a repository with work it never claimed, which is the exact complaint board routing
+    // exists to answer. A second board is a second project until someone says otherwise.
     const boardId = String(d.boardId ?? '')
-    const boundTo = claimedBy(boardId) ?? claimedBy(guildId)
+    const boundTo = claimedBy(boardId)
 
     // ONLY the bound project. An unbound board wakes nobody at all — not "everybody once".
     //

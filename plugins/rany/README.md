@@ -43,9 +43,11 @@ session that by definition cannot tell whether the task is its own. The sighting
 instead: `/rany-bind` with no argument lists boards that have had work assigned and are bound to
 nothing. Binding a board elsewhere moves it, so a moved checkout needs no file edited by hand.
 
-A **server id is accepted too**, and claims everything in it — bind the server when it really is one
-project. It is also the only thing that can route a *conversation*: a message names a guild, never a
-board, so a board binding cannot decide whose it is. A board binding wins wherever both exist.
+A **server id is accepted too**, but it routes *conversations only* — a message names a server, never
+a board, so a board binding cannot decide whose it is. It never routes tasks: RANY gives a server's
+DEFAULT board the server's own id, so binding that board and binding the server are the same
+keystrokes, and letting the server id claim tasks would silently hand a second board's work to
+whoever bound the first one. An unbound board wakes nobody, however its server is bound.
 
 Messages in a **claimed** server go only to the repository that claims it. Messages in a server
 nobody has claimed still wake any open session — a conversation with no owner is better answered
