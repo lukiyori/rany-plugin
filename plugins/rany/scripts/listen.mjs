@@ -19,7 +19,7 @@
 // Zero dependencies on purpose — a plugin that needs `npm install` before it works is a plugin
 // most people never finish installing. Node 22's global WebSocket is all this needs.
 
-import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync } from 'node:fs'
+import { readFileSync, writeFileSync, appendFileSync, unlinkSync, existsSync, mkdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { homedir, tmpdir } from 'node:os'
 import { createHash } from 'node:crypto'
@@ -63,6 +63,32 @@ function loadBindings() {
   try { return JSON.parse(readFileSync(bindFile, 'utf8')).boards ?? {} } catch { return {} }
 }
 
+/**
+ * Which repository claims this id, if any. An id may be a BOARD or a GUILD: a board is the precise
+ * unit, but not every event carries one — a guild mention or a task comment names only the guild — and
+ * a guild binding is the honest answer for a server that is one project.
+ */
+function claimedBy(id) {
+  return id ? loadBindings()[String(id)] : undefined
+}
+
+/** Is this repository the one that claims it? */
+const claimedHere = (owner) => Boolean(owner) && samePath(owner, projectDir)
+
+/**
+ * Why this session did (or did not) wake, appended for every routed event. The routing bug that
+ * survived two fixes was impossible to diagnose after the fact: the listener EXITS when it wakes, so
+ * there is no process left to ask, and the notice on screen never said which project it decided it
+ * belonged to. One line per decision, in the shared directory, so a wake in the wrong repo can be
+ * traced instead of argued about. Best-effort — a failure here must never affect routing.
+ */
+function logRoute(type, ids, decision) {
+  try {
+    const line = `${new Date().toISOString()} ${type} ${JSON.stringify(ids)} -> ${decision} @ ${projectDir}\n`
+    appendFileSync(join(homedir(), '.rany-plugin', 'routing.log'), line)
+  } catch { /* diagnostics are not worth an interruption */ }
+}
+
 /** Boards seen on an assignment but bound to nothing — the list `--bind` prints with no argument.
  *  Written beside the bindings for the same reason: any process must be able to find it. */
 const unroutedFile = join(homedir(), '.rany-plugin', 'unrouted.json')
@@ -102,14 +128,16 @@ function listUnrouted() {
   process.stdout.write('\nRun /rany-bind <boardId> in the repository that owns that board.\n')
 }
 
-/** `--bind <boardId>`: run in the repo that owns that board's work. */
+/** `--bind <id>`: run in the repo that owns that work. The id may be a BOARD or a GUILD — a board is
+ *  the precise unit, a guild claims everything in a server that is one project (and covers the guild
+ *  conversations a board id can never match). Both live in the same map; a board binding wins. */
 function bindBoard(boardId) {
   const boards = loadBindings()
   boards[boardId] = projectDir
   try {
     mkdirSync(dirname(bindFile), { recursive: true })
     writeFileSync(bindFile, JSON.stringify({ boards }, null, 2))
-    process.stdout.write(`RANY: board ${boardId} is now handled in ${projectDir}\n`)
+    process.stdout.write(`RANY: ${boardId} is now handled in ${projectDir}\n`)
   } catch (e) {
     process.stdout.write(`RANY: could not save the binding (${e?.message ?? e})\n`)
   }
@@ -276,8 +304,11 @@ function classify(type, d) {
     // Keyed by BOARD, not guild: a guild is a company or a community and holds many projects, while
     // a board is the closest thing RANY has to one. (They coincide while a guild has only its
     // default board, which is exactly the case that would make a guild binding look correct.)
+    // The board is the precise unit, but a GUILD binding is accepted as a fallback: someone whose
+    // server is one project binds the server and expects that to hold, and an id copied from RANY is
+    // easy to mistake for the other kind. A board binding still wins where both exist.
     const boardId = String(d.boardId ?? '')
-    const boundTo = boardId ? loadBindings()[boardId] : undefined
+    const boundTo = claimedBy(boardId) ?? claimedBy(guildId)
 
     // ONLY the bound project. An unbound board wakes nobody at all — not "everybody once".
     //
@@ -289,10 +320,12 @@ function classify(type, d) {
     //
     // Nothing is lost, though: the sighting is recorded, and `/rany-bind` with no argument prints
     // what has been seen and never routed. Silence here is not the same as forgetting.
-    if (!boundTo || !samePath(boundTo, projectDir)) {
+    if (!claimedHere(boundTo)) {
       if (!boundTo) noteUnrouted(boardId, guildId, d)
+      logRoute('TASK_UPDATED', { boardId, guildId }, boundTo ? `skip (owned by ${boundTo})` : 'skip (unbound)')
       return null
     }
+    logRoute('TASK_UPDATED', { boardId, guildId }, 'wake')
 
     return [
       `RANY: a task was assigned to your persona.`,
@@ -324,6 +357,28 @@ function classify(type, d) {
   const recipients = Array.isArray(d.recipientIds) ? d.recipientIds : []
   const mentions = Array.isArray(d.mentions) ? d.mentions : []
   const isGuild = typeof d.guildId === 'string' && d.guildId.length > 0
+
+  // A guild message belongs to a guild, and a guild can be CLAIMED by a repository. If it is, only
+  // that repository hears it; every other session stays quiet.
+  //
+  // This was the hole the board routing left open. Tasks were routed and messages were not, on the
+  // reasoning that a message is "a conversation, not work on a repository, so any open session can
+  // answer". That reasoning does not survive contact: someone writing to your persona in a project's
+  // guild — a question about a task, a review request — IS that project's work, and answering it from
+  // an unrelated checkout is the same interruption, with the same session that cannot tell.
+  //
+  // Unclaimed guilds keep the old behaviour deliberately: if no repository has said "this server is
+  // mine", any session may answer, because a conversation nobody claims is better answered than
+  // dropped. Silence is only the right default once someone has claimed the work.
+  if (isGuild) {
+    const owner = claimedBy(d.guildId)
+    if (owner && !claimedHere(owner)) {
+      logRoute('MESSAGE_CREATED', { guildId: d.guildId, channelId: d.channelId }, `skip (owned by ${owner})`)
+      return null
+    }
+    logRoute('MESSAGE_CREATED', { guildId: d.guildId, channelId: d.channelId },
+      owner ? 'wake' : 'wake (guild unclaimed)')
+  }
 
   // The persona is itself a member of the conversation: a session with your owner, or a group DM
   // it was added to. Always its own conversation, never eavesdropping.

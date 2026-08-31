@@ -43,8 +43,23 @@ session that by definition cannot tell whether the task is its own. The sighting
 instead: `/rany-bind` with no argument lists boards that have had work assigned and are bound to
 nothing. Binding a board elsewhere moves it, so a moved checkout needs no file edited by hand.
 
-Messages (a direct `@your ▸ AI`, a forward, your persona's own chat) are not routed this way. They
-are a conversation, not work on a repository, so any open session can answer them.
+A **server id is accepted too**, and claims everything in it — bind the server when it really is one
+project. It is also the only thing that can route a *conversation*: a message names a guild, never a
+board, so a board binding cannot decide whose it is. A board binding wins wherever both exist.
+
+Messages in a **claimed** server go only to the repository that claims it. Messages in a server
+nobody has claimed still wake any open session — a conversation with no owner is better answered
+than dropped. (Earlier versions routed tasks and left every message unrouted, on the reasoning that
+a conversation is not repository work. It does not hold: someone asking your persona about a task in
+a project's server IS that project's work, and answering it from an unrelated checkout is the same
+interruption.) DMs, persona sessions and forwards have no guild and stay unrouted by design.
+
+Every routing decision is appended to `~/.rany-plugin/routing.log` — the event, the ids, whether it
+woke, and which repository claims it. The listener exits when it wakes, so without the log a wake in
+the wrong repo cannot be diagnosed after the fact.
+
+**Updating the plugin does not change a session that is already open.** The listener is spawned from
+a versioned path, so a session running when you updated keeps the old one until it is restarted.
 
 ## The limit, up front
 

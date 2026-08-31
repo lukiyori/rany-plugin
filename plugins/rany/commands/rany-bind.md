@@ -30,6 +30,11 @@ projects; a board is the closest thing RANY has to one. (While a server has only
 the two coincide — which is exactly the case that would make binding the server look correct, right
 up until someone adds a second board.)
 
+A **server id is accepted too**, and claims everything in it. Bind the server when it really is one
+project — and note that a server binding is the only thing that can route a *conversation*: someone
+writing to your persona in a channel names a guild, never a board, so a board binding cannot decide
+whose that message is. A board binding still wins wherever both exist.
+
 Binding a board that is already bound elsewhere moves it — the last `/rany-bind` wins, deliberately,
 so a moved checkout needs no file edited by hand.
 
