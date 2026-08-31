@@ -85,10 +85,27 @@ const claimedHere = (owner) => Boolean(owner) && samePath(owner, projectDir)
  */
 function logRoute(type, ids, decision) {
   try {
-    const line = `${new Date().toISOString()} ${type} ${JSON.stringify(ids)} -> ${decision} @ ${projectDir}\n`
+    const line = `${new Date().toISOString()} v${VERSION} ${type} ${JSON.stringify(ids)} -> ${decision} @ ${projectDir}\n`
     appendFileSync(join(homedir(), '.rany-plugin', 'routing.log'), line)
   } catch { /* diagnostics are not worth an interruption */ }
 }
+
+/**
+ * This listener's own plugin version, stamped on every routed decision.
+ *
+ * Not decoration. Updating the plugin does NOT change a session that is already open: the hook spawns
+ * the listener from a VERSIONED path, so a long-running session keeps whatever it loaded, forever, and
+ * early versions had no routing at all — they woke every session for every task. Such a process is
+ * invisible here (it predates this log), so the absence of a project from the log is itself the
+ * signal: a wake that no line explains came from a stale listener, and only restarting that session
+ * fixes it.
+ */
+const VERSION = (() => {
+  try {
+    const here = dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'))
+    return JSON.parse(readFileSync(join(here, '..', '.claude-plugin', 'plugin.json'), 'utf8')).version ?? '?'
+  } catch { return '?' }
+})()
 
 /** Boards seen on an assignment but bound to nothing — the list `--bind` prints with no argument.
  *  Written beside the bindings for the same reason: any process must be able to find it. */

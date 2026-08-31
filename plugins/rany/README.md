@@ -60,8 +60,15 @@ Every routing decision is appended to `~/.rany-plugin/routing.log` — the event
 woke, and which repository claims it. The listener exits when it wakes, so without the log a wake in
 the wrong repo cannot be diagnosed after the fact.
 
-**Updating the plugin does not change a session that is already open.** The listener is spawned from
-a versioned path, so a session running when you updated keeps the old one until it is restarted.
+**Updating the plugin does not change a session that is already open — restart it.** The listener is
+spawned from a VERSIONED path, so a session that was running when you updated keeps the version it
+loaded, indefinitely. This is not cosmetic: versions before 0.2.0 had no routing at all and woke
+every open session for every task, and a session still running one of those ignores every fix.
+
+Such a listener is invisible in `routing.log`, because it predates the log. So the absence of a line
+is the diagnosis: **a wake that no log line explains came from a stale listener**, and only restarting
+that session stops it. Deleting the old version directories under
+`~/.claude/plugins/cache/rany-plugins/rany/` also stops one immediately — the spawn simply fails.
 
 ## The limit, up front
 
