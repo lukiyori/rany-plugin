@@ -235,6 +235,12 @@ function classify(type, d) {
         ``,
         `If it does: /rany-bind ${boardId} — then that board's tasks wake THIS project and no other.`,
         `If it does not: run that in the repository that owns it. Until then I stay out of the way.`,
+        ``,
+        // The ids ride along, because the event that carried them is gone by the time anyone binds
+        // and it is never redelivered — so without this the FIRST task on a board is always lost and
+        // has to be re-assigned by hand just to produce a second notice.
+        `Either way the task itself is not lost — once bound, act on it now:`,
+        `  get_task({guildId:"${guildId}", taskId:"${d.id}"})`,
       ].join('\n'))
     }
 
