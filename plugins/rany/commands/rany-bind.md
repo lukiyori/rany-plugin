@@ -5,13 +5,15 @@ description: Claim a RANY task board's work for the repository this session is o
 
 # Bind a task board to this repository
 
-Argument: `<boardId>`. You do not have to go looking for it — a board id is not in any URL, so the
-first unrouted task prints this command with the id already filled in.
+Argument: `<boardId>`, copied from RANY — the board header has an ID button next to the board
+switcher. **With no argument** it instead lists the boards that have had work assigned but are bound
+to nothing, so you can see what is waiting.
 
 Run:
 
 ```
 node "${CLAUDE_PLUGIN_ROOT}/scripts/listen.mjs" --bind <boardId>
+node "${CLAUDE_PLUGIN_ROOT}/scripts/listen.mjs" --bind            # list unrouted boards
 ```
 
 Report the line it prints, and nothing more — no summary, no next steps.
@@ -31,5 +33,7 @@ up until someone adds a second board.)
 Binding a board that is already bound elsewhere moves it — the last `/rany-bind` wins, deliberately,
 so a moved checkout needs no file edited by hand.
 
-An unbound board says so once per repository and then stays quiet. That is not a failure to fix
-blind: run this in the repository that actually owns that work.
+**An unbound board wakes nobody.** Not "everybody once" — announcing it in every open session
+interrupts N unrelated pieces of work to solve a discovery problem, and solves it in the worst
+place: a session that by definition cannot tell whether the task is its own. The sighting is
+recorded instead, and `--bind` with no argument prints it. Silence here is not forgetting.

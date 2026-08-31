@@ -63,6 +63,45 @@ function loadBindings() {
   try { return JSON.parse(readFileSync(bindFile, 'utf8')).boards ?? {} } catch { return {} }
 }
 
+/** Boards seen on an assignment but bound to nothing — the list `--bind` prints with no argument.
+ *  Written beside the bindings for the same reason: any process must be able to find it. */
+const unroutedFile = join(homedir(), '.rany-plugin', 'unrouted.json')
+
+/** Remember a board nobody claimed, so silence does not mean the task was forgotten. Keyed by
+ *  board: the newest sighting replaces the last, since what you need is "which board, and what was
+ *  the most recent thing on it", not an audit log. */
+function noteUnrouted(boardId, guildId, d) {
+  if (!boardId) return
+  let seen = {}
+  try { seen = JSON.parse(readFileSync(unroutedFile, 'utf8')).boards ?? {} } catch { /* first one */ }
+  seen[boardId] = {
+    guildId,
+    lastTaskId: String(d.id ?? ''),
+    lastTitle: String(d.title ?? ''),
+    lastSeen: new Date().toISOString(),
+  }
+  try {
+    mkdirSync(dirname(unroutedFile), { recursive: true })
+    writeFileSync(unroutedFile, JSON.stringify({ boards: seen }, null, 2))
+  } catch { /* unwritable: the sighting is lost, the silence is not */ }
+}
+
+/** `--bind` with no argument: what has been seen and never routed. */
+function listUnrouted() {
+  let seen = {}
+  try { seen = JSON.parse(readFileSync(unroutedFile, 'utf8')).boards ?? {} } catch { /* none */ }
+  const bound = loadBindings()
+  const rows = Object.entries(seen).filter(([id]) => !bound[id])
+  if (rows.length === 0) {
+    process.stdout.write('RANY: no unrouted boards seen. Copy a board id from RANY (board header → ID) to bind one.\n')
+    return
+  }
+  process.stdout.write('RANY: boards seen on an assignment but bound to no repository:\n')
+  for (const [id, v] of rows)
+    process.stdout.write(`  ${id}  — last: "${v.lastTitle}" (${v.lastSeen.slice(0, 16).replace('T', ' ')})\n`)
+  process.stdout.write('\nRun /rany-bind <boardId> in the repository that owns that board.\n')
+}
+
 /** `--bind <boardId>`: run in the repo that owns that board's work. */
 function bindBoard(boardId) {
   const boards = loadBindings()
@@ -154,8 +193,11 @@ function releaseLock() {
 const bindAt = process.argv.indexOf('--bind')
 if (bindAt !== -1) {
   const boardId = process.argv[bindAt + 1]
-  if (!boardId || !/^[0-9]+$/.test(boardId)) {
-    process.stdout.write('RANY: --bind needs a board id — the wake-up notice prints the command with it filled in\n')
+  // No argument: show what has gone unrouted rather than erroring. That is the question someone
+  // actually has when they reach for this command with nothing in hand.
+  if (!boardId) { listUnrouted(); process.exit(QUIET) }
+  if (!/^[0-9]+$/.test(boardId)) {
+    process.stdout.write('RANY: --bind needs a board id (RANY → board header → ID), or no argument to list unrouted boards\n')
     process.exit(QUIET)
   }
   bindBoard(boardId)
@@ -236,25 +278,20 @@ function classify(type, d) {
     // default board, which is exactly the case that would make a guild binding look correct.)
     const boardId = String(d.boardId ?? '')
     const boundTo = boardId ? loadBindings()[boardId] : undefined
-    if (boundTo && !samePath(boundTo, projectDir)) return null
-    if (!boundTo) {
-      // Nothing bound yet. Said once per board per project, rather than waking every open session
-      // for every task or silently dropping the first one — and it carries the exact command,
-      // because a board id is not in any URL and nobody should have to go find it.
-      return sayOnce(`unbound:${boardId}`, [
-        `RANY: "${d.title ?? 'a task'}" was assigned to your persona, but no repository is bound to`,
-        `its board (${boardId || 'unknown'}), so I cannot tell whether it belongs to this one:`,
-        `  ${projectDir}`,
-        ``,
-        `If it does: /rany-bind ${boardId} — then that board's tasks wake THIS project and no other.`,
-        `If it does not: run that in the repository that owns it. Until then I stay out of the way.`,
-        ``,
-        // The ids ride along, because the event that carried them is gone by the time anyone binds
-        // and it is never redelivered — so without this the FIRST task on a board is always lost and
-        // has to be re-assigned by hand just to produce a second notice.
-        `Either way the task itself is not lost — once bound, act on it now:`,
-        `  get_task({guildId:"${guildId}", taskId:"${d.id}"})`,
-      ].join('\n'))
+
+    // ONLY the bound project. An unbound board wakes nobody at all — not "everybody once".
+    //
+    // The earlier version announced itself in every open session so the first task on a new board
+    // would not be silently dropped. That reasoning was wrong twice over: it interrupts N unrelated
+    // pieces of work to solve a discovery problem, and it solves it in the worst possible place —
+    // a session that by definition cannot tell whether the task is its own. Discovery belongs in
+    // RANY, where the board's Copy ID button now sits, not in an interruption.
+    //
+    // Nothing is lost, though: the sighting is recorded, and `/rany-bind` with no argument prints
+    // what has been seen and never routed. Silence here is not the same as forgetting.
+    if (!boundTo || !samePath(boundTo, projectDir)) {
+      if (!boundTo) noteUnrouted(boardId, guildId, d)
+      return null
     }
 
     return [

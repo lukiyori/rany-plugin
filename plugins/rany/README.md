@@ -34,11 +34,14 @@ adds a second board.) In the repo that owns a board's work:
 /rany-bind <boardId>
 ```
 
-You never have to hunt for the id: a board id is in no URL, so the first unrouted task prints the
-command with it filled in. After that, tasks from that board wake only sessions open there, and
-every other session ignores them. An unbound board says so once per repository and then stays quiet;
-that message means the binding belongs somewhere else, not that something is broken here. Binding it
-elsewhere moves it, so a moved checkout needs no file edited by hand.
+The id is on the board header in RANY, next to the board switcher (ID button). Tasks from a bound
+board wake only sessions open in that repository; every other session ignores them.
+
+**An unbound board wakes nobody at all.** Announcing it in every open session would interrupt N
+unrelated pieces of work to solve a discovery problem, and would do it in the worst place — a
+session that by definition cannot tell whether the task is its own. The sighting is recorded
+instead: `/rany-bind` with no argument lists boards that have had work assigned and are bound to
+nothing. Binding a board elsewhere moves it, so a moved checkout needs no file edited by hand.
 
 Messages (a direct `@your ▸ AI`, a forward, your persona's own chat) are not routed this way. They
 are a conversation, not work on a repository, so any open session can answer them.
