@@ -25,16 +25,20 @@ The plugin is installed per user, so it is live in **every** Claude Code session
 task belongs to one repository and nothing in the task says which — so waking whichever session
 happened to start first interrupts unrelated work with somebody else's project.
 
-Each RANY server is therefore bound to one repository. In the repo that owns that server's work:
+The unit is the **board**. A RANY server is a company or a community and holds many projects; a
+board is the closest thing RANY has to one. (While a server has only its default board the two
+coincide, which is exactly the case that would make binding the server look correct — until someone
+adds a second board.) In the repo that owns a board's work:
 
 ```
-/rany-bind <guildId>          # the first number in a RANY url
+/rany-bind <boardId>
 ```
 
-After that, tasks from that server wake only sessions open there, and every other session ignores
-them. An unbound server says so once per repository — naming the command — and then stays quiet;
-that message is not a failure to fix blind, it means the binding belongs somewhere else. Re-running
-`/rany-bind` elsewhere moves it, so a moved checkout needs no file edited by hand.
+You never have to hunt for the id: a board id is in no URL, so the first unrouted task prints the
+command with it filled in. After that, tasks from that board wake only sessions open there, and
+every other session ignores them. An unbound board says so once per repository and then stays quiet;
+that message means the binding belongs somewhere else, not that something is broken here. Binding it
+elsewhere moves it, so a moved checkout needs no file edited by hand.
 
 Messages (a direct `@your ▸ AI`, a forward, your persona's own chat) are not routed this way. They
 are a conversation, not work on a repository, so any open session can answer them.

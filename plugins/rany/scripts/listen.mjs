@@ -35,28 +35,29 @@ const stateDir = process.env.CLAUDE_PLUGIN_DATA || join(tmpdir(), 'rany-plugin')
  * WHICH project this session is. The plugin is installed per user, so it is live in every session
  * on the machine — and a task belongs to one repository, not to whichever session happened to
  * start first. Everything that is per-session (the lock, the say-once marker) is therefore keyed
- * by project, and the guild→project bindings below decide whose task this is.
+ * by project, and the board→project bindings below decide whose task this is.
  */
 const projectDir = process.env.CLAUDE_PROJECT_DIR || process.cwd()
 const projectKey = createHash('sha256').update(projectDir).digest('hex').slice(0, 16)
 const projectState = join(stateDir, 'projects', projectKey)
 const pidFile = join(projectState, 'listener.pid')
 const saidFile = join(projectState, 'said.json')
-/** Shared across projects: one guild's tasks belong to one repository. */
+/** Shared across projects: one BOARD's tasks belong to one repository. A board is the closest
+ *  thing RANY has to a project — a guild is a company or a community and holds many. */
 const bindFile = join(stateDir, 'bindings.json')
 
 function loadBindings() {
-  try { return JSON.parse(readFileSync(bindFile, 'utf8')).guilds ?? {} } catch { return {} }
+  try { return JSON.parse(readFileSync(bindFile, 'utf8')).boards ?? {} } catch { return {} }
 }
 
-/** `--bind <guildId>`: run in the repo that owns that guild's work. */
-function bindGuild(guildId) {
-  const guilds = loadBindings()
-  guilds[guildId] = projectDir
+/** `--bind <boardId>`: run in the repo that owns that board's work. */
+function bindBoard(boardId) {
+  const boards = loadBindings()
+  boards[boardId] = projectDir
   try {
     mkdirSync(dirname(bindFile), { recursive: true })
-    writeFileSync(bindFile, JSON.stringify({ guilds }, null, 2))
-    process.stdout.write(`RANY: guild ${guildId} is now handled in ${projectDir}\n`)
+    writeFileSync(bindFile, JSON.stringify({ boards }, null, 2))
+    process.stdout.write(`RANY: board ${boardId} is now handled in ${projectDir}\n`)
   } catch (e) {
     process.stdout.write(`RANY: could not save the binding (${e?.message ?? e})\n`)
   }
@@ -136,15 +137,15 @@ function releaseLock() {
   } catch { /* nothing to do */ }
 }
 
-/** `--bind <guildId>`: claim that guild's tasks for THIS repository. */
+/** `--bind <boardId>`: claim that board's tasks for THIS repository. */
 const bindAt = process.argv.indexOf('--bind')
 if (bindAt !== -1) {
-  const guildId = process.argv[bindAt + 1]
-  if (!guildId || !/^[0-9]+$/.test(guildId)) {
-    process.stdout.write('RANY: --bind needs a guild id (the first number in a RANY url)\n')
+  const boardId = process.argv[bindAt + 1]
+  if (!boardId || !/^[0-9]+$/.test(boardId)) {
+    process.stdout.write('RANY: --bind needs a board id — the wake-up notice prints the command with it filled in\n')
     process.exit(QUIET)
   }
-  bindGuild(guildId)
+  bindBoard(boardId)
   process.exit(QUIET)
 }
 
@@ -217,17 +218,22 @@ function classify(type, d) {
 
     // WHOSE task is this? A session open in an unrelated repository can do nothing useful with it,
     // and waking it is worse than silence — it interrupts one piece of work with another project's.
-    // So the guild must be bound to THIS project.
-    const boundTo = loadBindings()[guildId]
+    // Keyed by BOARD, not guild: a guild is a company or a community and holds many projects, while
+    // a board is the closest thing RANY has to one. (They coincide while a guild has only its
+    // default board, which is exactly the case that would make a guild binding look correct.)
+    const boardId = String(d.boardId ?? '')
+    const boundTo = boardId ? loadBindings()[boardId] : undefined
     if (boundTo && boundTo !== projectDir) return null
     if (!boundTo) {
-      // Nothing bound yet. Said once per project, rather than waking every open session for every
-      // task or silently dropping the first one — and it names the command that fixes it.
-      return sayOnce(`unbound:${guildId}`, [
-        `RANY: a task was assigned to your persona, but no repository is bound to guild ${guildId},`,
-        `so I cannot tell whether it belongs to this one (${projectDir}).`,
+      // Nothing bound yet. Said once per board per project, rather than waking every open session
+      // for every task or silently dropping the first one — and it carries the exact command,
+      // because a board id is not in any URL and nobody should have to go find it.
+      return sayOnce(`unbound:${boardId}`, [
+        `RANY: "${d.title ?? 'a task'}" was assigned to your persona, but no repository is bound to`,
+        `its board (${boardId || 'unknown'}), so I cannot tell whether it belongs to this one:`,
+        `  ${projectDir}`,
         ``,
-        `If it does: /rany-bind ${guildId} — then that guild's tasks wake THIS project and no other.`,
+        `If it does: /rany-bind ${boardId} — then that board's tasks wake THIS project and no other.`,
         `If it does not: run that in the repository that owns it. Until then I stay out of the way.`,
       ].join('\n'))
     }
