@@ -21,7 +21,7 @@
 
 import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { createHash } from 'node:crypto'
 
 const WAKE = 2   // exit code asyncRewake watches for
@@ -42,9 +42,22 @@ const projectKey = createHash('sha256').update(projectDir).digest('hex').slice(0
 const projectState = join(stateDir, 'projects', projectKey)
 const pidFile = join(projectState, 'listener.pid')
 const saidFile = join(projectState, 'said.json')
-/** Shared across projects: one BOARD's tasks belong to one repository. A board is the closest
- *  thing RANY has to a project — a guild is a company or a community and holds many. */
-const bindFile = join(stateDir, 'bindings.json')
+/**
+ * Shared across projects: one BOARD's tasks belong to one repository. A board is the closest thing
+ * RANY has to a project — a guild is a company or a community and holds many.
+ *
+ * Deliberately NOT under CLAUDE_PLUGIN_DATA. That variable reaches hook processes and MCP
+ * subprocesses, but `--bind` runs as an ordinary command where it is unset — so the writer fell
+ * back to a temp directory while the listener, being a hook, read the real one. The binding was
+ * saved correctly and never seen. A path both sides compute from nothing cannot drift apart.
+ */
+const bindFile = join(homedir(), '.rany-plugin', 'bindings.json')
+
+/** Compare paths, not strings. Windows hands the same directory back as `E:\Works\x` or `E:/Works/x`
+ *  depending on who asked, and a case difference in a drive letter is not a different repository —
+ *  a binding that fails on punctuation is worse than no binding at all. */
+const samePath = (a, b) => norm(a) === norm(b)
+const norm = (p) => p.replace(/[\\/]+/g, '/').replace(/\/$/, '').toLowerCase()
 
 function loadBindings() {
   try { return JSON.parse(readFileSync(bindFile, 'utf8')).boards ?? {} } catch { return {} }
@@ -223,7 +236,7 @@ function classify(type, d) {
     // default board, which is exactly the case that would make a guild binding look correct.)
     const boardId = String(d.boardId ?? '')
     const boundTo = boardId ? loadBindings()[boardId] : undefined
-    if (boundTo && boundTo !== projectDir) return null
+    if (boundTo && !samePath(boundTo, projectDir)) return null
     if (!boundTo) {
       // Nothing bound yet. Said once per board per project, rather than waking every open session
       // for every task or silently dropping the first one — and it carries the exact command,
