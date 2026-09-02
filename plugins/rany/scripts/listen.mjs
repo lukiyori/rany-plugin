@@ -23,6 +23,8 @@ import { readFileSync, writeFileSync, appendFileSync, unlinkSync, existsSync, mk
 import { dirname, join } from 'node:path'
 import { homedir, tmpdir } from 'node:os'
 import { createHash } from 'node:crypto'
+import { request as httpRequest } from 'node:http'
+import { request as httpsRequest } from 'node:https'
 
 const WAKE = 2   // exit code asyncRewake watches for
 const QUIET = 0  // "nothing to say" — the session is not disturbed
@@ -165,6 +167,52 @@ function bindBoard(boardId) {
   }
 }
 
+/** The boards THIS repository claims — the bindings map filtered to this project. Guild ids bound
+ *  for conversations ride along harmlessly: a guild's default board carries the guild's own id, so
+ *  what the server records is a board either way, and an id that names no board matches nothing. */
+function boardsHere() {
+  return Object.entries(loadBindings()).filter(([, dir]) => samePath(dir, projectDir)).map(([id]) => id)
+}
+
+/**
+ * Tell RANY which boards this checkout is handling.
+ *
+ * The binding is a file on this machine, so until now RANY had no way to know whether ANY runtime
+ * was listening for a board's work — and offered every persona as an assignee on every board,
+ * including boards where the card would simply never move. This is the other half of `--bind`.
+ *
+ * A heartbeat, not a registration: the server keeps a claim only while it is refreshed, so closing
+ * the terminal stops offering a persona that can no longer do anything. Best-effort by design — an
+ * older server has no such route, and a plugin that breaks when the server is behind is worse than
+ * one whose personas stay listed.
+ */
+function declareBoards(boardIds, timeoutMs = 5000) {
+  return new Promise((resolve) => {
+    if (!config.token) return resolve()
+    let url
+    try { url = new URL(`${config.apiUrl}/personas/@self/boards`) } catch { return resolve() }
+    const body = JSON.stringify({ projectKey, boardIds })
+    // node:http rather than fetch, for one reason: `--bind` and `--stop` call process.exit the
+    // moment this resolves, and exiting after a fetch trips a libuv assertion on Windows
+    // (`!(handle->flags & UV_HANDLE_CLOSING)`) — a crash banner after a command that in fact worked.
+    // `agent: false` also means no keep-alive socket left idling, so the process can just end.
+    const send = url.protocol === 'http:' ? httpRequest : httpsRequest
+    const req = send(url, {
+      method: 'POST',
+      agent: false,
+      timeout: timeoutMs,
+      headers: {
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(body),
+        authorization: `Bearer ${config.token}`,
+      },
+    }, (res) => { res.resume(); res.on('end', resolve); res.on('error', () => resolve()) })
+    req.on('timeout', () => req.destroy())
+    req.on('error', () => resolve()) // offline, old server, no such route: not the listener's problem
+    req.end(body)
+  })
+}
+
 /**
  * Say a setup problem ONCE, then never again for the same problem.
  *
@@ -239,6 +287,10 @@ function releaseLock() {
   } catch { /* nothing to do */ }
 }
 
+/** Read before the early-exit commands below, because `--bind` and `--stop` both talk to RANY now
+ *  (they declare and withdraw this checkout's board claims). */
+const config = loadConfig()
+
 /** `--bind <boardId>`: claim that board's tasks for THIS repository. */
 const bindAt = process.argv.indexOf('--bind')
 if (bindAt !== -1) {
@@ -251,6 +303,9 @@ if (bindAt !== -1) {
     process.exit(QUIET)
   }
   bindBoard(boardId)
+  // Tell RANY straight away. Waiting for the next session start would leave the board looking
+  // unhandled in the assignee picker right after someone deliberately bound it.
+  await declareBoards(boardsHere())
   process.exit(QUIET)
 }
 
@@ -263,10 +318,12 @@ if (process.argv.includes('--stop')) {
       unlinkSync(pidFile)
     }
   } catch { /* already gone */ }
+  // Withdraw this checkout's board claims: with the session closed nothing here would pick a task
+  // up, so the persona must stop being offered for this board's work. The claims also expire on
+  // their own — this just makes closing a terminal immediate instead of eventual.
+  await declareBoards([], 2000)
   process.exit(QUIET)
 }
-
-const config = loadConfig()
 
 if (typeof WebSocket === 'undefined') {
   const msg = sayOnce('node', [
@@ -294,15 +351,21 @@ const OP = { Dispatch: 0, Hello: 1, Identify: 2, Heartbeat: 3, Resume: 6, Invali
 
 let personaUserId = null
 let heartbeat = null
+let claimBeat = null
 let socket = null
 
 const done = (code, text) => {
   if (text) process.stdout.write(text + '\n')
   if (heartbeat) clearInterval(heartbeat)
+  if (claimBeat) clearInterval(claimBeat)
   try { socket?.close() } catch { /* closing anyway */ }
   releaseLock()
   process.exit(code)
 }
+
+/** Board claims are refreshed on this cadence while a session is open. Well under the server's
+ *  freshness window, so one missed beat (a suspended laptop, a blip) does not drop the claim. */
+const CLAIM_REFRESH_MS = 5 * 60_000
 
 process.on('SIGTERM', () => done(QUIET))
 process.on('SIGINT', () => done(QUIET))
@@ -489,7 +552,17 @@ function connect() {
     }
 
     if (frame.op !== OP.Dispatch) return
-    if (frame.t === 'READY') { personaUserId = String(frame.d?.userId ?? '') || null; return }
+    if (frame.t === 'READY') {
+      personaUserId = String(frame.d?.userId ?? '') || null
+      // Authenticated and listening → this checkout is genuinely handling its boards. Declared here
+      // rather than at startup so a persona is never advertised on the strength of a token that the
+      // gateway then refuses (paused, revoked, or hosted).
+      void declareBoards(boardsHere())
+      if (claimBeat) clearInterval(claimBeat)
+      claimBeat = setInterval(() => void declareBoards(boardsHere()), CLAIM_REFRESH_MS)
+      claimBeat.unref?.()
+      return
+    }
     if (!personaUserId) return
 
     const summary = classify(frame.t, frame.d ?? {})
