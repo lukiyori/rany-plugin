@@ -46,6 +46,25 @@ const SYSTEM_BOT_ID = '1'
 const SESSION_STALE_MS = 20 * 60_000
 const CLAIM_REFRESH_MS = 5 * 60_000
 
+/** The payload Codex pipes to a hook on stdin (`session_id`, `cwd`, `hook_event_name`, …). Read
+ *  with a deadline rather than to EOF, so a hand-run `--ping` from a shell whose stdin never closes
+ *  does not hang; run from a terminal there is nothing to read at all. */
+function hookInput(ms = 700) {
+  return new Promise((resolve) => {
+    if (process.stdin.isTTY) return resolve({})
+    let raw = ''
+    const parse = () => { try { return raw.trim() ? JSON.parse(raw) : {} } catch { return {} } }
+    const timer = setTimeout(() => resolve(parse()), ms)
+    const done = () => { clearTimeout(timer); resolve(parse()) }
+    try {
+      process.stdin.setEncoding('utf8')
+      process.stdin.on('data', (d) => { raw += d })
+      process.stdin.on('end', done)
+      process.stdin.on('error', done)
+    } catch { done() }
+  })
+}
+
 const norm = (p) => String(p).replace(/[\\/]+/g, '/').replace(/\/$/, '').toLowerCase()
 const samePath = (a, b) => norm(a) === norm(b)
 const projectKeyOf = (dir) => createHash('sha256').update(norm(dir)).digest('hex').slice(0, 16)
@@ -79,32 +98,59 @@ function logRoute(type, ids, decision) {
 // A hook writes one file per session and refreshes it on every prompt. `thread/list` cannot answer
 // this: its `status` and `canAcceptDirectInput` are per app-server PROCESS, so a separate process
 // (this daemon) sees every thread as `notLoaded` no matter how alive it is.
+//
+// The file also records WHICH thread the prompt was typed into (the hook's `session_id` is the
+// thread id `codex queue --thread` takes). Two sessions open in one repository is ordinary — a long
+// autonomous one and the one you are actually typing in — and `thread/list` recency cannot tell
+// them apart: the autonomous one updates itself every turn, and a queued message counts as use, so
+// once it wins it keeps winning. The thread you last prompted is the one that should be woken.
 
-function noteSession(cwd) {
+/** Session file name: one per thread when the hook told us which, else one per directory (an older
+ *  Codex, or a hand-run `--ping`) — the shape the daemon already understood. */
+const sessionFile = (cwd, threadId) =>
+  join(sessionsDir, `${projectKeyOf(cwd)}${threadId ? `-${threadId}` : ''}.json`)
+
+function noteSession(cwd, threadId) {
   try {
     mkdirSync(sessionsDir, { recursive: true })
-    writeFileSync(join(sessionsDir, `${projectKeyOf(cwd)}.json`),
-      JSON.stringify({ dir: cwd, ts: Date.now() }))
+    writeFileSync(sessionFile(cwd, threadId),
+      JSON.stringify({ dir: cwd, ts: Date.now(), ...(threadId ? { threadId } : {}) }))
   } catch { /* unwritable state dir: the daemon falls back to thread recency */ }
 }
 
-function forgetSession(cwd) {
-  try { rmSync(join(sessionsDir, `${projectKeyOf(cwd)}.json`), { force: true }) } catch { /* gone */ }
+function forgetSession(cwd, threadId) {
+  try { rmSync(sessionFile(cwd, threadId), { force: true }) } catch { /* gone */ }
 }
 
-/** Directories with a session that has run a turn recently. */
-function liveProjectDirs() {
+/** Every session file that is still fresh; stale ones are deleted on the way (their boards must stop
+ *  being claimed, and a closed thread must stop being a wake target). */
+function liveSessions() {
   const out = []
   let names = []
   try { names = readdirSync(sessionsDir) } catch { return out }
   for (const n of names) {
     try {
       const row = JSON.parse(readFileSync(join(sessionsDir, n), 'utf8'))
-      if (row?.dir && Date.now() - (row.ts ?? 0) < SESSION_STALE_MS) out.push(row.dir)
-      else rmSync(join(sessionsDir, n), { force: true }) // stale: stop claiming its boards
+      if (row?.dir && Date.now() - (row.ts ?? 0) < SESSION_STALE_MS) out.push(row)
+      else rmSync(join(sessionsDir, n), { force: true })
     } catch { /* unreadable: ignore it rather than drop every other session */ }
   }
   return out
+}
+
+/** Directories with a session that has run a turn recently. */
+function liveProjectDirs() {
+  const out = []
+  for (const row of liveSessions()) if (!out.some((d) => samePath(d, row.dir))) out.push(row.dir)
+  return out
+}
+
+/** The thread most recently prompted in this directory, when a hook recorded one. */
+function lastPromptedThread(dir) {
+  let best = null
+  for (const row of liveSessions())
+    if (row.threadId && samePath(row.dir, dir) && (!best || (row.ts ?? 0) > (best.ts ?? 0))) best = row
+  return best?.threadId ?? null
 }
 
 // ---- the Codex app-server --------------------------------------------------------------------
@@ -157,14 +203,18 @@ function appServer(method, params, timeoutMs = 20000) {
   })
 }
 
-/** The thread to write into for a repository: the most recently touched one opened in that exact
- *  directory. `thread/list` filters by cwd server-side, so this cannot drift into a sibling checkout. */
+/** The thread to write into for a repository: the one you last typed a prompt into there, else the
+ *  most recently touched one opened in that exact directory. `thread/list` filters by cwd
+ *  server-side, so neither can drift into a sibling checkout. Returns `{ id, why }` or null. */
 async function threadForDir(dir) {
-  const res = await appServer('thread/list', { cwd: dir, limit: 10 })
+  const prompted = lastPromptedThread(dir)
+  const res = await appServer('thread/list', { cwd: dir, limit: 50 })
   const rows = (res?.data ?? []).filter((t) => t?.id && t?.cwd && samePath(t.cwd, dir))
+  // The prompted thread is trusted when the app-server confirms it — or cannot be asked at all.
+  if (prompted && (res === null || rows.some((t) => t.id === prompted))) return { id: prompted, why: 'last prompted' }
   if (rows.length === 0) return null
   rows.sort((a, b) => (b.updatedAt ?? b.recencyAt ?? 0) - (a.updatedAt ?? a.recencyAt ?? 0))
-  return rows[0].id
+  return { id: rows[0].id, why: 'most recent' }
 }
 
 /** Deliver. `codex queue` is the supported door and it is what the TUI drains — a live session picks
@@ -317,7 +367,9 @@ const alive = (pid) => { try { process.kill(pid, 0); return true } catch { retur
 
 /** SessionStart: record this session and make sure the machine's one daemon is running. */
 if (has('--ensure') || has('--ping')) {
-  noteSession(process.cwd())
+  const hook = await hookInput()
+  noteSession(typeof hook.cwd === 'string' && hook.cwd ? hook.cwd : process.cwd(),
+    typeof hook.session_id === 'string' && hook.session_id ? hook.session_id : undefined)
   let running = false
   try {
     if (existsSync(pidFile)) {
@@ -345,8 +397,14 @@ if (has('--ensure') || has('--ping')) {
   process.exit(0)
 }
 
-/** SessionEnd: this repository stops being a wake target straight away. */
-if (has('--bye')) { forgetSession(process.cwd()); process.exit(0) }
+/** SessionEnd: this thread stops being a wake target straight away (another session open in the
+ *  same repository keeps its own file, and the repository stays live). */
+if (has('--bye')) {
+  const hook = await hookInput()
+  forgetSession(typeof hook.cwd === 'string' && hook.cwd ? hook.cwd : process.cwd(),
+    typeof hook.session_id === 'string' && hook.session_id ? hook.session_id : undefined)
+  process.exit(0)
+}
 
 if (has('--stop')) {
   try {
@@ -381,7 +439,7 @@ try {
 const OP = { Dispatch: 0, Hello: 1, Identify: 2, Heartbeat: 3, InvalidSession: 9 }
 
 let personaUserId = null
-let personaName = null   // from READY; the name every post is attributed to
+let personaName = null   // from READY; the name every post is attributed to
 let ownerUserId = null   // from READY; only the OWNER own chat may reach a coding session
 let heartbeat = null
 let socket = null
@@ -538,25 +596,15 @@ function route(type, d) {
 /** The session the owner is actually sitting in — for the events that name no repository. */
 function mostRecentLiveDir() {
   let best = null
-  let bestTs = 0
-  let names = []
-  try { names = readdirSync(sessionsDir) } catch { return null }
-  for (const n of names) {
-    try {
-      const row = JSON.parse(readFileSync(join(sessionsDir, n), 'utf8'))
-      if (row?.dir && (row.ts ?? 0) > bestTs && Date.now() - row.ts < SESSION_STALE_MS) {
-        best = row.dir; bestTs = row.ts
-      }
-    } catch { /* skip */ }
-  }
-  return best
+  for (const row of liveSessions()) if (!best || (row.ts ?? 0) > (best.ts ?? 0)) best = row
+  return best?.dir ?? null
 }
 
 async function deliver(type, ids, { dir, text }) {
-  const threadId = await threadForDir(dir)
-  if (!threadId) { logRoute(type, ids, `no thread in ${dir}`); return }
-  const ok = await queueMessage(threadId, text)
-  logRoute(type, ids, ok ? `queued -> ${threadId} @ ${dir}` : `queue FAILED -> ${threadId} @ ${dir}`)
+  const thread = await threadForDir(dir)
+  if (!thread) { logRoute(type, ids, `no thread in ${dir}`); return }
+  const ok = await queueMessage(thread.id, text)
+  logRoute(type, ids, ok ? `queued -> ${thread.id} (${thread.why}) @ ${dir}` : `queue FAILED -> ${thread.id} @ ${dir}`)
 }
 
 function connect() {

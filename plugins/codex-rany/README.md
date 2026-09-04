@@ -75,7 +75,13 @@ What is the same, deliberately:
 2. The binding maps that to a repository directory.
 3. `thread/list` is asked for threads whose cwd is exactly that directory — **interactive sessions
    only**, since `exec` threads are excluded by default and are not something to wake.
-4. The most recently used one is queued.
+4. **The thread you last typed a prompt into** is queued (the `UserPromptSubmit` hook records its
+   `session_id`, which is the thread id). Only when no prompt has been recorded — an older Codex, or
+   a session opened before the plugin — does the most recently used thread win. Recency alone is
+   the wrong answer whenever two sessions are open in one repository: a long autonomous run updates
+   itself every turn, and a queued message counts as use, so once it wins it keeps winning — the
+   work gets done in a window you are not looking at. `routing.log` says which rule applied
+   (`last prompted` / `most recent`).
 
 A persona's own DM carries neither board nor guild, so it goes to the session you were most recently
 working in — the only honest answer available.
@@ -98,9 +104,9 @@ unclaimed for up to five minutes until the Claude side's next heartbeat.
 
 | Event | What it does |
 |---|---|
-| `SessionStart` | records this session, starts the daemon if it is not running, and says once if the token is missing |
-| `UserPromptSubmit` | refreshes the session heartbeat (a file write; no network) |
-| `SessionEnd` | drops the heartbeat, so this repository stops being a wake target immediately |
+| `SessionStart` | records this session (directory + thread id from the hook's stdin), starts the daemon if it is not running, and says once if the token is missing |
+| `UserPromptSubmit` | refreshes the session heartbeat and marks this thread as the one you are typing in (a file write; no network) |
+| `SessionEnd` | drops this thread's heartbeat, so it stops being a wake target immediately; another session in the same repository keeps its own |
 
 ## Diagnosing
 
