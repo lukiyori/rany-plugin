@@ -25,6 +25,13 @@ task belongs to one repository, and nothing in the task says which. Without a bi
 assignment cannot be routed: waking whichever session happened to start first interrupts unrelated
 work with somebody else's project.
 
+**A bind belongs to THIS session, not just this directory (ADR-038).** Open two terminals in the
+same repository — a long autonomous run and the one you are typing in — and only the window that ran
+`/rany-bind` wakes for that board. Closing that window drops the bind (and stops offering the persona
+as an assignee for it); re-run `/rany-bind` in another session to move the work there. A binding made
+by an older plugin that predates this is directory-scoped and still works, but only the active window
+answers it — re-bind to make it precise.
+
 The unit is the **board**, not the server. A RANY server is a company or a community and holds many
 projects; a board is the closest thing RANY has to one. (While a server has only its default board
 the two coincide — which is exactly the case that would make binding the server look correct, right
@@ -39,7 +46,7 @@ claimed tasks, then adding a second board later would silently send its work to 
 first one. A board that has not been bound wakes nobody, however its server is bound.
 
 Binding a board that is already bound elsewhere moves it — the last `/rany-bind` wins, deliberately,
-so a moved checkout needs no file edited by hand.
+so a moved checkout (or a moved window) needs no file edited by hand.
 
 **An unbound board wakes nobody.** Not "everybody once" — announcing it in every open session
 interrupts N unrelated pieces of work to solve a discovery problem, and solves it in the worst

@@ -85,6 +85,33 @@ function loadBindings() {
  *  up the board and only the board (see the task branch), guild conversations look up the guild. */
 const claimedBy = (id) => (id ? loadBindings()[String(id)] : undefined)
 
+/**
+ * Who owns a binding, for routing (ADR-038). A binding is one of:
+ *   · a Codex object `{ dir, agent:'codex', threadId, ts }` — owned by ONE thread; that thread, and
+ *     only it, is woken, even with another Codex thread open in the same repo.
+ *   · a Claude object (has `sessionId`, no `threadId`) — another agent's; never ours.
+ *   · a legacy directory string — pre-ADR-038, routed by directory to the most recent thread there.
+ * Returns `{ dir, threadId|null, legacy }`, or null when the id is unbound or another agent's.
+ */
+function ownerOf(entry) {
+  if (!entry) return null
+  if (typeof entry === 'string') return { dir: entry, threadId: null, legacy: true }
+  if (entry.threadId) return { dir: entry.dir, threadId: String(entry.threadId), legacy: false }
+  return null
+}
+
+/** Drop every binding a thread owns — SessionEnd, so a closed Codex thread stops being a wake target
+ *  and RANY stops offering the persona for its boards. Legacy strings and other threads' entries are
+ *  left untouched. */
+function dropThreadBindings(threadId) {
+  if (!threadId) return
+  const boards = loadBindings()
+  let changed = false
+  for (const [id, e] of Object.entries(boards))
+    if (typeof e === 'object' && String(e?.threadId) === String(threadId)) { delete boards[id]; changed = true }
+  if (changed) try { writeFileSync(bindFile, JSON.stringify({ boards }, null, 2)) } catch { /* best effort */ }
+}
+
 /** Why an event went where it went. The daemon outlives every session, so without this the only
  *  record of a routing decision is the interruption itself. Best-effort; never worth an error. */
 function logRoute(type, ids, decision) {
@@ -135,13 +162,6 @@ function liveSessions() {
       else rmSync(join(sessionsDir, n), { force: true })
     } catch { /* unreadable: ignore it rather than drop every other session */ }
   }
-  return out
-}
-
-/** Directories with a session that has run a turn recently. */
-function liveProjectDirs() {
-  const out = []
-  for (const row of liveSessions()) if (!out.some((d) => samePath(d, row.dir))) out.push(row.dir)
   return out
 }
 
@@ -316,15 +336,28 @@ function declareBoards(projectKey, boardIds, timeoutMs = 5000) {
 
 /** Every open session's boards, declared per project; projects that went quiet declare nothing and
  *  their claims expire server-side. */
+const claimKey = (s) => (s.threadId ? projectKeyOf(s.dir + '|' + s.threadId) : projectKeyOf(s.dir))
+
+/** The boards a live session claims: its own session-scoped entries (threadId match), plus any legacy
+ *  directory string pointing at its repo. */
+function boardsForSession(bindings, s) {
+  return Object.entries(bindings).filter(([, e]) => {
+    if (typeof e === 'string') return samePath(e, s.dir)
+    if (e.threadId) return s.threadId && String(e.threadId) === s.threadId
+    return false // another agent's (Claude) entry
+  }).map(([id]) => id)
+}
+
+/** Declare each live thread's boards under a per-thread key (ADR-038), so closing one thread withdraws
+ *  only its own claims; threads that went quiet declare nothing and expire server-side. */
 async function refreshClaims() {
   const bindings = loadBindings()
   const known = new Set()
-  for (const dir of liveProjectDirs()) {
-    const boards = Object.entries(bindings).filter(([, d]) => samePath(d, dir)).map(([id]) => id)
-    known.add(projectKeyOf(dir))
-    await declareBoards(projectKeyOf(dir), boards)
+  for (const s of liveSessions()) {
+    const key = claimKey(s)
+    known.add(key)
+    await declareBoards(key, boardsForSession(bindings, s))
   }
-  // A project whose session just closed must stop claiming immediately, not in 20 minutes.
   let previous = []
   try { previous = JSON.parse(readFileSync(stateFile, 'utf8')).projects ?? [] } catch { /* first run */ }
   for (const key of previous) if (!known.has(key)) await declareBoards(key, [])
@@ -348,18 +381,26 @@ if (has('--bind')) {
     process.exit(0)
   }
   const boards = loadBindings()
-  boards[boardId] = process.cwd()
+  // Bind to the CURRENT thread, resolved from the heartbeat the UserPromptSubmit hook just wrote for
+  // this cwd (a skill-run command gets no hook stdin, so the thread id comes from there). Falls back
+  // to a legacy directory string only when no live thread can be identified.
+  const threadId = lastPromptedThread(process.cwd())
+  boards[boardId] = threadId
+    ? { dir: process.cwd(), agent: 'codex', threadId, ts: Date.now() }
+    : process.cwd()
   try {
     mkdirSync(HOME, { recursive: true })
     writeFileSync(bindFile, JSON.stringify({ boards }, null, 2))
-    process.stdout.write(`RANY: ${boardId} is now handled in ${process.cwd()}\n`)
+    process.stdout.write(threadId
+      ? `RANY: ${boardId} is now handled in THIS Codex thread (${process.cwd()}). It stops when this thread closes; re-run /rany-bind in another to move it.\n`
+      : `RANY: ${boardId} is now handled in ${process.cwd()} (no active thread detected; routes to the most recent one there)\n`)
   } catch (e) {
     process.stdout.write(`RANY: could not save the binding (${e?.message ?? e})\n`)
     process.exit(0)
   }
-  noteSession(process.cwd())
-  await declareBoards(projectKeyOf(process.cwd()),
-    Object.entries(loadBindings()).filter(([, d]) => samePath(d, process.cwd())).map(([id]) => id))
+  noteSession(process.cwd(), threadId ?? undefined)
+  const s = { dir: process.cwd(), threadId: threadId ?? undefined }
+  await declareBoards(claimKey(s), boardsForSession(loadBindings(), s))
   process.exit(0)
 }
 
@@ -401,8 +442,10 @@ if (has('--ensure') || has('--ping')) {
  *  same repository keeps its own file, and the repository stays live). */
 if (has('--bye')) {
   const hook = await hookInput()
-  forgetSession(typeof hook.cwd === 'string' && hook.cwd ? hook.cwd : process.cwd(),
-    typeof hook.session_id === 'string' && hook.session_id ? hook.session_id : undefined)
+  const threadId = typeof hook.session_id === 'string' && hook.session_id ? hook.session_id : undefined
+  forgetSession(typeof hook.cwd === 'string' && hook.cwd ? hook.cwd : process.cwd(), threadId)
+  // ADR-038: closing the thread drops its bindings, so the board stops waking anything until re-bound.
+  dropThreadBindings(threadId)
   process.exit(0)
 }
 
@@ -484,14 +527,14 @@ function route(type, d) {
     // id, so "I bound the board" and "I bound the server" are the same keystrokes — a fallback would
     // make binding the default board silently claim every board added to that server later.
     const boardId = String(d.boardId ?? '')
-    const dir = claimedBy(boardId)
-    if (!dir) {
-      noteUnrouted(boardId, guildId, d)
-      logRoute('TASK_UPDATED', { boardId, guildId }, 'skip (unbound)')
+    const owner = ownerOf(claimedBy(boardId))
+    if (!owner) {
+      if (!claimedBy(boardId)) noteUnrouted(boardId, guildId, d)
+      logRoute('TASK_UPDATED', { boardId, guildId }, claimedBy(boardId) ? 'skip (another agent\'s bind)' : 'skip (unbound)')
       return null
     }
     return {
-      dir,
+      dir: owner.dir, threadId: owner.threadId,
       text: [
         `RANY: a task was assigned to your persona.`,
         `  task ${d.id} in guild ${guildId} — "${d.title ?? '(untitled)'}"`,
@@ -508,12 +551,12 @@ function route(type, d) {
 
   if (type === 'PERSONA_FORWARD') {
     if (!config.wake.forwards) return null
-    const dir = claimedBy(d.guildId)
-    if (!dir) { logRoute('PERSONA_FORWARD', { guildId: d.guildId }, 'skip (unclaimed guild)'); return null }
+    const owner = ownerOf(claimedBy(d.guildId))
+    if (!owner) { logRoute('PERSONA_FORWARD', { guildId: d.guildId }, 'skip (unclaimed guild)'); return null }
     const msgs = Array.isArray(d.messages) ? d.messages : []
     const target = msgs.find((m) => m.target) ?? msgs[msgs.length - 1]
     return {
-      dir,
+      dir: owner.dir, threadId: owner.threadId,
       text: [
         `RANY: your owner forwarded a conversation to your persona.`,
         `  channel ${d.channelId}${d.channelName ? ` (#${d.channelName})` : ''}`,
@@ -536,11 +579,11 @@ function route(type, d) {
   // is no "any open session may answer" case here: this daemon can see every session at once, so
   // picking one at random would not be a fallback, it would be a coin toss.
   if (isGuild) {
-    const dir = claimedBy(d.guildId)
-    if (!dir) { logRoute('MESSAGE_CREATED', { guildId: d.guildId }, 'skip (unclaimed guild)'); return null }
+    const owner = ownerOf(claimedBy(d.guildId))
+    if (!owner) { logRoute('MESSAGE_CREATED', { guildId: d.guildId }, 'skip (unclaimed guild)'); return null }
     if (mentions.includes(personaUserId) && config.wake.addressed) {
       return {
-        dir,
+        dir: owner.dir, threadId: owner.threadId,
         text: [
           `RANY: someone addressed your persona directly in channel ${d.channelId}.`,
           `  user ${d.authorId}: ${d.content ?? ''}`,
@@ -553,7 +596,7 @@ function route(type, d) {
       }
     }
     if (config.wake.ownerMentions) {
-      return { dir, text: `RANY: you were mentioned in channel ${d.channelId}.\n  user ${d.authorId}: ${d.content ?? ''}` }
+      return { dir: owner.dir, threadId: owner.threadId, text: `RANY: you were mentioned in channel ${d.channelId}.\n  user ${d.authorId}: ${d.content ?? ''}` }
     }
     return null
   }
@@ -576,10 +619,10 @@ function route(type, d) {
       logRoute('MESSAGE_CREATED', { channelId: d.channelId }, 'skip (notification bot)')
       return null
     }
-    const dir = mostRecentLiveDir()
-    if (!dir) { logRoute('MESSAGE_CREATED', { channelId: d.channelId }, 'skip (no open session)'); return null }
+    const live = mostRecentLiveSession()
+    if (!live) { logRoute('MESSAGE_CREATED', { channelId: d.channelId }, 'skip (no open session)'); return null }
     return {
-      dir,
+      dir: live.dir, threadId: live.threadId ?? null,
       text: [
         `RANY: a message in your persona's own chat (channel ${d.channelId}).`,
         `  user ${d.authorId}: ${d.content ?? ''}`,
@@ -594,13 +637,21 @@ function route(type, d) {
 }
 
 /** The session the owner is actually sitting in — for the events that name no repository. */
-function mostRecentLiveDir() {
+function mostRecentLiveSession() {
   let best = null
   for (const row of liveSessions()) if (!best || (row.ts ?? 0) > (best.ts ?? 0)) best = row
-  return best?.dir ?? null
+  return best
 }
 
-async function deliver(type, ids, { dir, text }) {
+async function deliver(type, ids, { dir, threadId, text }) {
+  // Session-scoped: a binding names the exact thread, so queue straight to it — `codex queue` holds
+  // the message for a thread that is momentarily closed, which is the point (the task waits). Legacy
+  // directory bindings still resolve a thread by recency.
+  if (threadId) {
+    const ok = await queueMessage(threadId, text)
+    logRoute(type, ids, ok ? `queued -> ${threadId} (bound) @ ${dir}` : `queue FAILED -> ${threadId} @ ${dir}`)
+    return
+  }
   const thread = await threadForDir(dir)
   if (!thread) { logRoute(type, ids, `no thread in ${dir}`); return }
   const ok = await queueMessage(thread.id, text)

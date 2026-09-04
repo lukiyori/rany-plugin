@@ -40,10 +40,33 @@ const stateDir = process.env.CLAUDE_PLUGIN_DATA || join(tmpdir(), 'rany-plugin')
  * by project, and the board→project bindings below decide whose task this is.
  */
 const projectDir = process.env.CLAUDE_PROJECT_DIR || process.cwd()
-const projectKey = createHash('sha256').update(projectDir).digest('hex').slice(0, 16)
-const projectState = join(stateDir, 'projects', projectKey)
-const pidFile = join(projectState, 'listener.pid')
+
+/**
+ * WHICH session this is. A binding belongs to the session that ran `/rany-bind`, not merely to the
+ * directory — open two terminals in one repo and only the one you bound wakes (ADR-038). Claude Code
+ * exports this in the environment of every command AND hook process it spawns, so `--bind` and the
+ * listener agree on it without a handshake. Absent on an older Claude: everything then falls back to
+ * the previous directory-scoped behaviour, so nothing breaks where the id cannot be had.
+ */
+const sessionId = process.env.CLAUDE_CODE_SESSION_ID || null
+
+// Per-session, not per-project: the point is that two sessions in one repo each wake only for what
+// THEY bound. The project key still folds in the directory so the server's board claim (db/0285) can
+// tell two checkouts apart, and now the session so it can tell two windows apart too.
+const projectKey = createHash('sha256').update(projectDir + '|' + (sessionId ?? '')).digest('hex').slice(0, 16)
+const projectState = join(stateDir, 'projects',
+  createHash('sha256').update(projectDir).digest('hex').slice(0, 16))
+// One listener PER SESSION (keyed by the session id), so a second window in the same repo does not
+// kill the first's socket. Falls back to the old per-project pidfile when there is no session id.
+const pidFile = sessionId
+  ? join(stateDir, 'sessions', createHash('sha256').update(sessionId).digest('hex').slice(0, 16) + '.pid')
+  : join(projectState, 'listener.pid')
 const saidFile = join(projectState, 'said.json')
+/** The machine's most-recently-active session, refreshed every turn (the Stop hook respawns the
+ *  listener, which stamps this). Events that name no board and no guild — the persona's own DM — have
+ *  nothing to route BY, so they wake only this session, the window the owner is actually sitting in. */
+const activeFile = join(stateDir, 'active-session.json')
+const ACTIVE_STALE_MS = 15 * 60_000
 /**
  * Shared across projects: one BOARD's tasks belong to one repository. A board is the closest thing
  * RANY has to a project — a guild is a company or a community and holds many.
@@ -70,17 +93,47 @@ function loadBindings() {
 }
 
 /**
- * Which repository claims this id, if any. One map holds both kinds, because RANY makes them the same
+ * Which binding claims this id, if any. One map holds both kinds, because RANY makes them the same
  * number: a guild's DEFAULT board carries the guild's own id. What the id MEANS is decided by the
  * caller — tasks look up the board and only the board; guild conversations, which carry no board id at
  * all, look up the guild. Never one falling back to the other: see the task branch for why.
+ *
+ * A binding is one of two shapes. The new one is `{ dir, agent, sessionId, ts }` — owned by the exact
+ * session that ran `/rany-bind` (ADR-038). The legacy one is a bare directory string, from before
+ * session ownership; it is honoured for compatibility but treated as directory-scoped, so an existing
+ * setup keeps working until it is re-bound.
  */
 function claimedBy(id) {
   return id ? loadBindings()[String(id)] : undefined
 }
 
-/** Is this repository the one that claims it? */
-const claimedHere = (owner) => Boolean(owner) && samePath(owner, projectDir)
+const entryDir = (e) => (typeof e === 'string' ? e : e?.dir)
+const entrySession = (e) => (typeof e === 'string' ? null : e?.sessionId ?? null)
+
+/** The session the marker says is active right now (the window that most recently finished a turn),
+ *  or null when the mark is missing or stale. */
+function activeSessionId() {
+  try {
+    const m = JSON.parse(readFileSync(activeFile, 'utf8'))
+    if (m?.sessionId && Date.now() - (m.ts ?? 0) < ACTIVE_STALE_MS) return String(m.sessionId)
+  } catch { /* none */ }
+  return null
+}
+/** Am I the window the owner is sitting in? True when I hold the mark, or when nobody fresh does. */
+const isActiveSession = () => { const a = activeSessionId(); return !a || a === sessionId }
+
+/**
+ * Is THIS session the one that should act on a binding?
+ *   · session-scoped entry → only its owning session (the whole point).
+ *   · legacy directory string → the directory must match AND, because there is now one listener per
+ *     session rather than one per repo, only the active window answers — otherwise every window open
+ *     in that repo would wake at once, the very thing session ownership removes.
+ */
+function ownedHere(entry) {
+  if (!entry) return false
+  if (typeof entry === 'string') return samePath(entry, projectDir) && isActiveSession()
+  return Boolean(sessionId) && entry.sessionId === sessionId
+}
 
 /**
  * Why this session did (or did not) wake, appended for every routed event. The routing bug that
@@ -157,21 +210,43 @@ function listUnrouted() {
  *  conversations a board id can never match). Both live in the same map; a board binding wins. */
 function bindBoard(boardId) {
   const boards = loadBindings()
-  boards[boardId] = projectDir
+  // Session-scoped when we know the session (the normal case); a bare directory string only on an
+  // older Claude that does not export the id, which keeps the previous behaviour rather than losing
+  // the binding entirely.
+  boards[boardId] = sessionId
+    ? { dir: projectDir, agent: 'claude', sessionId, ts: Date.now() }
+    : projectDir
   try {
     mkdirSync(dirname(bindFile), { recursive: true })
     writeFileSync(bindFile, JSON.stringify({ boards }, null, 2))
-    process.stdout.write(`RANY: ${boardId} is now handled in ${projectDir}\n`)
+    process.stdout.write(sessionId
+      ? `RANY: ${boardId} is now handled in THIS session (${projectDir}). It stops when this session closes; re-run /rany-bind in another to move it.\n`
+      : `RANY: ${boardId} is now handled in ${projectDir}\n`)
   } catch (e) {
     process.stdout.write(`RANY: could not save the binding (${e?.message ?? e})\n`)
   }
 }
 
-/** The boards THIS repository claims — the bindings map filtered to this project. Guild ids bound
- *  for conversations ride along harmlessly: a guild's default board carries the guild's own id, so
- *  what the server records is a board either way, and an id that names no board matches nothing. */
+/** The boards THIS session claims — its own session-scoped entries, plus any legacy directory string
+ *  pointing at this repo. Guild ids bound for conversations ride along harmlessly: a guild's default
+ *  board carries the guild's own id, so what the server records is a board either way. */
 function boardsHere() {
-  return Object.entries(loadBindings()).filter(([, dir]) => samePath(dir, projectDir)).map(([id]) => id)
+  return Object.entries(loadBindings())
+    .filter(([, e]) => (typeof e === 'string' ? samePath(e, projectDir) : e?.sessionId === sessionId))
+    .map(([id]) => id)
+}
+
+/** Drop every binding this session owns — SessionEnd, so a closed window stops being a wake target
+ *  and RANY stops offering the persona for boards nothing can now pick up. Legacy directory strings
+ *  are left alone: they are not this session's to remove. */
+function dropMyBindings() {
+  if (!sessionId) return
+  const boards = loadBindings()
+  let changed = false
+  for (const [id, e] of Object.entries(boards))
+    if (typeof e === 'object' && e?.sessionId === sessionId) { delete boards[id]; changed = true }
+  if (!changed) return
+  try { writeFileSync(bindFile, JSON.stringify({ boards }, null, 2)) } catch { /* best effort */ }
 }
 
 /**
@@ -263,29 +338,19 @@ function alive(pid) {
   try { process.kill(pid, 0); return true } catch { return false }
 }
 
-/** True when this process may run. One listener per PROJECT — not per machine: sessions open in
- *  different repositories each need their own, or only one project could ever be woken. Within a
- *  project the lock still holds, so the Stop hook respawning after every turn adds no sockets. */
+/** True when this process may run. One listener PER SESSION now (ADR-038): two windows in one repo
+ *  each hold their own socket and wake only for what they bound. The pidfile is keyed by session, so
+ *  the only holder we ever take over is our OWN previous process — the Stop hook respawns the
+ *  listener every turn, and that respawn should replace the last one, never a sibling window's. */
 function claimLock() {
   try {
     mkdirSync(dirname(pidFile), { recursive: true })
     if (existsSync(pidFile)) {
       const pid = Number(readFileSync(pidFile, 'utf8').trim())
-      // A LIVE holder is another session open in this same repository. Take the lock from it rather
-      // than bowing out.
-      //
-      // Bowing out was the old behaviour and it produced the worst possible symptom: the second
-      // window's hook spawned a listener, the listener saw a live pid, exited instantly — a console
-      // flashing open and shut — and every task woke the FIRST window, which the user might not even
-      // have on screen. From where they sat, assignment simply did nothing.
-      //
-      // Taking over is not a race to the bottom, because of when this runs: the Stop hook respawns
-      // the listener at the end of every turn, so the lock lands on whichever session most recently
-      // did something. That is the session the person is actually sitting in — the only honest
-      // answer to "which of my windows should this task wake".
+      // Same session, previous turn's listener: replace it. (Without a session id the pidfile is
+      // per-project, and this is the old take-the-repo-listener behaviour.)
       if (pid && pid !== process.pid && alive(pid)) {
-        try { process.kill(pid) } catch { /* it exited between the check and here: fine, we take it */ }
-        logRoute('LOCK', { tookFrom: pid }, 'took the project listener')
+        try { process.kill(pid) } catch { /* exited between check and here: fine */ }
       }
     }
     writeFileSync(pidFile, String(process.pid))
@@ -293,6 +358,17 @@ function claimLock() {
   } catch {
     return true // unwritable state dir: better a possible duplicate than a plugin that never runs
   }
+}
+
+/** Stamp this session as the machine's active window. The Stop hook respawns the listener at the end
+ *  of every turn, so this runs once per turn and lands on whichever window the owner just used —
+ *  which is who un-routable events (a persona DM) should wake. */
+function markActive() {
+  if (!sessionId) return
+  try {
+    mkdirSync(dirname(activeFile), { recursive: true })
+    writeFileSync(activeFile, JSON.stringify({ sessionId, ts: Date.now() }))
+  } catch { /* best effort */ }
 }
 
 function releaseLock() {
@@ -324,7 +400,8 @@ if (bindAt !== -1) {
   process.exit(QUIET)
 }
 
-/** `--stop`: SessionEnd asks the live listener to go away, so a closed terminal leaves no socket. */
+/** `--stop`: SessionEnd asks this session's listener to go away, so a closed terminal leaves no
+ *  socket AND no binding — ADR-038's "closing the window drops the bind, re-bind to move it". */
 if (process.argv.includes('--stop')) {
   try {
     if (existsSync(pidFile)) {
@@ -333,9 +410,12 @@ if (process.argv.includes('--stop')) {
       unlinkSync(pidFile)
     }
   } catch { /* already gone */ }
-  // Withdraw this checkout's board claims: with the session closed nothing here would pick a task
-  // up, so the persona must stop being offered for this board's work. The claims also expire on
-  // their own — this just makes closing a terminal immediate instead of eventual.
+  // Drop this session's bindings and, if it held the active mark, release it. With the window closed
+  // nothing here would pick a task up, so the persona must stop being offered for its boards.
+  dropMyBindings()
+  try { if (activeSessionId() === sessionId) unlinkSync(activeFile) } catch { /* fine */ }
+  // Withdraw this session's board claims from RANY. They also expire on their own — this just makes
+  // closing a terminal immediate instead of eventual.
   await declareBoards([], 2000)
   process.exit(QUIET)
 }
@@ -361,10 +441,11 @@ if (!config.token) {
 }
 
 if (!claimLock()) process.exit(QUIET)
+markActive() // this window just started or finished a turn — it is the one to wake for un-routable events
 
 const OP = { Dispatch: 0, Hello: 1, Identify: 2, Heartbeat: 3, Resume: 6, InvalidSession: 9 }
 
-let personaUserId = null
+let personaUserId = null
 let ownerUserId = null
 let personaName = null   // from READY; the name every post is attributed to
 let heartbeat = null
@@ -427,19 +508,18 @@ function classify(type, d) {
     const boardId = String(d.boardId ?? '')
     const boundTo = claimedBy(boardId)
 
-    // ONLY the bound project. An unbound board wakes nobody at all — not "everybody once".
+    // ONLY the session that bound this board. An unbound board wakes nobody at all — not "everybody
+    // once". And a board bound in ANOTHER session stays that session's, even in this same repo:
+    // that is the whole of ADR-038, the thing that makes "which of my windows wakes" answerable.
     //
-    // The earlier version announced itself in every open session so the first task on a new board
-    // would not be silently dropped. That reasoning was wrong twice over: it interrupts N unrelated
-    // pieces of work to solve a discovery problem, and it solves it in the worst possible place —
-    // a session that by definition cannot tell whether the task is its own. Discovery belongs in
-    // RANY, where the board's Copy ID button now sits, not in an interruption.
-    //
-    // Nothing is lost, though: the sighting is recorded, and `/rany-bind` with no argument prints
-    // what has been seen and never routed. Silence here is not the same as forgetting.
-    if (!claimedHere(boundTo)) {
+    // Nothing is lost when unbound: the sighting is recorded, and `/rany-bind` with no argument
+    // prints what has been seen and never routed. Silence here is not the same as forgetting.
+    if (!ownedHere(boundTo)) {
       if (!boundTo) noteUnrouted(boardId, guildId, d)
-      logRoute('TASK_UPDATED', { boardId, guildId }, boundTo ? `skip (owned by ${boundTo})` : 'skip (unbound)')
+      const why = !boundTo ? 'skip (unbound)'
+        : entrySession(boundTo) ? `skip (bound to session ${entrySession(boundTo)})`
+        : `skip (owned by ${entryDir(boundTo)})`
+      logRoute('TASK_UPDATED', { boardId, guildId }, why)
       return null
     }
     logRoute('TASK_UPDATED', { boardId, guildId }, 'wake')
@@ -493,8 +573,15 @@ function classify(type, d) {
   // dropped. Silence is only the right default once someone has claimed the work.
   if (isGuild) {
     const owner = claimedBy(d.guildId)
-    if (owner && !claimedHere(owner)) {
-      logRoute('MESSAGE_CREATED', { guildId: d.guildId, channelId: d.channelId }, `skip (owned by ${owner})`)
+    if (owner && !ownedHere(owner)) {
+      const why = entrySession(owner) ? `skip (bound to session ${entrySession(owner)})` : `skip (owned by ${entryDir(owner)})`
+      logRoute('MESSAGE_CREATED', { guildId: d.guildId, channelId: d.channelId }, why)
+      return null
+    }
+    // An unclaimed guild is answered only by the window you are sitting in — with one listener per
+    // session now, "any session may answer" would mean every session answering the same message.
+    if (!owner && !isActiveSession()) {
+      logRoute('MESSAGE_CREATED', { guildId: d.guildId, channelId: d.channelId }, 'skip (guild unclaimed, not active session)')
       return null
     }
     logRoute('MESSAGE_CREATED', { guildId: d.guildId, channelId: d.channelId },
@@ -505,6 +592,13 @@ function classify(type, d) {
   // it was added to. Always its own conversation, never eavesdropping.
   if (!isGuild && recipients.includes(personaUserId)) {
     if (!config.wake.sessions) return null
+    // A DM carries no board and no guild, so there is nothing to route it BY. It goes to the window
+    // the owner is sitting in — the active session — and to that one only; with a listener per
+    // session, anything else would wake every open window for one message.
+    if (!isActiveSession()) {
+      logRoute('MESSAGE_CREATED', { channelId: d.channelId }, 'skip (persona DM, not active session)')
+      return null
+    }
     // Only the persona's OWN chat with its owner may wake a coding session. A conversation somebody
     // else opened with the persona (ADR-037) must not: waking this session hands a stranger the
     // repository, the shell and the tools. Those are answered by a hosted persona on the server, or

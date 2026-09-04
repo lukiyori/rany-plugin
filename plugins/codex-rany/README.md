@@ -72,25 +72,24 @@ What is the same, deliberately:
 ## Which session gets the message
 
 1. The event names a board (tasks) or a guild (conversations).
-2. The binding maps that to a repository directory.
-3. `thread/list` is asked for threads whose cwd is exactly that directory — **interactive sessions
-   only**, since `exec` threads are excluded by default and are not something to wake.
-4. **The thread you last typed a prompt into** is queued (the `UserPromptSubmit` hook records its
-   `session_id`, which is the thread id). Only when no prompt has been recorded — an older Codex, or
-   a session opened before the plugin — does the most recently used thread win. Recency alone is
-   the wrong answer whenever two sessions are open in one repository: a long autonomous run updates
-   itself every turn, and a queued message counts as use, so once it wins it keeps winning — the
-   work gets done in a window you are not looking at. `routing.log` says which rule applied
-   (`last prompted` / `most recent`).
+2. The binding maps that to the **thread that ran `/rany-bind`** (ADR-038) — resolved at bind time
+   from the `UserPromptSubmit` heartbeat, since a skill-run command gets no hook stdin.
+3. The notice is queued straight into that thread with `codex queue --thread`. A live session picks
+   it up within a second; a closed one keeps it in its queue until resumed. Only that thread wakes,
+   even with another Codex thread open in the same repository — the fix for "the task got done in a
+   window I was not looking at."
+4. A binding left over from an older plugin names only the **directory**; it still routes, to the
+   thread most recently prompted there. `routing.log` says which rule applied (`bound` / `most
+   recent`).
 
 A persona's own DM carries neither board nor guild, so it goes to the session you were most recently
 working in — the only honest answer available.
 
-## Board claims (ADR-033)
+## Board claims (ADR-033/036/038)
 
-A hook writes one heartbeat file per open session and refreshes it on every prompt; the daemon turns
-that into `POST /personas/@self/boards` per checkout, which is what makes your persona offered as a
-task assignee on that board at all. Close the session and the claim is withdrawn on the next refresh.
+A hook writes one heartbeat file per open thread and refreshes it on every prompt; the daemon turns
+that into `POST /personas/@self/boards` per **thread**, which is what makes your persona offered as a
+task assignee on that board at all. Close the thread and its claim (and its binding) are withdrawn.
 
 Thread `status` cannot be used for this: it is per app-server *process*, so a separate daemon sees
 every thread as `notLoaded` however alive it is. Hence the heartbeat file.
