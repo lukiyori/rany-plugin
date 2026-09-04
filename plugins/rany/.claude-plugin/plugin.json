@@ -1,7 +1,7 @@
 {
   "name": "rany",
   "displayName": "RANY",
-  "version": "0.7.3",
+  "version": "0.7.4",
   "description": "Your RANY persona, inside the Claude Code session you already have open: it wakes this session when someone assigns you a task or asks your AI something, and gives Claude the tools to read and answer in RANY.",
   "license": "MIT",
   "keywords": ["rany", "persona", "chat", "tasks"]

@@ -324,7 +324,7 @@ function loadConfig() {
     // persona; the last two are it overhearing your own conversations, which is a firehose in a
     // busy guild and is off unless you ask for it.
     wake: {
-      tasks: true, addressed: true, sessions: true, forwards: true,
+      tasks: true, comments: true, addressed: true, sessions: true, forwards: true,
       ownerMentions: false, ownerDms: false,
       ...(file.wake ?? {}),
     },
@@ -532,6 +532,37 @@ function classify(type, d) {
       `in this project, report what you did with comment_task, and move the card with`,
       `set_task_status (get_task lists the board's statuses and their categories). If it is not`,
       `about this project, say so in the comment instead of guessing.`,
+      ``,
+      asPersona(),
+    ].join('\n')
+  }
+
+  // A COMMENT on a task this persona is ASSIGNED to (the gateway only delivers those, and never the
+  // persona's own comment — db/0312). Routed by board like the assignment, so it wakes the session
+  // that bound the board and no other. This is the follow-up channel: an answer to a question the
+  // persona asked, or "also do X" on a task it already owns.
+  if (type === 'TASK_COMMENT_CREATED') {
+    if (!config.wake.comments) return null
+    const guildId = String(d.guildId ?? d.taskGuildId ?? '')
+    const boardId = String(d.boardId ?? '')
+    const boundTo = claimedBy(boardId)
+    if (!ownedHere(boundTo)) {
+      const why = !boundTo ? 'skip (unbound)'
+        : entrySession(boundTo) ? `skip (bound to session ${entrySession(boundTo)})`
+        : `skip (owned by ${entryDir(boundTo)})`
+      logRoute('TASK_COMMENT_CREATED', { boardId, guildId }, why)
+      return null
+    }
+    logRoute('TASK_COMMENT_CREATED', { boardId, guildId }, 'wake')
+    const c = d.comment ?? {}
+    return [
+      `RANY: a new comment on a task assigned to your persona.`,
+      `  task ${d.taskId} in guild ${guildId} — comment by user ${c.authorId ?? '?'}:`,
+      `  ${c.content ?? ''}`,
+      ``,
+      `Re-read the task with get_task({guildId:"${guildId}", taskId:"${d.taskId}"}) — the full comment`,
+      `thread and current state — then do what the comment asks in this project, reply with`,
+      `comment_task, and move the card with set_task_status if the state changed.`,
       ``,
       asPersona(),
     ].join('\n')

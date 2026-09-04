@@ -299,7 +299,7 @@ function loadConfig() {
   return {
     apiUrl, token, gatewayUrl,
     wake: {
-      tasks: true, addressed: true, sessions: true, forwards: true,
+      tasks: true, comments: true, addressed: true, sessions: true, forwards: true,
       ownerMentions: false, ownerDms: false,
       ...(file.wake ?? {}),
     },
@@ -543,6 +543,35 @@ function route(type, d) {
         `in this project, report what you did with comment_task, and move the card with`,
         `set_task_status (get_task lists the board's statuses and their categories). If it is not`,
         `about this project, say so in the comment instead of guessing.`,
+        ``,
+        asPersona(),
+      ].join('\n'),
+    }
+  }
+
+  // A COMMENT on a task this persona is ASSIGNED to (the gateway delivers only those, never the
+  // persona's own — db/0312). Routed by board like the assignment: it goes to the thread that bound
+  // the board. The follow-up channel — an answer to a question the persona asked, or "also do X".
+  if (type === 'TASK_COMMENT_CREATED') {
+    if (!config.wake.comments) return null
+    const guildId = String(d.guildId ?? d.taskGuildId ?? '')
+    const boardId = String(d.boardId ?? '')
+    const owner = ownerOf(claimedBy(boardId))
+    if (!owner) {
+      logRoute('TASK_COMMENT_CREATED', { boardId, guildId }, claimedBy(boardId) ? 'skip (another agent\'s bind)' : 'skip (unbound)')
+      return null
+    }
+    const c = d.comment ?? {}
+    return {
+      dir: owner.dir, threadId: owner.threadId,
+      text: [
+        `RANY: a new comment on a task assigned to your persona.`,
+        `  task ${d.taskId} in guild ${guildId} — comment by user ${c.authorId ?? '?'}:`,
+        `  ${c.content ?? ''}`,
+        ``,
+        `Re-read the task with get_task({guildId:"${guildId}", taskId:"${d.taskId}"}) — the full comment`,
+        `thread and current state — then do what the comment asks in this project, reply with`,
+        `comment_task, and move the card with set_task_status if the state changed.`,
         ``,
         asPersona(),
       ].join('\n'),
