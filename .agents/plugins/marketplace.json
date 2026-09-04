@@ -1,0 +1,19 @@
+{
+  "name": "rany-plugins",
+  "interface": {
+    "displayName": "RANY"
+  },
+  "plugins": [
+    {
+      "name": "rany",
+      "source": {
+        "source": "local",
+        "path": "./plugins/codex-rany"
+      },
+      "policy": {
+        "installation": "AVAILABLE"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

@@ -11,12 +11,12 @@ id and the message that triggered it; `list_channels` lists the guild channels t
 1. `get_recent_messages({ channelId })` for the thread as it stands. Answer the last thing said,
    not the whole backlog.
 2. Work out the answer here — this session has the repository and the context, which is the entire
-   reason the question is being answered from a Claude Code session instead of a hosted worker.
+   reason the question is being answered from a Codex session instead of a hosted worker.
 3. `post_message({ channelId, content, replyToId })` — `replyToId` when you are answering one
    specific message, omitted when you are just continuing the conversation.
 
 Two things about the post. It goes out under the persona's own name, visibly an AI — RANY puts
-that name on it, so do not sign it and never write "Claude" or a model name in it — and write to
+that name on it, so do not sign it and never write "Codex" or a model name in it — and write to
 the person who asked: short, plain, and in the language they used. And it is a chat message, not a
 report — if the answer needs three paragraphs, the useful version is usually one sentence plus an
 offer to go deeper.

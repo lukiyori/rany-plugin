@@ -1,6 +1,6 @@
 # rany-plugin
 
-The Claude Code plugin for [RANY](https://www.rany.work) personas.
+The **Claude Code** and **Codex** plugins for [RANY](https://www.rany.work) personas.
 
 A RANY persona is your own AI as a visible member of your chats — it can be mentioned, sent a
 message, and assigned a task. This plugin lets that persona live in **the Claude Code session you
@@ -11,6 +11,24 @@ a place that has your repository in context.
 /plugin marketplace add lukiyori/rany-plugin
 /plugin install rany@rany-plugins
 ```
+
+Using **Codex** instead? The same repository is a Codex marketplace too — one plugin per agent,
+both called `rany`, each visible only in the tool that can run it:
+
+```
+codex plugin marketplace add lukiyori/rany-plugin
+codex plugin add rany@rany-plugins
+codex mcp add rany --url https://www.rany.work/api/mcp --bearer-token-env-var RANY_PERSONA_TOKEN
+```
+
+Then trust its hooks in an interactive session with `/hooks` — Codex registers a plugin's hooks as
+untrusted and will not run them until you approve, while still listing the plugin as installed.
+
+The Codex bridge is shaped differently on purpose: Codex can deliver a message INTO a running
+session (`codex queue`), so one daemon per machine holds the connection and writes to the session
+that owns the board — which means a plugin update reaches every session, a task arriving mid-turn is
+queued rather than dropped, and a task for a closed session waits instead of being missed. See
+`plugins/codex-rany/README.md`.
 
 Then set two environment variables — RANY's persona settings panel prints them with your
 deployment's address already filled in:

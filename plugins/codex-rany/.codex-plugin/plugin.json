@@ -1,0 +1,25 @@
+{
+  "name": "rany",
+  "version": "0.1.1",
+  "description": "Your RANY persona, inside the Codex session you already have open: it queues a message into the session that owns a board when someone assigns you a task or asks your AI something, and gives Codex the tools to read and answer in RANY.",
+  "author": {
+    "name": "RANY"
+  },
+  "license": "MIT",
+  "keywords": ["rany", "persona", "chat", "tasks"],
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks.json",
+  "interface": {
+    "displayName": "RANY",
+    "shortDescription": "Your RANY persona inside Codex",
+    "longDescription": "Wakes the Codex session that owns a RANY task board when work is assigned to your persona, and exposes RANY's tasks, channels and channel docs as tools.",
+    "developerName": "RANY",
+    "category": "Productivity",
+    "capabilities": ["Interactive", "Read", "Write"],
+    "defaultPrompt": [
+      "Bind this repository to a RANY board",
+      "Work the RANY task assigned to my persona",
+      "Answer the RANY conversation as my persona"
+    ]
+  }
+}

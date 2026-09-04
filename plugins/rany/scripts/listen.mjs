@@ -350,6 +350,7 @@ if (!claimLock()) process.exit(QUIET)
 const OP = { Dispatch: 0, Hello: 1, Identify: 2, Heartbeat: 3, Resume: 6, InvalidSession: 9 }
 
 let personaUserId = null
+let personaName = null   // from READY; the name every post is attributed to
 let heartbeat = null
 let claimBeat = null
 let socket = null
@@ -370,6 +371,18 @@ const CLAIM_REFRESH_MS = 5 * 60_000
 process.on('SIGTERM', () => done(QUIET))
 process.on('SIGINT', () => done(QUIET))
 setTimeout(() => done(QUIET), config.maxMinutes * 60_000).unref()
+
+/** Who the session speaks as. Every wake-up carries it, because a session that is not told signs
+ *  as the model underneath ("— Claude (AI)") under a comment RANY already labels with the persona's
+ *  name — and a commit made for the task then credits the model too. */
+function asPersona() {
+  const who = personaName ? `the persona "${personaName}"` : 'your persona'
+  return [
+    `You act as ${who}. RANY attributes posts and comments to that name by itself: do not sign`,
+    `them, and never name the model underneath ("Claude", "— AI"). A commit made for RANY work is`,
+    `${who}'s as well — author or Co-Authored-By ${personaName ?? 'the persona'} <noreply@rany.work>.`,
+  ].join('\n')
+}
 
 /**
  * What this event means for the persona, or null to keep waiting. The gateway already decides what
@@ -423,6 +436,8 @@ function classify(type, d) {
       `in this project, report what you did with comment_task, and move the card with`,
       `set_task_status (get_task lists the board's statuses and their categories). If it is not`,
       `about this project, say so in the comment instead of guessing.`,
+      ``,
+      asPersona(),
     ].join('\n')
   }
 
@@ -437,6 +452,8 @@ function classify(type, d) {
       ``,
       `Answer with post_message({channelId:"${d.channelId}", content:"…", replyToId:"${target?.id ?? ''}"}).`,
       `get_recent_messages on that channel gives you the rest of the thread.`,
+      ``,
+      asPersona(),
     ].join('\n')
   }
 
@@ -487,6 +504,8 @@ function classify(type, d) {
       `  user ${d.authorId}: ${d.content ?? ''}`,
       ``,
       `Reply with post_message({channelId:"${d.channelId}", content:"…"}).`,
+      ``,
+      asPersona(),
     ].join('\n')
   }
 
@@ -500,6 +519,8 @@ function classify(type, d) {
       `They are asking YOUR AI, not you. Answer them with`,
       `post_message({channelId:"${d.channelId}", content:"…", replyToId:"${d.messageId}"}).`,
       `get_recent_messages on that channel for what was said before.`,
+      ``,
+      asPersona(),
     ].join('\n')
   }
 
@@ -554,6 +575,7 @@ function connect() {
     if (frame.op !== OP.Dispatch) return
     if (frame.t === 'READY') {
       personaUserId = String(frame.d?.userId ?? '') || null
+      personaName = String(frame.d?.persona?.displayName ?? '').trim() || null
       // Authenticated and listening → this checkout is genuinely handling its boards. Declared here
       // rather than at startup so a persona is never advertised on the strength of a token that the
       // gateway then refuses (paused, revoked, or hosted).

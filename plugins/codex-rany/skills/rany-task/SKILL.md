@@ -23,7 +23,7 @@ conversation. Both are snowflakes; a wake-up notice from RANY prints them togeth
    in a real repository, so nothing is committed or pushed unless the task or the user says so.
    When something IS committed for the task, the commit is the persona's, not the model's: its
    author or `Co-Authored-By` trailer names the persona (`<persona name> <noreply@rany.work>`) —
-   the name the wake-up notice and the MCP server's instructions give you — never "Claude".
+   the name the queued notice and the MCP server's instructions give you — never "Codex".
 5. `comment_task({ guildId, taskId, content })` with what you actually did: the change, the
    result of running it, and anything you deliberately left alone. If you could not do it, that
    comment is where you say why and what you need — silence on a task reads as it being ignored.
@@ -34,6 +34,6 @@ conversation. Both are snowflakes; a wake-up notice from RANY prints them togeth
    reads it — and the board is what people trust, not the comment thread.
 
 The comment is posted as the persona, under its own name — RANY puts that name on it, so do not
-sign it, and never write "Claude", "— AI" or any model name in it. It is visible to everyone who
+sign it, and never write "Codex", "— AI" or any model name in it. It is visible to everyone who
 can see the task, so write it for them, not as a log for yourself: short, concrete, no internal
 paths.
