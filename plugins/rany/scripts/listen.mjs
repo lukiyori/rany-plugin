@@ -271,7 +271,22 @@ function claimLock() {
     mkdirSync(dirname(pidFile), { recursive: true })
     if (existsSync(pidFile)) {
       const pid = Number(readFileSync(pidFile, 'utf8').trim())
-      if (pid && pid !== process.pid && alive(pid)) return false
+      // A LIVE holder is another session open in this same repository. Take the lock from it rather
+      // than bowing out.
+      //
+      // Bowing out was the old behaviour and it produced the worst possible symptom: the second
+      // window's hook spawned a listener, the listener saw a live pid, exited instantly — a console
+      // flashing open and shut — and every task woke the FIRST window, which the user might not even
+      // have on screen. From where they sat, assignment simply did nothing.
+      //
+      // Taking over is not a race to the bottom, because of when this runs: the Stop hook respawns
+      // the listener at the end of every turn, so the lock lands on whichever session most recently
+      // did something. That is the session the person is actually sitting in — the only honest
+      // answer to "which of my windows should this task wake".
+      if (pid && pid !== process.pid && alive(pid)) {
+        try { process.kill(pid) } catch { /* it exited between the check and here: fine, we take it */ }
+        logRoute('LOCK', { tookFrom: pid }, 'took the project listener')
+      }
     }
     writeFileSync(pidFile, String(process.pid))
     return true
