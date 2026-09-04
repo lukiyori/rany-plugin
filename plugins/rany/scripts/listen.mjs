@@ -349,7 +349,8 @@ if (!claimLock()) process.exit(QUIET)
 
 const OP = { Dispatch: 0, Hello: 1, Identify: 2, Heartbeat: 3, Resume: 6, InvalidSession: 9 }
 
-let personaUserId = null
+let personaUserId = null
+let ownerUserId = null
 let personaName = null   // from READY; the name every post is attributed to
 let heartbeat = null
 let claimBeat = null
@@ -489,6 +490,14 @@ function classify(type, d) {
   // it was added to. Always its own conversation, never eavesdropping.
   if (!isGuild && recipients.includes(personaUserId)) {
     if (!config.wake.sessions) return null
+    // Only the persona's OWN chat with its owner may wake a coding session. A conversation somebody
+    // else opened with the persona (ADR-037) must not: waking this session hands a stranger the
+    // repository, the shell and the tools. Those are answered by a hosted persona on the server, or
+    // not at all — "no code access" has to be a rule in the runtime, not a hope about who talks.
+    if (!(ownerUserId && recipients.length === 2 && recipients.includes(ownerUserId))) {
+      logRoute('MESSAGE_CREATED', { channelId: d.channelId, recipients }, 'skip (not the owner own chat)')
+      return null
+    }
     // ...unless RANY's own notification bot wrote it. Those DMs mirror events the gateway ALREADY
     // delivered (a task assignment arrives as TASK_UPDATED, which is routed by board), so waking on
     // them announces the same thing twice — and, being a DM rather than a guild event, the second
@@ -576,6 +585,10 @@ function connect() {
     if (frame.t === 'READY') {
       personaUserId = String(frame.d?.userId ?? '') || null
       personaName = String(frame.d?.persona?.displayName ?? '').trim() || null
+      // Who the persona belongs to. Needed to tell the persona's OWN chat from a conversation some
+      // third party opened with it — see the DM branch, where that distinction is the whole of
+      // "a stranger must never reach your code".
+      ownerUserId = String(frame.d?.persona?.ownerUserId ?? '') || null
       // Authenticated and listening → this checkout is genuinely handling its boards. Declared here
       // rather than at startup so a persona is never advertised on the strength of a token that the
       // gateway then refuses (paused, revoked, or hosted).

@@ -381,7 +381,8 @@ try {
 const OP = { Dispatch: 0, Hello: 1, Identify: 2, Heartbeat: 3, InvalidSession: 9 }
 
 let personaUserId = null
-let personaName = null   // from READY; the name every post is attributed to
+let personaName = null   // from READY; the name every post is attributed to
+let ownerUserId = null   // from READY; only the OWNER own chat may reach a coding session
 let heartbeat = null
 let socket = null
 
@@ -503,6 +504,14 @@ function route(type, d) {
   // carries no board and no guild, so there is nothing to route it BY — it goes to the session the
   // owner most recently worked in, which is the only honest answer.
   if (recipients.includes(personaUserId) && config.wake.sessions) {
+    // Only the persona's OWN chat with its owner may reach a coding session. A conversation somebody
+    // else opened with the persona (ADR-037) must not: queueing it hands a stranger this machine's
+    // repositories, shell and tools. Those are answered by a hosted persona on the server, or not at
+    // all — "no code access" has to be a rule here, not a hope about who talks to whom.
+    if (!(ownerUserId && recipients.length === 2 && recipients.includes(ownerUserId))) {
+      logRoute('MESSAGE_CREATED', { channelId: d.channelId }, 'skip (not the owner own chat)')
+      return null
+    }
     // ...unless RANY's own notification bot wrote it. Those DMs mirror events the gateway ALREADY
     // delivered, so acting on them announces the same thing twice — and the copy carries no board.
     if (String(d.authorId ?? '') === SYSTEM_BOT_ID) {
@@ -579,6 +588,9 @@ function connect() {
     if (frame.t === 'READY') {
       personaUserId = String(frame.d?.userId ?? '') || null
       personaName = String(frame.d?.persona?.displayName ?? '').trim() || null
+      // Who the persona belongs to — the DM branch needs it to tell the persona's own chat from a
+      // conversation a third party opened with it.
+      ownerUserId = String(frame.d?.persona?.ownerUserId ?? '') || null
       return
     }
     if (!personaUserId) return
