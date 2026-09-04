@@ -498,6 +498,15 @@ const shutdown = () => {
 process.on('SIGTERM', shutdown)
 process.on('SIGINT', shutdown)
 
+// Stay up. This daemon's whole job is to be there when a task arrives, and a background process that
+// dies silently on one bad event is worse than useless — it looks bound and wakes nobody, which is
+// exactly the "assigned a task, nothing happened" report. A single malformed frame or a transient
+// network reject must be logged and shrugged off, never fatal. The socket's own close handler owns
+// reconnection; these just make sure an unexpected throw somewhere else does not take the process
+// with it.
+process.on('uncaughtException', (e) => logRoute('CRASH', {}, `uncaughtException: ${e?.stack ?? e?.message ?? e}`))
+process.on('unhandledRejection', (e) => logRoute('CRASH', {}, `unhandledRejection: ${e?.message ?? e}`))
+
 void refreshClaims()
 setInterval(() => void refreshClaims(), CLAIM_REFRESH_MS).unref?.()
 
