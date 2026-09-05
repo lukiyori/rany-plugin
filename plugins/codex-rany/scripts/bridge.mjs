@@ -587,6 +587,35 @@ function route(type, d) {
     }
   }
 
+  // A guild WORKFLOW handed this persona a step (ADR-040). The answer goes back through
+  // complete_workflow_step; the workflow decides where the output lands.
+  if (type === 'PERSONA_WORKFLOW') {
+    if (config.wake.workflows === false) return null
+    const owner = ownerOf(claimedBy(d.guildId))
+    if (!owner) { logRoute('PERSONA_WORKFLOW', { guildId: d.guildId, stepId: d.stepId }, 'skip (unclaimed guild)'); return null }
+    const msgs = Array.isArray(d.messages) ? d.messages : []
+    const context = msgs.length
+      ? ['', 'Recent messages of the channel this step is about:',
+         ...msgs.map((m) => `  [${m.createdAt ?? ''}] user ${m.authorId ?? '?'}: ${m.content ?? ''}`)]
+      : []
+    return {
+      dir: owner.dir, threadId: owner.threadId,
+      text: [
+        `RANY: the workflow "${d.workflowName ?? d.workflowId}" in guild ${d.guildId} is running a step through your persona.`,
+        `  step ${d.stepId} (run ${d.runId}) — answer within ${d.timeoutMinutes ?? 30} minutes or the run fails.`,
+        `  Prompt:`,
+        `  ${String(d.prompt ?? '').split('\n').join('\n  ')}`,
+        ...context,
+        ``,
+        `Do what the prompt asks (in this project when it concerns the code), then send ONLY the requested`,
+        `content with complete_workflow_step({stepId:"${d.stepId}", output:"…"}). No preamble, no sign-off;`,
+        `do not post_message on your own for this step unless the prompt explicitly asks you to.`,
+        ``,
+        asPersona(),
+      ].join('\n'),
+    }
+  }
+
   if (type === 'PERSONA_FORWARD') {
     if (!config.wake.forwards) return null
     const owner = ownerOf(claimedBy(d.guildId))

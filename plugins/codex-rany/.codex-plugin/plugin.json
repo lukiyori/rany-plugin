@@ -1,6 +1,6 @@
 {
   "name": "rany",
-  "version": "0.2.4",
+  "version": "0.3.0",
   "description": "Your RANY persona, inside the Codex session you already have open: it queues a message into the session that owns a board when someone assigns you a task or asks your AI something, and gives Codex the tools to read and answer in RANY.",
   "author": {
     "name": "RANY"

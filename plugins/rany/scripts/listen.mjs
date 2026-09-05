@@ -324,7 +324,7 @@ function loadConfig() {
     // persona; the last two are it overhearing your own conversations, which is a firehose in a
     // busy guild and is off unless you ask for it.
     wake: {
-      tasks: true, comments: true, addressed: true, sessions: true, forwards: true,
+      tasks: true, comments: true, addressed: true, sessions: true, forwards: true, workflows: true,
       ownerMentions: false, ownerDms: false,
       ...(file.wake ?? {}),
     },
@@ -563,6 +563,45 @@ function classify(type, d) {
       `Re-read the task with get_task({guildId:"${guildId}", taskId:"${d.taskId}"}) — the full comment`,
       `thread and current state — then do what the comment asks in this project, reply with`,
       `comment_task, and move the card with set_task_status if the state changed.`,
+      ``,
+      asPersona(),
+    ].join('\n')
+  }
+
+  // A guild WORKFLOW handed this persona a step (ADR-040): the prompt is the work, and the answer
+  // goes back through complete_workflow_step — never into a channel by itself, the workflow decides
+  // where the output lands. Routed like a guild message: a claimed guild wakes its session, an
+  // unclaimed one wakes the window you are sitting in.
+  if (type === 'PERSONA_WORKFLOW') {
+    if (!config.wake.workflows) return null
+    const guildId = String(d.guildId ?? '')
+    const owner = claimedBy(guildId)
+    if (owner && !ownedHere(owner)) {
+      const why = entrySession(owner) ? `skip (bound to session ${entrySession(owner)})` : `skip (owned by ${entryDir(owner)})`
+      logRoute('PERSONA_WORKFLOW', { guildId, stepId: d.stepId }, why)
+      return null
+    }
+    if (!owner && !isActiveSession()) {
+      logRoute('PERSONA_WORKFLOW', { guildId, stepId: d.stepId }, 'skip (guild unclaimed, not active session)')
+      return null
+    }
+    logRoute('PERSONA_WORKFLOW', { guildId, stepId: d.stepId }, 'wake')
+    const msgs = Array.isArray(d.messages) ? d.messages : []
+    const context = msgs.length
+      ? ['', 'Recent messages of the channel this step is about:',
+         ...msgs.map((m) => `  [${m.createdAt ?? ''}] user ${m.authorId ?? '?'}: ${m.content ?? ''}`)]
+      : []
+    return [
+      `RANY: the workflow "${d.workflowName ?? d.workflowId}" in guild ${guildId} is running a step through your persona.`,
+      `  step ${d.stepId} (run ${d.runId}) — answer within ${d.timeoutMinutes ?? 30} minutes or the run fails.`,
+      `  Prompt:`,
+      `  ${String(d.prompt ?? '').split('\n').join('\n  ')}`,
+      ...context,
+      ``,
+      `Do what the prompt asks (in this project when it concerns the code), then send ONLY the requested`,
+      `content with complete_workflow_step({stepId:"${d.stepId}", output:"…"}). The output may be posted to a`,
+      `channel, written into a task or fed to later steps by the workflow — no preamble, no sign-off.`,
+      `Do not post_message on your own for this step unless the prompt explicitly asks you to.`,
       ``,
       asPersona(),
     ].join('\n')
