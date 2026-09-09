@@ -112,6 +112,60 @@ function dropThreadBindings(threadId) {
   if (changed) try { writeFileSync(bindFile, JSON.stringify({ boards }, null, 2)) } catch { /* best effort */ }
 }
 
+/** A durable, per-repository record of every board ever bound here, WITH its human names. Unlike a
+ *  binding (session-scoped, dies with the thread), this survives — so a fresh Codex session can open
+ *  and be told "this repo has handled General (Rany) before — re-bind it?" instead of leaving you to
+ *  remember the number. Keyed by normalized repo dir. */
+const historyFile = join(HOME, 'board-history.json')
+
+function loadHistory() {
+  try { return JSON.parse(readFileSync(historyFile, 'utf8')).repos ?? {} } catch { return {} }
+}
+function recordHistory(dir, boardId, info) {
+  const repos = loadHistory()
+  const key = norm(dir)
+  const boards = repos[key] ?? {}
+  boards[String(boardId)] = {
+    boardName: info?.name ?? null, guildName: info?.guildName ?? null,
+    guildId: info?.guildId ?? null, dir, lastBound: new Date().toISOString(),
+  }
+  repos[key] = boards
+  try { mkdirSync(HOME, { recursive: true }); writeFileSync(historyFile, JSON.stringify({ repos }, null, 2)) }
+  catch { /* best effort — the binding itself still saved */ }
+}
+const historyForRepo = (dir) => Object.entries(loadHistory()[norm(dir)] ?? {})
+function boardLabel(boardId, h) {
+  if (h?.boardName && h?.guildName) return `${h.boardName} (${h.guildName}) — board ${boardId}`
+  if (h?.boardName) return `${h.boardName} — board ${boardId}`
+  return `board ${boardId}`
+}
+
+/** Resolve a board id to its name + space via the persona token (GET /personas/@self/boards/{id}).
+ *  Best-effort: an older server, offline, or no access yields null and the binding is stored by id
+ *  alone. node:http, like declareBoards, so `--bind` can exit cleanly right after. */
+function fetchBoardInfo(boardId, timeoutMs = 5000) {
+  return new Promise((resolve) => {
+    if (!config.token) return resolve(null)
+    let url
+    try { url = new URL(`${config.apiUrl}/personas/@self/boards/${boardId}`) } catch { return resolve(null) }
+    const send = url.protocol === 'http:' ? httpRequest : httpsRequest
+    const req = send(url, {
+      method: 'GET', agent: false, timeout: timeoutMs,
+      headers: { authorization: `Bearer ${config.token}`, accept: 'application/json' },
+    }, (res) => {
+      if (res.statusCode !== 200) { res.resume(); return resolve(null) }
+      let body = ''
+      res.setEncoding('utf8')
+      res.on('data', (d) => { body += d })
+      res.on('end', () => { try { resolve(JSON.parse(body)) } catch { resolve(null) } })
+      res.on('error', () => resolve(null))
+    })
+    req.on('timeout', () => req.destroy())
+    req.on('error', () => resolve(null))
+    req.end()
+  })
+}
+
 /** Why an event went where it went. The daemon outlives every session, so without this the only
  *  record of a routing decision is the interruption itself. Best-effort; never worth an error. */
 function logRoute(type, ids, decision) {
@@ -380,20 +434,26 @@ if (has('--bind')) {
     process.stdout.write('RANY: --bind needs a board id (RANY → board header → ID), or no argument to list unrouted boards\n')
     process.exit(0)
   }
+  // Resolve the human names first, so the binding, the confirmation, and the next session's reminder
+  // read "General (Rany)" and not a bare number.
+  const info = await fetchBoardInfo(boardId)
+  const label = info?.name ? (info.guildName ? `${info.name} (${info.guildName})` : info.name) : `board ${boardId}`
   const boards = loadBindings()
   // Bind to the CURRENT thread, resolved from the heartbeat the UserPromptSubmit hook just wrote for
   // this cwd (a skill-run command gets no hook stdin, so the thread id comes from there). Falls back
   // to a legacy directory string only when no live thread can be identified.
   const threadId = lastPromptedThread(process.cwd())
   boards[boardId] = threadId
-    ? { dir: process.cwd(), agent: 'codex', threadId, ts: Date.now() }
+    ? { dir: process.cwd(), agent: 'codex', threadId, ts: Date.now(),
+        boardName: info?.name ?? null, guildName: info?.guildName ?? null }
     : process.cwd()
   try {
     mkdirSync(HOME, { recursive: true })
     writeFileSync(bindFile, JSON.stringify({ boards }, null, 2))
+    recordHistory(process.cwd(), boardId, info)
     process.stdout.write(threadId
-      ? `RANY: ${boardId} is now handled in THIS Codex thread (${process.cwd()}). It stops when this thread closes; re-run /rany-bind in another to move it.\n`
-      : `RANY: ${boardId} is now handled in ${process.cwd()} (no active thread detected; routes to the most recent one there)\n`)
+      ? `RANY: ${label} is now handled in THIS Codex thread (${process.cwd()}). It stops when this thread closes; re-run /rany-bind in another to move it.\n`
+      : `RANY: ${label} is now handled in ${process.cwd()} (no active thread detected; routes to the most recent one there)\n`)
   } catch (e) {
     process.stdout.write(`RANY: could not save the binding (${e?.message ?? e})\n`)
     process.exit(0)
@@ -434,6 +494,33 @@ if (has('--ensure') || has('--ping')) {
           + 'self-hosted deployment, RANY_API_URL.',
       },
     }) + '\n')
+  }
+  // Re-bind reminder at SessionStart: a binding is thread-scoped, so a fresh Codex session owns nothing
+  // even in a repo it has handled before. Surface those boards by name and hand over the one-liners,
+  // rather than leaving the numbers to memory. --ensure only (never --ping, which fires every prompt).
+  if (config.token && has('--ensure')) {
+    const dir = typeof hook.cwd === 'string' && hook.cwd ? hook.cwd : process.cwd()
+    const threadId = typeof hook.session_id === 'string' ? hook.session_id : undefined
+    const boards = loadBindings()
+    const boundHere = (id) => {
+      const e = boards[String(id)]
+      return e && typeof e === 'object' && threadId && String(e.threadId) === threadId
+    }
+    const forgotten = historyForRepo(dir).filter(([id]) => !boundHere(id))
+    if (forgotten.length > 0) {
+      process.stdout.write(JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName: 'SessionStart',
+          additionalContext: [
+            'RANY: this repo has handled these boards before, but none are bound to THIS Codex thread:',
+            ...forgotten.map(([id, h]) => '  • ' + boardLabel(id, h)),
+            '',
+            'A binding belongs to one thread and does not carry over. To handle them here, run:',
+            ...forgotten.map(([id]) => '  /rany-bind ' + id),
+          ].join('\n'),
+        },
+      }) + '\n')
+    }
   }
   process.exit(0)
 }

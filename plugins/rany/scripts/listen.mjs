@@ -208,20 +208,28 @@ function listUnrouted() {
 /** `--bind <id>`: run in the repo that owns that work. The id may be a BOARD or a GUILD — a board is
  *  the precise unit, a guild claims everything in a server that is one project (and covers the guild
  *  conversations a board id can never match). Both live in the same map; a board binding wins. */
-function bindBoard(boardId) {
+async function bindBoard(boardId) {
+  // Resolve the human names first, so the binding carries "General (Rany)" — legible in the file, in
+  // the confirmation, and in the next session's re-bind reminder — not a bare number.
+  const info = await fetchBoardInfo(boardId)
   const boards = loadBindings()
   // Session-scoped when we know the session (the normal case); a bare directory string only on an
   // older Claude that does not export the id, which keeps the previous behaviour rather than losing
   // the binding entirely.
   boards[boardId] = sessionId
-    ? { dir: projectDir, agent: 'claude', sessionId, ts: Date.now() }
+    ? { dir: projectDir, agent: 'claude', sessionId, ts: Date.now(),
+        boardName: info?.name ?? null, guildName: info?.guildName ?? null }
     : projectDir
   try {
     mkdirSync(dirname(bindFile), { recursive: true })
     writeFileSync(bindFile, JSON.stringify({ boards }, null, 2))
+    recordHistory(boardId, info)
+    const label = info?.name
+      ? (info.guildName ? `${info.name} (${info.guildName})` : info.name)
+      : `board ${boardId}`
     process.stdout.write(sessionId
-      ? `RANY: ${boardId} is now handled in THIS session (${projectDir}). It stops when this session closes; re-run /rany-bind in another to move it.\n`
-      : `RANY: ${boardId} is now handled in ${projectDir}\n`)
+      ? `RANY: ${label} is now handled in THIS session (${projectDir}). It stops when this session closes; re-run /rany-bind in another to move it.\n`
+      : `RANY: ${label} is now handled in ${projectDir}\n`)
   } catch (e) {
     process.stdout.write(`RANY: could not save the binding (${e?.message ?? e})\n`)
   }
@@ -247,6 +255,72 @@ function dropMyBindings() {
     if (typeof e === 'object' && e?.sessionId === sessionId) { delete boards[id]; changed = true }
   if (!changed) return
   try { writeFileSync(bindFile, JSON.stringify({ boards }, null, 2)) } catch { /* best effort */ }
+}
+
+/** A durable, per-repository record of every board ever bound here, WITH its human names. Unlike a
+ *  binding (which is session-scoped and dies with the window), this survives — so a fresh session can
+ *  open and say "this repo has handled General (Rany) and Tasks (Cocktail) before — re-bind them?"
+ *  instead of leaving you to remember the numbers. Keyed by normalized repo dir. */
+const historyFile = join(homedir(), '.rany-plugin', 'board-history.json')
+
+function loadHistory() {
+  try { return JSON.parse(readFileSync(historyFile, 'utf8')).repos ?? {} } catch { return {} }
+}
+
+/** Remember (or refresh) a board bound in THIS repo, with the names resolved at bind time. */
+function recordHistory(boardId, info) {
+  const repos = loadHistory()
+  const key = norm(projectDir)
+  const boards = repos[key] ?? {}
+  boards[String(boardId)] = {
+    boardName: info?.name ?? null,
+    guildName: info?.guildName ?? null,
+    guildId: info?.guildId ?? null,
+    dir: projectDir,
+    lastBound: new Date().toISOString(),
+  }
+  repos[key] = boards
+  try {
+    mkdirSync(dirname(historyFile), { recursive: true })
+    writeFileSync(historyFile, JSON.stringify({ repos }, null, 2))
+  } catch { /* best effort — the binding itself still saved */ }
+}
+
+/** This repo's remembered boards. */
+const historyForRepo = () => Object.entries(loadHistory()[norm(projectDir)] ?? {})
+
+/** A board's human label for a message: "General (Rany)" when known, else the bare id. */
+function boardLabel(boardId, h) {
+  const name = h?.boardName, space = h?.guildName
+  if (name && space) return `${name} (${space}) — board ${boardId}`
+  if (name) return `${name} — board ${boardId}`
+  return `board ${boardId}`
+}
+
+/** Resolve a board id to its name + space via the persona token (server ADR: GET
+ *  /personas/@self/boards/{id}). Best-effort: an older server, offline, or no access yields null and
+ *  the binding is stored by id alone. Uses node:http like declareBoards so `--bind` can exit cleanly. */
+function fetchBoardInfo(boardId, timeoutMs = 5000) {
+  return new Promise((resolve) => {
+    if (!config.token) return resolve(null)
+    let url
+    try { url = new URL(`${config.apiUrl}/personas/@self/boards/${boardId}`) } catch { return resolve(null) }
+    const send = url.protocol === 'http:' ? httpRequest : httpsRequest
+    const req = send(url, {
+      method: 'GET', agent: false, timeout: timeoutMs,
+      headers: { authorization: `Bearer ${config.token}`, accept: 'application/json' },
+    }, (res) => {
+      if (res.statusCode !== 200) { res.resume(); return resolve(null) }
+      let body = ''
+      res.setEncoding('utf8')
+      res.on('data', (d) => { body += d })
+      res.on('end', () => { try { resolve(JSON.parse(body)) } catch { resolve(null) } })
+      res.on('error', () => resolve(null))
+    })
+    req.on('timeout', () => req.destroy())
+    req.on('error', () => resolve(null))
+    req.end()
+  })
 }
 
 /**
@@ -378,6 +452,20 @@ function releaseLock() {
   } catch { /* nothing to do */ }
 }
 
+/** The re-bind reminder is shown ONCE per session (a binding is session-scoped, so every fresh window
+ *  starts owning nothing — but nagging it every turn would be unbearable). Marked per session id. */
+const remindedFile = join(projectState, 'reminded.json')
+function alreadyReminded(sid) {
+  try { return JSON.parse(readFileSync(remindedFile, 'utf8'))[sid] === true } catch { return false }
+}
+function markReminded(sid) {
+  let m = {}
+  try { m = JSON.parse(readFileSync(remindedFile, 'utf8')) } catch { /* first */ }
+  m[sid] = true
+  try { mkdirSync(dirname(remindedFile), { recursive: true }); writeFileSync(remindedFile, JSON.stringify(m)) }
+  catch { /* unwritable: it reminds again next turn, which beats never */ }
+}
+
 /** Read before the early-exit commands below, because `--bind` and `--stop` both talk to RANY now
  *  (they declare and withdraw this checkout's board claims). */
 const config = loadConfig()
@@ -393,7 +481,7 @@ if (bindAt !== -1) {
     process.stdout.write('RANY: --bind needs a board id (RANY → board header → ID), or no argument to list unrouted boards\n')
     process.exit(QUIET)
   }
-  bindBoard(boardId)
+  await bindBoard(boardId)
   // Tell RANY straight away. Waiting for the next session start would leave the board looking
   // unhandled in the assignee picker right after someone deliberately bound it.
   await declareBoards(boardsHere())
@@ -438,6 +526,27 @@ if (!config.token) {
   ].join('\n'))
   if (msg) process.stdout.write(msg + '\n')
   process.exit(msg ? WAKE : QUIET)
+}
+
+// Re-bind reminder (once per session): this repo has handled boards before, but a session-scoped
+// binding dies with its window, so a fresh session owns nothing until you say so. Rather than leave
+// you to remember which boards and their numbers, list them by name and hand over the one-liners.
+if (sessionId && !alreadyReminded(sessionId)) {
+  const mineNow = new Set(boardsHere())
+  const forgotten = historyForRepo().filter(([id]) => !mineNow.has(id))
+  if (forgotten.length > 0) {
+    markReminded(sessionId)
+    const msg = [
+      `RANY: this repo has handled these boards before, but none are bound to THIS session:`,
+      ...forgotten.map(([id, h]) => `  • ${boardLabel(id, h)}`),
+      ``,
+      `A binding belongs to one session and does not carry over. To handle them here, run:`,
+      ...forgotten.map(([id]) => `  /rany-bind ${id}`),
+    ].join('\n')
+    process.stdout.write(msg + '\n')
+    process.exit(WAKE)
+  }
+  markReminded(sessionId) // nothing to remind, but don't recompute every turn
 }
 
 if (!claimLock()) process.exit(QUIET)
