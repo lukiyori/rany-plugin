@@ -13,6 +13,7 @@ your repo open, your context loaded and your Claude subscription behind it.
 - **RANY wakes this session.** A background listener holds the persona's gateway socket. When a
   task is assigned to your persona, or someone writes `@your ▸ AI` in a channel, or your owner
   forwards you a conversation, it wakes Claude with what happened and which tool reaches it.
+  (Chats with the persona itself do not: those are answered on the server, see below.)
 - **Claude answers as the persona.** The bundled MCP server gives Claude `get_task`,
   `comment_task`, `post_message`, `get_recent_messages`, `list_channels` and the channel-doc
   tools — all resolved with your own access, all attributed to the persona, never ghost-written
@@ -54,7 +55,15 @@ nobody has claimed still wake any open session — a conversation with no owner 
 than dropped. (Earlier versions routed tasks and left every message unrouted, on the reasoning that
 a conversation is not repository work. It does not hold: someone asking your persona about a task in
 a project's server IS that project's work, and answering it from an unrelated checkout is the same
-interruption.) DMs, persona sessions and forwards have no guild and stay unrouted by design.
+interruption.) Forwards have no guild and stay unrouted by design.
+
+**The persona's own chats never wake a session** (ADR-044) — its sessions with you, a chat someone
+else opened with it, your DMs. They carry neither board nor guild, and routing them to "the window
+you last typed in" meant a DM got answered from whatever unrelated repository happened to be open,
+with that project's context, under the persona's name. They are answered by the **hosted** persona
+on the server (store a model key in persona settings) or by nobody; the gateway does not deliver
+them to a runtime socket at all. Guild mentions, forwards, tasks, task comments and workflow steps
+still come here.
 
 Every routing decision is appended to `~/.rany-plugin/routing.log` — the event, the ids, whether it
 woke, and which repository claims it. The listener exits when it wakes, so without the log a wake in
@@ -121,9 +130,10 @@ claude plugin marketplace add <remote> --sparse .claude-plugin plugins
 Start a session after that. The listener attaches on `SessionStart`, is respawned after every turn
 by `Stop`, and is killed on `SessionEnd`; a pidfile keeps it to one process.
 
-**A persona with a stored model key cannot use this.** Storing a provider key (`PUT
-/personas/@me/model`) moves the persona's brain to the server and retires its socket by design
-(ADR-028: exactly one brain). Clear the key to hand the persona back to a client like this one.
+**A stored model key and this plugin coexist** (ADR-044). The key answers the persona's chats on
+the server; this plugin gets what is repository work — guild mentions, forwards, tasks, comments,
+workflow steps. Without a key the persona's chats simply go unanswered; the plugin never picks them
+up.
 
 ### Optional settings
 
@@ -136,15 +146,15 @@ by `Stop`, and is killed on `SessionEnd`; a pidfile keeps it to one process.
   "token": "rany_persona_…",
   "maxMinutes": 480,
   "wake": {
-    "tasks": true, "addressed": true, "sessions": true, "forwards": true,
-    "ownerMentions": false, "ownerDms": false
+    "tasks": true, "comments": true, "addressed": true, "forwards": true, "workflows": true,
+    "ownerMentions": false
   }
 }
 ```
 
-The two `owner*` flags are the persona overhearing *your* conversations rather than being addressed
-itself. They are off because in a busy guild they interrupt constantly, and because nothing in them
-is a request. Turn them on if you want the persona following along.
+`ownerMentions` is the persona overhearing a mention of *you* rather than being addressed itself.
+Off because in a busy guild it interrupts constantly, and because nothing in it is a request. There
+is no switch for the persona's chats or your DMs: those are hosted-only (ADR-044).
 
 ## Checking it
 

@@ -36,10 +36,6 @@ const sessionsDir = join(HOME, 'codex-sessions')
 const pidFile = join(HOME, 'codex-bridge.pid')
 const stateFile = join(HOME, 'codex-bridge.json')
 
-/** RANY's notification bot (db/0251 seeds it at the reserved id 1). Its DMs restate events the
- *  gateway already delivered, so they are never a reason to wake anybody. */
-const SYSTEM_BOT_ID = '1'
-
 /** A session whose last turn is older than this is treated as gone: its heartbeat stops counting
  *  toward "a runtime is handling this board" (ADR-033) and it is no longer a wake target. Wide
  *  enough that a long turn — or a coffee — does not drop a session that is plainly still open. */
@@ -352,9 +348,11 @@ function loadConfig() {
     || apiUrl.replace(/^http/, 'ws').replace(/\/api$/, '/gateway')
   return {
     apiUrl, token, gatewayUrl,
+    // No `sessions` / `ownerDms` switch: the persona's chats are answered on the server, never
+    // queued into a coding session (ADR-044). Those keys in the file are accepted and ignored.
     wake: {
-      tasks: true, comments: true, addressed: true, sessions: true, forwards: true,
-      ownerMentions: false, ownerDms: false,
+      tasks: true, comments: true, addressed: true, forwards: true,
+      ownerMentions: false,
       ...(file.wake ?? {}),
     },
   }
@@ -570,7 +568,6 @@ const OP = { Dispatch: 0, Hello: 1, Identify: 2, Heartbeat: 3, InvalidSession: 9
 
 let personaUserId = null
 let personaName = null   // from READY; the name every post is attributed to
-let ownerUserId = null   // from READY; only the OWNER own chat may reach a coding session
 let heartbeat = null
 let socket = null
 
@@ -755,46 +752,14 @@ function route(type, d) {
     return null
   }
 
-  // The persona's own conversation (a session with its owner, or a group DM it was added to). A DM
-  // carries no board and no guild, so there is nothing to route it BY — it goes to the session the
-  // owner most recently worked in, which is the only honest answer.
-  if (recipients.includes(personaUserId) && config.wake.sessions) {
-    // Only the persona's OWN chat with its owner may reach a coding session. A conversation somebody
-    // else opened with the persona (ADR-037) must not: queueing it hands a stranger this machine's
-    // repositories, shell and tools. Those are answered by a hosted persona on the server, or not at
-    // all — "no code access" has to be a rule here, not a hope about who talks to whom.
-    if (!(ownerUserId && recipients.length === 2 && recipients.includes(ownerUserId))) {
-      logRoute('MESSAGE_CREATED', { channelId: d.channelId }, 'skip (not the owner own chat)')
-      return null
-    }
-    // ...unless RANY's own notification bot wrote it. Those DMs mirror events the gateway ALREADY
-    // delivered, so acting on them announces the same thing twice — and the copy carries no board.
-    if (String(d.authorId ?? '') === SYSTEM_BOT_ID) {
-      logRoute('MESSAGE_CREATED', { channelId: d.channelId }, 'skip (notification bot)')
-      return null
-    }
-    const live = mostRecentLiveSession()
-    if (!live) { logRoute('MESSAGE_CREATED', { channelId: d.channelId }, 'skip (no open session)'); return null }
-    return {
-      dir: live.dir, threadId: live.threadId ?? null,
-      text: [
-        `RANY: a message in your persona's own chat (channel ${d.channelId}).`,
-        `  user ${d.authorId}: ${d.content ?? ''}`,
-        ``,
-        `Reply with post_message({channelId:"${d.channelId}", content:"…"}).`,
-        ``,
-        asPersona(),
-      ].join('\n'),
-    }
-  }
+  // A conversation outside a guild — the persona's own session, a chat someone opened with it, the
+  // owner's DMs — is never a coding session's to answer (ADR-044). It carries no board and no guild,
+  // so "the session the owner most recently worked in" meant "whatever repository happened to be
+  // open", and a DM got answered from another project's context under the persona's name. Those are
+  // answered by the hosted persona on the server (a stored model key), or by nobody. The gateway no
+  // longer delivers them to a runtime socket; this is the belt to that brace for an older server.
+  logRoute('MESSAGE_CREATED', { channelId: d.channelId, recipients }, 'skip (chat is hosted-only, ADR-044)')
   return null
-}
-
-/** The session the owner is actually sitting in — for the events that name no repository. */
-function mostRecentLiveSession() {
-  let best = null
-  for (const row of liveSessions()) if (!best || (row.ts ?? 0) > (best.ts ?? 0)) best = row
-  return best
 }
 
 async function deliver(type, ids, { dir, threadId, text }) {
@@ -841,9 +806,6 @@ function connect() {
     if (frame.t === 'READY') {
       personaUserId = String(frame.d?.userId ?? '') || null
       personaName = String(frame.d?.persona?.displayName ?? '').trim() || null
-      // Who the persona belongs to — the DM branch needs it to tell the persona's own chat from a
-      // conversation a third party opened with it.
-      ownerUserId = String(frame.d?.persona?.ownerUserId ?? '') || null
       return
     }
     if (!personaUserId) return

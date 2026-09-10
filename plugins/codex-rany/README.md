@@ -33,8 +33,8 @@ Self-hosted? Set `RANY_API_URL` too (the gateway URL is derived from it), or wri
 
 ```json
 { "apiUrl": "https://rany.example/api", "token": "rany_persona_…",
-  "wake": { "tasks": true, "addressed": true, "sessions": true, "forwards": true,
-            "ownerMentions": false, "ownerDms": false } }
+  "wake": { "tasks": true, "comments": true, "addressed": true, "forwards": true,
+            "ownerMentions": false } }
 ```
 
 Then, in the repository that owns a board:
@@ -82,8 +82,10 @@ What is the same, deliberately:
    thread most recently prompted there. `routing.log` says which rule applied (`bound` / `most
    recent`).
 
-A persona's own DM carries neither board nor guild, so it goes to the session you were most recently
-working in — the only honest answer available.
+A persona's own chats (its sessions, a chat someone opened with it, your DMs) never reach a Codex
+session at all (ADR-044): they carry neither board nor guild, and "the session you were most recently
+working in" turned out to mean "whatever repository happened to be open". They are answered by the
+hosted persona on the server — store a model key in persona settings — or by nobody.
 
 ## Board claims (ADR-033/036/038)
 

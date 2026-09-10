@@ -63,8 +63,10 @@ const pidFile = sessionId
   : join(projectState, 'listener.pid')
 const saidFile = join(projectState, 'said.json')
 /** The machine's most-recently-active session, refreshed every turn (the Stop hook respawns the
- *  listener, which stamps this). Events that name no board and no guild — the persona's own DM — have
- *  nothing to route BY, so they wake only this session, the window the owner is actually sitting in. */
+ *  listener, which stamps this). Guild events nobody has claimed wake only this session, the window
+ *  the owner is actually sitting in — with one listener per session, "any session may answer" would
+ *  mean every session answering. (The persona's DMs used to route here too; they are hosted-only
+ *  since ADR-044.) */
 const activeFile = join(stateDir, 'active-session.json')
 const ACTIVE_STALE_MS = 15 * 60_000
 /**
@@ -77,10 +79,6 @@ const ACTIVE_STALE_MS = 15 * 60_000
  * saved correctly and never seen. A path both sides compute from nothing cannot drift apart.
  */
 const bindFile = join(homedir(), '.rany-plugin', 'bindings.json')
-
-/** RANY's notification bot (db/0251 seeds it at the reserved id 1). Its DMs restate events the
- *  gateway already delivered, so they are never a reason to wake. */
-const SYSTEM_BOT_ID = '1'
 
 /** Compare paths, not strings. Windows hands the same directory back as `E:\Works\x` or `E:/Works/x`
  *  depending on who asked, and a case difference in a drive letter is not a different repository —
@@ -394,12 +392,14 @@ function loadConfig() {
     || apiUrl.replace(/^http/, 'ws').replace(/\/api$/, '/gateway')
   return {
     apiUrl, token, gatewayUrl,
-    // Which events are worth interrupting you for. The first three are things addressed TO your
-    // persona; the last two are it overhearing your own conversations, which is a firehose in a
-    // busy guild and is off unless you ask for it.
+    // Which events are worth interrupting you for. All of these are things addressed TO your
+    // persona in a guild or a board; `ownerMentions` is it overhearing a mention of you, which is a
+    // firehose in a busy guild and is off unless you ask for it. There is deliberately no switch for
+    // the persona's own chats: those are answered on the server, never here (ADR-044), so a `sessions`
+    // or `ownerDms` key in the file is accepted and ignored.
     wake: {
-      tasks: true, comments: true, addressed: true, sessions: true, forwards: true, workflows: true,
-      ownerMentions: false, ownerDms: false,
+      tasks: true, comments: true, addressed: true, forwards: true, workflows: true,
+      ownerMentions: false,
       ...(file.wake ?? {}),
     },
     // Backstop only. The Stop hook respawns this after every turn, and the pidfile keeps that to
@@ -555,7 +555,6 @@ markActive() // this window just started or finished a turn — it is the one to
 const OP = { Dispatch: 0, Hello: 1, Identify: 2, Heartbeat: 3, Resume: 6, InvalidSession: 9 }
 
 let personaUserId = null
-let ownerUserId = null
 let personaName = null   // from READY; the name every post is attributed to
 let heartbeat = null
 let claimBeat = null
@@ -588,6 +587,25 @@ function asPersona() {
     `them, and never name the model underneath ("Claude", "— AI"). A commit made for RANY work is`,
     `${who}'s as well — author or Co-Authored-By ${personaName ?? 'the persona'} <noreply@rany.work>.`,
   ].join('\n')
+}
+
+/**
+ * The files on a message, as prompt lines. A message whose whole content is a screenshot or a PDF
+ * used to arrive as a blank line — the session then answered a message it had not read. The event
+ * carries the sender's filenames and mime types; it also carries a presigned url, but that one
+ * expires in an hour, so the prompt names the files and points at get_recent_messages for a URL
+ * that is fresh at the moment it is used.
+ */
+function attachmentLines(atts, channelId) {
+  const list = Array.isArray(atts) ? atts : []
+  if (list.length === 0) return []
+  const size = (n) => (typeof n === 'number' && n > 0 ? `, ${n < 1024 * 1024 ? Math.max(1, Math.round(n / 1024)) + ' KB' : (n / 1048576).toFixed(1) + ' MB'}` : '')
+  const names = list.map((a) => `${a.filename ?? 'file'} (${a.contentType ?? 'unknown type'}${size(a.size)})`)
+  return [
+    `  attached: ${names.join(', ')}`,
+    `  get_recent_messages({channelId:"${channelId}", limit:5}) returns a fresh download url per file —`,
+    `  download it and open it (an image included) before answering. Do not answer as if nothing was sent.`,
+  ]
 }
 
 /**
@@ -724,6 +742,7 @@ function classify(type, d) {
       `RANY: your owner forwarded a conversation to your persona.`,
       `  channel ${d.channelId}${d.channelName ? ` (#${d.channelName})` : ''}`,
       `  >>> ${target?.content ?? ''}`,
+      ...attachmentLines(target?.attachments, d.channelId),
       ``,
       `Answer with post_message({channelId:"${d.channelId}", content:"…", replyToId:"${target?.id ?? ''}"}).`,
       `get_recent_messages on that channel gives you the rest of the thread.`,
@@ -767,43 +786,16 @@ function classify(type, d) {
       owner ? 'wake' : 'wake (guild unclaimed)')
   }
 
-  // The persona is itself a member of the conversation: a session with your owner, or a group DM
-  // it was added to. Always its own conversation, never eavesdropping.
-  if (!isGuild && recipients.includes(personaUserId)) {
-    if (!config.wake.sessions) return null
-    // A DM carries no board and no guild, so there is nothing to route it BY. It goes to the window
-    // the owner is sitting in — the active session — and to that one only; with a listener per
-    // session, anything else would wake every open window for one message.
-    if (!isActiveSession()) {
-      logRoute('MESSAGE_CREATED', { channelId: d.channelId }, 'skip (persona DM, not active session)')
-      return null
-    }
-    // Only the persona's OWN chat with its owner may wake a coding session. A conversation somebody
-    // else opened with the persona (ADR-037) must not: waking this session hands a stranger the
-    // repository, the shell and the tools. Those are answered by a hosted persona on the server, or
-    // not at all — "no code access" has to be a rule in the runtime, not a hope about who talks.
-    if (!(ownerUserId && recipients.length === 2 && recipients.includes(ownerUserId))) {
-      logRoute('MESSAGE_CREATED', { channelId: d.channelId, recipients }, 'skip (not the owner own chat)')
-      return null
-    }
-    // ...unless RANY's own notification bot wrote it. Those DMs mirror events the gateway ALREADY
-    // delivered (a task assignment arrives as TASK_UPDATED, which is routed by board), so waking on
-    // them announces the same thing twice — and, being a DM rather than a guild event, the second
-    // copy carries no board and cannot be routed at all. That is how one assignment came to wake
-    // every open session on the machine while the task itself was routed correctly: the notice and
-    // the routing were two different events. A notification is not a conversation.
-    if (String(d.authorId ?? '') === SYSTEM_BOT_ID) {
-      logRoute('MESSAGE_CREATED', { channelId: d.channelId, authorId: d.authorId }, 'skip (notification bot)')
-      return null
-    }
-    return [
-      `RANY: a message in your persona's own chat (channel ${d.channelId}).`,
-      `  user ${d.authorId}: ${d.content ?? ''}`,
-      ``,
-      `Reply with post_message({channelId:"${d.channelId}", content:"…"}).`,
-      ``,
-      asPersona(),
-    ].join('\n')
+  // A conversation outside a guild — the persona's own session, a chat someone opened with it, the
+  // owner's DMs — is NEVER this session's to answer (ADR-044). It carries no board and no guild, so
+  // there was nothing to route it by, and "the window the owner last typed in" turned out to mean
+  // "whatever unrelated repository happened to be open": a DM got answered from another project's
+  // context, under the persona's name. Those conversations are answered by the hosted persona on
+  // the server (a stored model key), or by nobody. The gateway no longer delivers them to a runtime
+  // socket at all; this branch is the belt to that brace, for a server older than the plugin.
+  if (!isGuild) {
+    logRoute('MESSAGE_CREATED', { channelId: d.channelId, recipients }, 'skip (chat is hosted-only, ADR-044)')
+    return null
   }
 
   // Someone wrote <@persona> in a guild channel — they are talking to your AI, not to you.
@@ -812,6 +804,7 @@ function classify(type, d) {
     return [
       `RANY: someone addressed your persona directly in channel ${d.channelId}.`,
       `  user ${d.authorId}: ${d.content ?? ''}`,
+      ...attachmentLines(d.attachments, d.channelId),
       ``,
       `They are asking YOUR AI, not you. Answer them with`,
       `post_message({channelId:"${d.channelId}", content:"…", replyToId:"${d.messageId}"}).`,
@@ -821,12 +814,13 @@ function classify(type, d) {
     ].join('\n')
   }
 
-  // Overhearing the owner's own conversations (the listen_dms / listen_mentions flags). Off by
-  // default: in a busy guild this is a firehose, and it is not addressed to the persona.
-  if (isGuild ? config.wake.ownerMentions : config.wake.ownerDms) {
+  // Overhearing a mention of the owner (the listen_mentions flag). Off by default: in a busy guild
+  // this is a firehose, and it is not addressed to the persona. (Overheard DMs are hosted-only now.)
+  if (config.wake.ownerMentions) {
     return [
-      `RANY: ${isGuild ? 'you were mentioned in' : 'a direct message arrived in'} channel ${d.channelId}.`,
+      `RANY: you were mentioned in channel ${d.channelId}.`,
       `  user ${d.authorId}: ${d.content ?? ''}`,
+      ...attachmentLines(d.attachments, d.channelId),
     ].join('\n')
   }
   return null
@@ -873,10 +867,6 @@ function connect() {
     if (frame.t === 'READY') {
       personaUserId = String(frame.d?.userId ?? '') || null
       personaName = String(frame.d?.persona?.displayName ?? '').trim() || null
-      // Who the persona belongs to. Needed to tell the persona's OWN chat from a conversation some
-      // third party opened with it — see the DM branch, where that distinction is the whole of
-      // "a stranger must never reach your code".
-      ownerUserId = String(frame.d?.persona?.ownerUserId ?? '') || null
       // Authenticated and listening → this checkout is genuinely handling its boards. Declared here
       // rather than at startup so a persona is never advertised on the strength of a token that the
       // gateway then refuses (paused, revoked, or hosted).
