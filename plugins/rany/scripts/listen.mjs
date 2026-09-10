@@ -395,10 +395,11 @@ function loadConfig() {
     // Which events are worth interrupting you for. All of these are things addressed TO your
     // persona in a guild or a board; `ownerMentions` is it overhearing a mention of you, which is a
     // firehose in a busy guild and is off unless you ask for it. There is deliberately no switch for
-    // the persona's own chats: those are answered on the server, never here (ADR-044), so a `sessions`
-    // or `ownerDms` key in the file is accepted and ignored.
+    // the persona's own chats: those are answered on the server (ADR-044), and reach this session
+    // only as an `ask` — a question its chat brain could not answer without the code (ADR-045). A
+    // `sessions` or `ownerDms` key left in the file is accepted and ignored.
     wake: {
-      tasks: true, comments: true, addressed: true, forwards: true, workflows: true,
+      tasks: true, comments: true, addressed: true, forwards: true, workflows: true, asks: true,
       ownerMentions: false,
       ...(file.wake ?? {}),
     },
@@ -729,6 +730,51 @@ function classify(type, d) {
       `content with complete_workflow_step({stepId:"${d.stepId}", output:"…"}). The output may be posted to a`,
       `channel, written into a task or fed to later steps by the workflow — no preamble, no sign-off.`,
       `Do not post_message on your own for this step unless the prompt explicitly asks you to.`,
+      ``,
+      asPersona(),
+    ].join('\n')
+  }
+
+  // The persona's own CHAT BRAIN is asking this session a question (ADR-045). Conversations are
+  // answered on the server — it has the chat, the history and the channel's documents — but not the
+  // repository, so anything that needs the code comes here instead. What you send back is posted to
+  // the person who asked, under the persona's name: answer THEM, not the brain.
+  //
+  // Routed by BOARD first, exactly like a task: the server picks the board bound in the guild the
+  // question came from, so a question asked in a project's own server reaches that project's window.
+  // A board this session did not bind is somebody else's to answer, even in this repository.
+  if (type === 'PERSONA_ASK') {
+    if (!config.wake.asks) return null
+    const boardId = String(d.boardId ?? '')
+    const guildId = String(d.guildId ?? '')
+    const owner = claimedBy(boardId) || claimedBy(guildId)
+    if (owner ? !ownedHere(owner) : !(boardId === '' && isActiveSession())) {
+      const why = !owner ? 'skip (board unbound here)'
+        : entrySession(owner) ? `skip (bound to session ${entrySession(owner)})`
+        : `skip (owned by ${entryDir(owner)})`
+      logRoute('PERSONA_ASK', { askId: d.askId, boardId, guildId }, why)
+      return null
+    }
+    logRoute('PERSONA_ASK', { askId: d.askId, boardId, guildId }, 'wake')
+    const msgs = Array.isArray(d.messages) ? d.messages : []
+    const context = msgs.length
+      ? ['', 'How the conversation got here (you cannot see the channel yourself):',
+         ...msgs.map((m) => `  [${m.createdAt ?? ''}] user ${m.authorId ?? '?'}: ${m.content ?? ''}`)]
+      : []
+    return [
+      `RANY: your persona is asking THIS project a question — it is in a conversation it cannot`,
+      `answer without the code.`,
+      `  ask ${d.askId} — answer within ${d.timeoutMinutes ?? 10} minutes or it gives up and says so.`,
+      `  Question:`,
+      `  ${String(d.question ?? '').split('\n').join('\n  ')}`,
+      ...context,
+      ``,
+      `Work it out in this repository, then send ONLY the answer with`,
+      `answer_persona_ask({askId:"${d.askId}", answer:"…"}).`,
+      `It is POSTED STRAIGHT INTO THE CHAT as the persona, so write to the person who asked: their`,
+      `language, short, no preamble, no sign-off, and no local paths or machine details they cannot`,
+      `use. If the repository does not answer it, say that plainly instead of guessing.`,
+      `Do not post_message for this — the answer goes back through the ask.`,
       ``,
       asPersona(),
     ].join('\n')

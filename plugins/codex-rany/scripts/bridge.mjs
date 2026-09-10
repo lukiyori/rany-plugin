@@ -348,10 +348,11 @@ function loadConfig() {
     || apiUrl.replace(/^http/, 'ws').replace(/\/api$/, '/gateway')
   return {
     apiUrl, token, gatewayUrl,
-    // No `sessions` / `ownerDms` switch: the persona's chats are answered on the server, never
-    // queued into a coding session (ADR-044). Those keys in the file are accepted and ignored.
+    // No `sessions` / `ownerDms` switch: the persona's chats are answered on the server (ADR-044) and
+    // reach a session only as an `ask` — a question its chat brain could not answer without the code
+    // (ADR-045). Those keys left in the file are accepted and ignored.
     wake: {
-      tasks: true, comments: true, addressed: true, forwards: true,
+      tasks: true, comments: true, addressed: true, forwards: true, asks: true,
       ownerMentions: false,
       ...(file.wake ?? {}),
     },
@@ -694,6 +695,45 @@ function route(type, d) {
         `Do what the prompt asks (in this project when it concerns the code), then send ONLY the requested`,
         `content with complete_workflow_step({stepId:"${d.stepId}", output:"…"}). No preamble, no sign-off;`,
         `do not post_message on your own for this step unless the prompt explicitly asks you to.`,
+        ``,
+        asPersona(),
+      ].join('\n'),
+    }
+  }
+
+  // The persona's chat brain is asking this project a question (ADR-045). Conversations are answered
+  // on the server, which has the chat but not the code; what needs the repository comes here, and the
+  // answer is posted straight into that conversation under the persona's name. Routed by BOARD first
+  // — the server picks the board bound in the guild the question came from — so it lands in the
+  // thread that owns that project rather than whichever one was last used.
+  if (type === 'PERSONA_ASK') {
+    if (config.wake.asks === false) return null
+    const owner = ownerOf(claimedBy(d.boardId)) ?? ownerOf(claimedBy(d.guildId))
+    if (!owner) {
+      logRoute('PERSONA_ASK', { askId: d.askId, boardId: d.boardId, guildId: d.guildId }, 'skip (board unbound here)')
+      return null
+    }
+    const msgs = Array.isArray(d.messages) ? d.messages : []
+    const context = msgs.length
+      ? ['', 'How the conversation got here (you cannot see the channel yourself):',
+         ...msgs.map((m) => `  [${m.createdAt ?? ''}] user ${m.authorId ?? '?'}: ${m.content ?? ''}`)]
+      : []
+    return {
+      dir: owner.dir, threadId: owner.threadId,
+      text: [
+        `RANY: your persona is asking THIS project a question — it is in a conversation it cannot`,
+        `answer without the code.`,
+        `  ask ${d.askId} — answer within ${d.timeoutMinutes ?? 10} minutes or it gives up and says so.`,
+        `  Question:`,
+        `  ${String(d.question ?? '').split('\n').join('\n  ')}`,
+        ...context,
+        ``,
+        `Work it out in this repository, then send ONLY the answer with`,
+        `answer_persona_ask({askId:"${d.askId}", answer:"…"}).`,
+        `It is POSTED STRAIGHT INTO THE CHAT as the persona, so write to the person who asked: their`,
+        `language, short, no preamble, no sign-off, and no local paths or machine details they cannot`,
+        `use. If the repository does not answer it, say that plainly instead of guessing.`,
+        `Do not post_message for this — the answer goes back through the ask.`,
         ``,
         asPersona(),
       ].join('\n'),
