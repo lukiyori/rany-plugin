@@ -561,8 +561,11 @@ if (has('--join')) {
 
 const alive = (pid) => { try { process.kill(pid, 0); return true } catch { return false } }
 
-/** SessionStart: record this session and make sure the machine's one daemon is running. */
-if (has('--ensure') || has('--ping')) {
+/** SessionStart: record this session and make sure the machine's one daemon is running. `--beat`
+ *  (PostToolUse) does the same mid-turn: a queued room message starts a turn without a typed prompt, so
+ *  a long one aged the session file past SESSION_STALE_MS and dropped its claims while it worked — and a
+ *  daemon that died stayed dead until someone typed again. */
+if (has('--ensure') || has('--ping') || has('--beat')) {
   const hook = await hookInput()
   noteSession(typeof hook.cwd === 'string' && hook.cwd ? hook.cwd : process.cwd(),
     typeof hook.session_id === 'string' && hook.session_id ? hook.session_id : undefined)

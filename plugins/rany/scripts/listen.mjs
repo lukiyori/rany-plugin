@@ -19,7 +19,7 @@
 // Zero dependencies on purpose — a plugin that needs `npm install` before it works is a plugin
 // most people never finish installing. Node 22's global WebSocket is all this needs.
 
-import { readFileSync, writeFileSync, appendFileSync, unlinkSync, existsSync, mkdirSync } from 'node:fs'
+import { readFileSync, writeFileSync, appendFileSync, unlinkSync, existsSync, mkdirSync, statSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
 import { homedir, tmpdir } from 'node:os'
 import { createHash } from 'node:crypto'
@@ -619,6 +619,24 @@ if (process.argv.includes('--prompt')) {
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: await joinSeat(code, sid) },
     }) + '\n')
+  }
+  process.exit(QUIET)
+}
+
+/**
+ * `--beat` (PostToolUse, async): keep this session's claims fresh WHILE it works. The listener only runs
+ * between turns — it exits to wake the session and is re-spawned by Stop — so a long turn let every claim
+ * lapse and the room showed a busy agent as "session closed". Throttled to one declare per refresh
+ * interval; every other tool call costs a stat and nothing else.
+ */
+if (process.argv.includes('--beat')) {
+  const mark = join(stateDir, `beat-${sessionId ?? projectKey}`)
+  let last = 0
+  try { last = statSync(mark).mtimeMs } catch { /* never beaten */ }
+  if (config.token && Date.now() - last >= 5 * 60_000) { // CLAIM_REFRESH_MS, declared further down
+    try { mkdirSync(stateDir, { recursive: true }); writeFileSync(mark, '') } catch { /* beats again next call */ }
+    const boards = boardsHere()
+    if (boards.length) await declareBoards(boards)
   }
   process.exit(QUIET)
 }
