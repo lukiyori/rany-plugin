@@ -35,6 +35,10 @@ const unroutedFile = join(HOME, 'unrouted.json')
 const sessionsDir = join(HOME, 'codex-sessions')
 const pidFile = join(HOME, 'codex-bridge.pid')
 const stateFile = join(HOME, 'codex-bridge.json')
+/** Cards handed to a work-room seat (MCP assign_task, ADR-046): taskId → seat id — the same file the
+ *  Claude listener keeps. Every agent is the same persona, so the assignment event alone would wake the
+ *  thread that bound the card's BOARD; the handoff names the seat and always arrives first. */
+const taskSeatsFile = join(HOME, 'task-seats.json')
 
 /** A session whose last turn is older than this is treated as gone: its heartbeat stops counting
  *  toward "a runtime is handling this board" (ADR-033) and it is no longer a wake target. Wide
@@ -225,6 +229,22 @@ function noteSession(cwd, threadId) {
     writeFileSync(sessionFile(cwd, threadId),
       JSON.stringify({ dir: cwd, ts: Date.now(), ...(threadId ? { threadId } : {}) }))
   } catch { /* unwritable state dir: the daemon falls back to thread recency */ }
+}
+
+function taskSeatOf(taskId) {
+  try { return JSON.parse(readFileSync(taskSeatsFile, 'utf8'))[String(taskId)] ?? null } catch { return null }
+}
+
+function noteTaskSeat(taskId, agentId) {
+  if (!taskId || !agentId) return
+  let map = {}
+  try { map = JSON.parse(readFileSync(taskSeatsFile, 'utf8')) } catch { /* first handoff */ }
+  delete map[String(taskId)]          // re-insert, so the newest handoffs are the ones kept
+  map[String(taskId)] = String(agentId)
+  const keys = Object.keys(map)
+  for (const k of keys.slice(0, Math.max(0, keys.length - 500))) delete map[k]
+  try { mkdirSync(HOME, { recursive: true }); writeFileSync(taskSeatsFile, JSON.stringify(map)) }
+  catch { /* unwritable: the card routes by board, as before */ }
 }
 
 function forgetSession(cwd, threadId) {
@@ -730,6 +750,12 @@ function route(type, d) {
     const added = Array.isArray(d.addedAssigneeIds) ? d.addedAssigneeIds : []
     if (!config.wake.tasks || !added.includes(personaUserId)) return null
     const guildId = String(d.guildId ?? d.taskGuildId ?? '')
+    // Handed to a work-room seat (assign_task): the handoff already woke THAT seat's thread.
+    const handedTo = taskSeatOf(d.id)
+    if (handedTo) {
+      logRoute('TASK_UPDATED', { taskId: d.id, agentId: handedTo }, 'skip (handed to a room seat)')
+      return null
+    }
     // BOARD ONLY, and deliberately no guild fallback: a guild's DEFAULT board carries the guild's own
     // id, so "I bound the board" and "I bound the server" are the same keystrokes — a fallback would
     // make binding the default board silently claim every board added to that server later.
@@ -763,7 +789,9 @@ function route(type, d) {
     if (!config.wake.comments) return null
     const guildId = String(d.guildId ?? d.taskGuildId ?? '')
     const boardId = String(d.boardId ?? '')
-    const owner = ownerOf(claimedBy(boardId))
+    // A card handed to a room seat (assign_task) talks to that seat, not to the board's thread.
+    const seatId = taskSeatOf(d.taskId)
+    const owner = ownerOf(claimedBy(seatId ?? boardId))
     if (!owner) {
       logRoute('TASK_COMMENT_CREATED', { boardId, guildId }, claimedBy(boardId) ? 'skip (another agent\'s bind)' : 'skip (unbound)')
       return null
@@ -822,6 +850,9 @@ function route(type, d) {
   // Work rooms (ADR-046): each event names the seats' BOARDS; the thread that bound one of them wakes.
   if (type === 'PERSONA_ROOM_MESSAGE' || type === 'PERSONA_ROOM_UPDATED' || type === 'PERSONA_ROOM_DECISION') {
     if (config.wake.rooms === false) return null
+    // Record a handoff whoever it is for: the card's assignment event, which follows, must not wake a
+    // board-bound thread either (see taskSeatsFile).
+    if (type === 'PERSONA_ROOM_UPDATED' && d.change === 'task_assigned') noteTaskSeat(d.taskId, d.agentId)
     const seats = type === 'PERSONA_ROOM_MESSAGE' ? (Array.isArray(d.targets) ? d.targets : [])
       : type === 'PERSONA_ROOM_UPDATED' ? (Array.isArray(d.agents) ? d.agents : [])
       : [{ agentId: d.agentId, boardId: d.boardId, name: d.agentName }]
@@ -954,7 +985,9 @@ function roomPrompt(type, d, seat) {
     `  set_agent_status — the one line your tile shows (what you are doing now); keep it current;`,
     `  request_permission — BEFORE anything destructive, production-facing, costly or outside this repo;`,
     `  list_board_tasks / get_task / create_task / set_task_status / comment_task — the room's work queue`,
-    `    (no board yet? create_board with roomChannelId, then put the job on it).`,
+    `    (no board yet? create_board with roomChannelId, then put the job on it);`,
+    `  assign_task({guildId, taskId, agentId}) — hand a card to ONE seat (a colleague's, from get_room): the`,
+    `    persona becomes its assignee and only that seat wakes with it.`,
   ]
   const files = Array.isArray(d.attachments) && d.attachments.length
     ? [`  attached: ${d.attachments.map((a) => `${a.filename ?? 'file'} (${a.contentType ?? 'unknown type'})`).join(', ')}`,
@@ -1006,12 +1039,17 @@ function roomPrompt(type, d, seat) {
     board: "the room's board changed",
     budget_exhausted: 'the room used up its turn budget and is waiting for the owner',
     closed: 'the owner CLOSED the room',
+    task_assigned: mine ? `card #${d.taskNumber ?? '?'} "${d.taskTitle ?? ''}" was handed to YOU` : 'a card was handed to an agent',
   }[d.change] ?? `the room changed (${d.change})`
   const next = stop
     ? [`STOP working on this room's job now and do not post there until you are resumed. Leave what you`,
        `were doing in a safe state${d.change === 'agent_removed' || d.change === 'closed' ? '.' : ' and say so in your status line.'}`]
     : d.change === 'budget_exhausted' ? [`Do not post in the room until the owner writes there again.`]
     : d.change === 'agent_joined' && mine ? [`Read the brief (get_room), then tell the room in one line which part you take.`]
+    : d.change === 'task_assigned' && mine ? [
+        `It is yours now (the persona is its assignee and the card is recorded as your seat's). Read it with`,
+        `get_task({guildId:"${d.taskGuildId}", taskId:"${d.taskId}"}), do it in this repository, report on the card`,
+        `with comment_task, move it with set_task_status, and say in one room line that you took it.`]
     : [`Nothing to do unless it changes your part of the job.`]
   return [`RANY: work room ${d.channelId} — ${what}.`, ``, who, ...next, ...tools, ``, asPersona()].join('\n')
 }

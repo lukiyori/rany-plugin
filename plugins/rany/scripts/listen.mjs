@@ -166,6 +166,29 @@ const VERSION = (() => {
 
 /** Boards seen on an assignment but bound to nothing — the list `--bind` prints with no argument.
  *  Written beside the bindings for the same reason: any process must be able to find it. */
+/**
+ * Cards handed to a work-room seat (MCP assign_task, ADR-046): taskId → seat id. Every agent is the same
+ * persona, so the assignment event alone would wake the session that bound the card's BOARD — the wrong
+ * agent, or nobody for a seat that joined by link. The handoff event names the seat and always arrives
+ * first; whichever runtime hears it records it here (shared with the Codex bridge), and the assignment
+ * and later comments on that card follow the seat instead of the board.
+ */
+const taskSeatsFile = join(homedir(), '.rany-plugin', 'task-seats.json')
+function taskSeatOf(taskId) {
+  try { return JSON.parse(readFileSync(taskSeatsFile, 'utf8'))[String(taskId)] ?? null } catch { return null }
+}
+function noteTaskSeat(taskId, agentId) {
+  if (!taskId || !agentId) return
+  let map = {}
+  try { map = JSON.parse(readFileSync(taskSeatsFile, 'utf8')) } catch { /* first handoff */ }
+  delete map[String(taskId)]          // re-insert, so the newest handoffs are the ones kept
+  map[String(taskId)] = String(agentId)
+  const keys = Object.keys(map)
+  for (const k of keys.slice(0, Math.max(0, keys.length - 500))) delete map[k]
+  try { mkdirSync(dirname(taskSeatsFile), { recursive: true }); writeFileSync(taskSeatsFile, JSON.stringify(map)) }
+  catch { /* unwritable: the card routes by board, as before */ }
+}
+
 const unroutedFile = join(homedir(), '.rany-plugin', 'unrouted.json')
 
 /** Remember a board nobody claimed, so silence does not mean the task was forgotten. Keyed by
@@ -780,7 +803,9 @@ function roomPrompt(type, d, seat) {
     `  set_agent_status — the one line your tile shows (what you are doing now); keep it current;`,
     `  request_permission — BEFORE anything destructive, production-facing, costly or outside this repo;`,
     `  list_board_tasks / get_task / create_task / set_task_status / comment_task — the room's work queue`,
-    `    (no board yet? create_board with roomChannelId, then put the job on it).`,
+    `    (no board yet? create_board with roomChannelId, then put the job on it);`,
+    `  assign_task({guildId, taskId, agentId}) — hand a card to ONE seat (a colleague's, from get_room): the`,
+    `    persona becomes its assignee and only that seat wakes with it.`,
   ]
   if (type === 'PERSONA_ROOM_MESSAGE') {
     const from = d.fromPersona ? `your PERSONA (the room's authority — follow it)`
@@ -830,12 +855,17 @@ function roomPrompt(type, d, seat) {
     board: "the room's board changed",
     budget_exhausted: 'the room used up its turn budget and is waiting for the owner',
     closed: 'the owner CLOSED the room',
+    task_assigned: mine ? `card #${d.taskNumber ?? '?'} "${d.taskTitle ?? ''}" was handed to YOU` : 'a card was handed to an agent',
   }[d.change] ?? `the room changed (${d.change})`
   const next = stop
     ? [`STOP working on this room's job now and do not post there until you are resumed. Leave what you`,
        `were doing in a safe state${d.change === 'agent_removed' || d.change === 'closed' ? '.' : ' and say so in your status line.'}`]
     : d.change === 'budget_exhausted' ? [`Do not post in the room until the owner writes there again.`]
     : d.change === 'agent_joined' && mine ? [`Read the brief (get_room), then tell the room in one line which part you take.`]
+    : d.change === 'task_assigned' && mine ? [
+        `It is yours now (the persona is its assignee and the card is recorded as your seat's). Read it with`,
+        `get_task({guildId:"${d.taskGuildId}", taskId:"${d.taskId}"}), do it in this repository, report on the card`,
+        `with comment_task, move it with set_task_status, and say in one room line that you took it.`]
     : [`Nothing to do unless it changes your part of the job.`]
   return [`RANY: work room ${d.channelId} — ${what}.`, ``, who, ...next, ...tools, ``, asPersona()].join('\n')
 }
@@ -852,6 +882,14 @@ function classify(type, d) {
     // A private board's payload drops guildId so the gateway cannot fan it guild-wide, and carries
     // the same value as taskGuildId for addressing (db/0242).
     const guildId = String(d.guildId ?? d.taskGuildId ?? '')
+
+    // Handed to a work-room seat (assign_task): the handoff already woke THAT seat's session, so the
+    // board's session must not wake for the same card.
+    const handedTo = taskSeatOf(d.id)
+    if (handedTo) {
+      logRoute('TASK_UPDATED', { taskId: d.id, agentId: handedTo }, 'skip (handed to a room seat)')
+      return null
+    }
 
     // WHOSE task is this? A session open in an unrelated repository can do nothing useful with it,
     // and waking it is worse than silence — it interrupts one piece of work with another project's.
@@ -904,7 +942,9 @@ function classify(type, d) {
     if (!config.wake.comments) return null
     const guildId = String(d.guildId ?? d.taskGuildId ?? '')
     const boardId = String(d.boardId ?? '')
-    const boundTo = claimedBy(boardId)
+    // A card handed to a room seat (assign_task) talks to that seat, not to the board's session.
+    const seatId = taskSeatOf(d.taskId)
+    const boundTo = seatId ? claimedBy(seatId) : claimedBy(boardId)
     if (!ownedHere(boundTo)) {
       const why = !boundTo ? 'skip (unbound)'
         : entrySession(boundTo) ? `skip (bound to session ${entrySession(boundTo)})`
@@ -1016,6 +1056,9 @@ function classify(type, d) {
   // which is how the Cortex agent hears a thread that lives in the Cocktail server.
   if (type === 'PERSONA_ROOM_MESSAGE' || type === 'PERSONA_ROOM_UPDATED' || type === 'PERSONA_ROOM_DECISION') {
     if (config.wake.rooms === false) return null
+    // Record a handoff whoever it is for: the card's assignment event, which follows, must not wake
+    // this session's board either (see taskSeatsFile).
+    if (type === 'PERSONA_ROOM_UPDATED' && d.change === 'task_assigned') noteTaskSeat(d.taskId, d.agentId)
     const seats = type === 'PERSONA_ROOM_MESSAGE' ? (Array.isArray(d.targets) ? d.targets : [])
       : type === 'PERSONA_ROOM_UPDATED' ? (Array.isArray(d.agents) ? d.agents : [])
       : [{ agentId: d.agentId, boardId: d.boardId, name: d.agentName }]
