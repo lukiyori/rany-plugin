@@ -344,6 +344,57 @@ function fetchBoardInfo(boardId, timeoutMs = 5000) {
   })
 }
 
+/** GET JSON with the persona token → the parsed body, or null (offline, unconfigured, not 200). */
+function getJson(path, timeoutMs = 5000) {
+  return new Promise((resolve) => {
+    if (!config.token) return resolve(null)
+    let url
+    try { url = new URL(`${config.apiUrl}${path}`) } catch { return resolve(null) }
+    const send = url.protocol === 'http:' ? httpRequest : httpsRequest
+    const req = send(url, {
+      method: 'GET', agent: false, timeout: timeoutMs,
+      headers: { authorization: `Bearer ${config.token}`, accept: 'application/json' },
+    }, (res) => {
+      if (res.statusCode !== 200) { res.resume(); return resolve(null) }
+      let body = ''
+      res.setEncoding('utf8')
+      res.on('data', (d) => { body += d })
+      res.on('end', () => { try { resolve(JSON.parse(body)) } catch { resolve(null) } })
+      res.on('error', () => resolve(null))
+    })
+    req.on('timeout', () => req.destroy())
+    req.on('error', () => resolve(null))
+    req.end()
+  })
+}
+
+/**
+ * The persona's HOME (ADR-047): the one session its owner chose to BE the persona. Conversations —
+ * being addressed in a channel, forwards, workflow steps and questions no board claims — wake the home
+ * and nothing else; while it is closed RANY's hosted brain answers them (when a model key is stored),
+ * and without a key nobody does. There is no "the window you typed in last" any more: that is how a
+ * work-room question got answered from an unrelated repository. Asked of the server on each such
+ * event, so a home moved or cleared from the web takes effect at once.
+ */
+async function homeIsHere() {
+  const h = (await getJson('/personas/@self/home'))?.home
+  return Boolean(h && h.agent === 'claude' && h.live && sessionId && h.ref === sessionId)
+}
+
+/** Make THIS session the persona's home — `/rany-home`, via the prompt hook or `--home`. */
+async function setHome(sid = sessionId) {
+  if (!sid) return 'RANY: could not tell which session this is — type /rany-home inside the session itself.'
+  const r = await postJson('/personas/@self/home', { agent: 'claude', ref: sid, label: projectDir })
+  if (!r) return 'RANY: could not reach RANY to set the home — check RANY_API_URL / RANY_PERSONA_TOKEN.'
+  if (!r.ok) return `RANY: the home was refused (${r.body?.error ?? r.status}).`
+  return [
+    `RANY: this session is now your persona's home (${projectDir}).`,
+    `Being addressed in a channel, forwards and workflow steps wake THIS session and no other. While it`,
+    `is closed, RANY's hosted AI answers them if a model key is stored — otherwise they go unanswered.`,
+    `Move it with /rany-home in another session, or clear it in RANY → persona settings.`,
+  ].join('\n')
+}
+
 /** POST JSON with the persona token → `{ ok, status, body }`, or null when offline / unconfigured.
  *  node:http like declareBoards, so a command can exit right after it resolves. */
 function postJson(path, payload, timeoutMs = 8000) {
@@ -389,12 +440,14 @@ function postJson(path, payload, timeoutMs = 8000) {
  * older server has no such route, and a plugin that breaks when the server is behind is worse than
  * one whose personas stay listed.
  */
-function declareBoards(boardIds, timeoutMs = 5000) {
+function declareBoards(boardIds, timeoutMs = 5000, extra = {}) {
   return new Promise((resolve) => {
     if (!config.token) return resolve()
     let url
     try { url = new URL(`${config.apiUrl}/personas/@self/boards`) } catch { return resolve() }
-    const body = JSON.stringify({ projectKey, boardIds })
+    // `ref` names this session, so the same heartbeat keeps the persona's home live when it is this
+    // session (ADR-047); `closing` (SessionEnd) makes it stop being live at once.
+    const body = JSON.stringify({ projectKey, boardIds, ref: sessionId ?? undefined, ...extra })
     // node:http rather than fetch, for one reason: `--bind` and `--stop` call process.exit the
     // moment this resolves, and exiting after a fetch trips a libuv assertion on Windows
     // (`!(handle->flags & UV_HANDLE_CLOSING)`) — a crash banner after a command that in fact worked.
@@ -614,6 +667,13 @@ async function joinSeat(code, sid = sessionId) {
   ].join('\n')
 }
 
+/** `--home`: make THIS session the persona's home (ADR-047) — /rany-home's fallback when the prompt hook
+ *  did not already do it. */
+if (process.argv.includes('--home')) {
+  process.stdout.write((await setHome(sessionId ?? activeSessionId())) + '\n')
+  process.exit(QUIET)
+}
+
 /** `--join <link|code>`: the same, typed by hand (the /rany-join command). */
 const joinAt = process.argv.indexOf('--join')
 if (joinAt !== -1) {
@@ -636,6 +696,15 @@ if (joinAt !== -1) {
  */
 if (process.argv.includes('--prompt')) {
   const hook = await readHookInput()
+  // `/rany-home` makes THIS session the persona's home (ADR-047). Done here rather than by the command
+  // alone because the hook knows the session for certain; the command's own run is the fallback.
+  if (/^\s*\/rany(?::rany)?-home\b/i.test(String(hook.prompt ?? '')) && config.token) {
+    const homeSid = sessionId ?? (typeof hook.session_id === 'string' && hook.session_id ? hook.session_id : null)
+    process.stdout.write(JSON.stringify({
+      hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: await setHome(homeSid) },
+    }) + '\n')
+    process.exit(QUIET)
+  }
   const code = inviteCodeIn(hook.prompt)
   if (code && config.token) {
     const sid = sessionId ?? (typeof hook.session_id === 'string' && hook.session_id ? hook.session_id : null)
@@ -659,7 +728,7 @@ if (process.argv.includes('--beat')) {
   if (config.token && Date.now() - last >= 5 * 60_000) { // CLAIM_REFRESH_MS, declared further down
     try { mkdirSync(stateDir, { recursive: true }); writeFileSync(mark, '') } catch { /* beats again next call */ }
     const boards = boardsHere()
-    if (boards.length) await declareBoards(boards)
+    await declareBoards(boards) // even with no boards: it is also the persona home's heartbeat (ADR-047)
   }
   process.exit(QUIET)
 }
@@ -680,7 +749,7 @@ if (process.argv.includes('--stop')) {
   try { if (activeSessionId() === sessionId) unlinkSync(activeFile) } catch { /* fine */ }
   // Withdraw this session's board claims from RANY. They also expire on their own — this just makes
   // closing a terminal immediate instead of eventual.
-  await declareBoards([], 2000)
+  await declareBoards([], 2000, { closing: true })
   process.exit(QUIET)
 }
 
@@ -875,7 +944,7 @@ function roomPrompt(type, d, seat) {
  * a persona may hear (owner-resolved visibility, guild opt-out, persona_depth), so this only sorts
  * what arrives into "worth waking you" and "not".
  */
-function classify(type, d) {
+async function classify(type, d) {
   if (type === 'TASK_UPDATED') {
     const added = Array.isArray(d.addedAssigneeIds) ? d.addedAssigneeIds : []
     if (!config.wake.tasks || !added.includes(personaUserId)) return null
@@ -980,8 +1049,8 @@ function classify(type, d) {
       logRoute('PERSONA_WORKFLOW', { guildId, stepId: d.stepId }, why)
       return null
     }
-    if (!owner && !isActiveSession()) {
-      logRoute('PERSONA_WORKFLOW', { guildId, stepId: d.stepId }, 'skip (guild unclaimed, not active session)')
+    if (!owner && !(await homeIsHere())) {
+      logRoute('PERSONA_WORKFLOW', { guildId, stepId: d.stepId }, 'skip (guild unclaimed, not the persona home)')
       return null
     }
     logRoute('PERSONA_WORKFLOW', { guildId, stepId: d.stepId }, 'wake')
@@ -1019,7 +1088,7 @@ function classify(type, d) {
     const boardId = String(d.boardId ?? '')
     const guildId = String(d.guildId ?? '')
     const owner = claimedBy(boardId) || claimedBy(guildId)
-    if (owner ? !ownedHere(owner) : !(boardId === '' && isActiveSession())) {
+    if (owner ? !ownedHere(owner) : !(boardId === '' && await homeIsHere())) {
       const why = !owner ? 'skip (board unbound here)'
         : entrySession(owner) ? `skip (bound to session ${entrySession(owner)})`
         : `skip (owned by ${entryDir(owner)})`
@@ -1077,6 +1146,12 @@ function classify(type, d) {
 
   if (type === 'PERSONA_FORWARD') {
     if (!config.wake.forwards) return null
+    // A forward is the owner handing the persona a conversation: its HOME takes it (ADR-047).
+    if (!(await homeIsHere())) {
+      logRoute('PERSONA_FORWARD', { channelId: d.channelId }, 'skip (not the persona home)')
+      return null
+    }
+    logRoute('PERSONA_FORWARD', { channelId: d.channelId }, 'wake (persona home)')
     const msgs = Array.isArray(d.messages) ? d.messages : []
     const target = msgs.find((m) => m.target) ?? msgs[msgs.length - 1]
     return [
@@ -1098,33 +1173,17 @@ function classify(type, d) {
   const mentions = Array.isArray(d.mentions) ? d.mentions : []
   const isGuild = typeof d.guildId === 'string' && d.guildId.length > 0
 
-  // A guild message belongs to a guild, and a guild can be CLAIMED by a repository. If it is, only
-  // that repository hears it; every other session stays quiet.
-  //
-  // This was the hole the board routing left open. Tasks were routed and messages were not, on the
-  // reasoning that a message is "a conversation, not work on a repository, so any open session can
-  // answer". That reasoning does not survive contact: someone writing to your persona in a project's
-  // guild — a question about a task, a review request — IS that project's work, and answering it from
-  // an unrelated checkout is the same interruption, with the same session that cannot tell.
-  //
-  // Unclaimed guilds keep the old behaviour deliberately: if no repository has said "this server is
-  // mine", any session may answer, because a conversation nobody claims is better answered than
-  // dropped. Silence is only the right default once someone has claimed the work.
+  // A conversation in a guild — the persona addressed by name, or its owner overheard — belongs to the
+  // persona's HOME and nowhere else (ADR-047). The owner decides where the persona lives by typing
+  // /rany-home there; guild claims and "the window you typed in last" no longer pick a session for a
+  // conversation, because they are how a work-room question got answered from an unrelated repository.
+  // While the home is closed, the server's hosted brain answers instead (when a key is stored).
   if (isGuild) {
-    const owner = claimedBy(d.guildId)
-    if (owner && !ownedHere(owner)) {
-      const why = entrySession(owner) ? `skip (bound to session ${entrySession(owner)})` : `skip (owned by ${entryDir(owner)})`
-      logRoute('MESSAGE_CREATED', { guildId: d.guildId, channelId: d.channelId }, why)
+    if (!(await homeIsHere())) {
+      logRoute('MESSAGE_CREATED', { guildId: d.guildId, channelId: d.channelId }, 'skip (not the persona home)')
       return null
     }
-    // An unclaimed guild is answered only by the window you are sitting in — with one listener per
-    // session now, "any session may answer" would mean every session answering the same message.
-    if (!owner && !isActiveSession()) {
-      logRoute('MESSAGE_CREATED', { guildId: d.guildId, channelId: d.channelId }, 'skip (guild unclaimed, not active session)')
-      return null
-    }
-    logRoute('MESSAGE_CREATED', { guildId: d.guildId, channelId: d.channelId },
-      owner ? 'wake' : 'wake (guild unclaimed)')
+    logRoute('MESSAGE_CREATED', { guildId: d.guildId, channelId: d.channelId }, 'wake (persona home)')
   }
 
   // A conversation outside a guild — the persona's own session, a chat someone opened with it, the
@@ -1175,7 +1234,7 @@ function connect() {
     return
   }
 
-  socket.addEventListener('message', (ev) => {
+  socket.addEventListener('message', async (ev) => {
     let frame
     try { frame = JSON.parse(String(ev.data)) } catch { return }
 
@@ -1219,7 +1278,7 @@ function connect() {
     }
     if (!personaUserId) return
 
-    const summary = classify(frame.t, frame.d ?? {})
+    const summary = await classify(frame.t, frame.d ?? {})
     if (summary) done(WAKE, summary)
   })
 

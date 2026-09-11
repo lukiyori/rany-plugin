@@ -141,6 +141,57 @@ function boardLabel(boardId, h) {
 }
 
 /** POST JSON with the persona token → `{ ok, status, body }`, or null when offline / unconfigured. */
+/** GET JSON with the persona token → the parsed body, or null (offline, unconfigured, not 200). */
+function getJson(path, timeoutMs = 5000) {
+  return new Promise((resolve) => {
+    if (!config.token) return resolve(null)
+    let url
+    try { url = new URL(`${config.apiUrl}${path}`) } catch { return resolve(null) }
+    const send = url.protocol === 'http:' ? httpRequest : httpsRequest
+    const req = send(url, {
+      method: 'GET', agent: false, timeout: timeoutMs,
+      headers: { authorization: `Bearer ${config.token}`, accept: 'application/json' },
+    }, (res) => {
+      if (res.statusCode !== 200) { res.resume(); return resolve(null) }
+      let body = ''
+      res.setEncoding('utf8')
+      res.on('data', (d) => { body += d })
+      res.on('end', () => { try { resolve(JSON.parse(body)) } catch { resolve(null) } })
+      res.on('error', () => resolve(null))
+    })
+    req.on('timeout', () => req.destroy())
+    req.on('error', () => resolve(null))
+    req.end()
+  })
+}
+
+/**
+ * The persona's HOME (ADR-047) when it is a live Codex thread → `{ dir, threadId }`, else null. The
+ * owner chose it (`$rany-home` in that thread); conversations — being addressed in a channel, forwards,
+ * workflow steps and questions no board claims — go there and nowhere else, and while it is closed the
+ * server's hosted brain answers them (when a key is stored). Asked on each such event, so a home moved
+ * or cleared from the web takes effect at once.
+ */
+async function homeTarget() {
+  const h = (await getJson('/personas/@self/home'))?.home
+  return h && h.agent === 'codex' && h.live && h.ref ? { dir: h.label || process.cwd(), threadId: h.ref } : null
+}
+
+/** Make this thread the persona's home. */
+async function setHome({ dir, threadId }) {
+  if (!threadId) return 'RANY: could not tell which Codex thread this is — type a prompt in it first, then $rany-home again.'
+  const r = await postJson('/personas/@self/home', { agent: 'codex', ref: threadId, label: dir })
+  if (!r) return 'RANY: could not reach RANY to set the home — check RANY_API_URL / RANY_PERSONA_TOKEN.'
+  if (!r.ok) return `RANY: the home was refused (${r.body?.error ?? r.status}).`
+  noteSession(dir, threadId)
+  return [
+    `RANY: this thread is now your persona's home (${dir}).`,
+    `Being addressed in a channel, forwards and workflow steps are queued into THIS thread and no other.`,
+    `While it is closed, RANY's hosted AI answers them if a model key is stored — otherwise they go`,
+    `unanswered. Move it with $rany-home in another thread, or clear it in RANY → persona settings.`,
+  ].join('\n')
+}
+
 function postJson(path, payload, timeoutMs = 8000) {
   return new Promise((resolve) => {
     if (!config.token) return resolve(null)
@@ -416,12 +467,14 @@ const config = loadConfig()
 /** Tell RANY which boards are being handled right now (ADR-033, db/0285), so a persona is offered as
  *  a task assignee only where something is listening. Declared PER PROJECT, because one daemon covers
  *  every checkout on the machine and a project's claims must not delete another's. */
-function declareBoards(projectKey, boardIds, timeoutMs = 5000) {
+function declareBoards(projectKey, boardIds, timeoutMs = 5000, extra = {}) {
   return new Promise((resolve) => {
     if (!config.token) return resolve()
     let url
     try { url = new URL(`${config.apiUrl}/personas/@self/boards`) } catch { return resolve() }
-    const body = JSON.stringify({ projectKey, boardIds })
+    // `extra.ref` names the thread, so the same heartbeat keeps the persona's home live when it is that
+    // thread (ADR-047); `extra.closing` makes it stop being live at once.
+    const body = JSON.stringify({ projectKey, boardIds, ...extra })
     const send = url.protocol === 'http:' ? httpRequest : httpsRequest
     const req = send(url, {
       method: 'POST',
@@ -461,7 +514,7 @@ async function refreshClaims() {
   for (const s of liveSessions()) {
     const key = claimKey(s)
     known.add(key)
-    await declareBoards(key, boardsForSession(bindings, s))
+    await declareBoards(key, boardsForSession(bindings, s), 5000, { ref: s.threadId })
   }
   let previous = []
   try { previous = JSON.parse(readFileSync(stateFile, 'utf8')).projects ?? [] } catch { /* first run */ }
@@ -566,6 +619,14 @@ async function joinSeat({ code, dir, threadId }) {
   ].join('\n')
 }
 
+/** `--home`: make this thread the persona's home (ADR-047) — the rany-home skill's fallback when the
+ *  prompt hook did not already do it. */
+if (has('--home')) {
+  const dir = process.cwd()
+  process.stdout.write((await setHome({ dir, threadId: lastPromptedThread(dir) })) + '\n')
+  process.exit(0)
+}
+
 /** `--join <link|code>`: the same, typed by hand (the rany-join skill). */
 if (has('--join')) {
   const raw = String(arg('--join') ?? '').trim()
@@ -592,7 +653,17 @@ if (has('--ensure') || has('--ping') || has('--beat')) {
   // A work-room invite link PASTED into the chat joins the room by itself (ADR-046). The link is a web
   // address nothing in a coding session understands on its own, so the hook reads the prompt before the
   // model does, seats THIS thread and hands the model the seat as context. No link = no network.
-  const inviteCode = has('--ping') ? inviteCodeIn(hook.prompt) : null
+  // `$rany-home` makes THIS thread the persona's home (ADR-047) — the same move as the invite link: the
+  // hook sees the prompt before the model, knows the thread for certain, and hands over the result.
+  const wantsHome = has('--ping') && /\$rany-home\b|^\s*\/?rany-home\b/i.test(String(hook.prompt ?? ''))
+  if (wantsHome && config.token) {
+    const dir = typeof hook.cwd === 'string' && hook.cwd ? hook.cwd : process.cwd()
+    const threadId = typeof hook.session_id === 'string' && hook.session_id ? hook.session_id : lastPromptedThread(dir)
+    process.stdout.write(JSON.stringify({
+      hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: await setHome({ dir, threadId }) },
+    }) + '\n')
+  }
+  const inviteCode = has('--ping') && !wantsHome ? inviteCodeIn(hook.prompt) : null
   if (inviteCode && config.token) {
     const dir = typeof hook.cwd === 'string' && hook.cwd ? hook.cwd : process.cwd()
     const threadId = typeof hook.session_id === 'string' && hook.session_id ? hook.session_id : lastPromptedThread(dir)
@@ -662,7 +733,11 @@ if (has('--ensure') || has('--ping') || has('--beat')) {
 if (has('--bye')) {
   const hook = await hookInput()
   const threadId = typeof hook.session_id === 'string' && hook.session_id ? hook.session_id : undefined
-  forgetSession(typeof hook.cwd === 'string' && hook.cwd ? hook.cwd : process.cwd(), threadId)
+  const byeDir = typeof hook.cwd === 'string' && hook.cwd ? hook.cwd : process.cwd()
+  forgetSession(byeDir, threadId)
+  // A closed thread that was the persona's home stops being live at once (ADR-047) instead of after the
+  // heartbeat window — the hosted brain takes its conversations from here.
+  if (threadId) await declareBoards(claimKey({ dir: byeDir, threadId }), [], 2000, { ref: threadId, closing: true })
   // ADR-038: closing the thread drops its bindings, so the board stops waking anything until re-bound.
   dropThreadBindings(threadId)
   process.exit(0)
@@ -745,7 +820,7 @@ function asPersona() {
  * null to stay quiet. The gateway already decides what a persona may HEAR; this only decides which
  * repository it is about.
  */
-function route(type, d) {
+async function route(type, d) {
   if (type === 'TASK_UPDATED') {
     const added = Array.isArray(d.addedAssigneeIds) ? d.addedAssigneeIds : []
     if (!config.wake.tasks || !added.includes(personaUserId)) return null
@@ -817,8 +892,8 @@ function route(type, d) {
   // complete_workflow_step; the workflow decides where the output lands.
   if (type === 'PERSONA_WORKFLOW') {
     if (config.wake.workflows === false) return null
-    const owner = ownerOf(claimedBy(d.guildId))
-    if (!owner) { logRoute('PERSONA_WORKFLOW', { guildId: d.guildId, stepId: d.stepId }, 'skip (unclaimed guild)'); return null }
+    const owner = ownerOf(claimedBy(d.guildId)) ?? await homeTarget()
+    if (!owner) { logRoute('PERSONA_WORKFLOW', { guildId: d.guildId, stepId: d.stepId }, 'skip (guild unclaimed, no live home)'); return null }
     const msgs = Array.isArray(d.messages) ? d.messages : []
     const context = msgs.length
       ? ['', 'Recent messages of the channel this step is about:',
@@ -872,6 +947,7 @@ function route(type, d) {
   if (type === 'PERSONA_ASK') {
     if (config.wake.asks === false) return null
     const owner = ownerOf(claimedBy(d.boardId)) ?? ownerOf(claimedBy(d.guildId))
+      ?? (d.boardId ? null : await homeTarget()) // no board named: the persona's home (ADR-047)
     if (!owner) {
       logRoute('PERSONA_ASK', { askId: d.askId, boardId: d.boardId, guildId: d.guildId }, 'skip (board unbound here)')
       return null
@@ -905,8 +981,8 @@ function route(type, d) {
 
   if (type === 'PERSONA_FORWARD') {
     if (!config.wake.forwards) return null
-    const owner = ownerOf(claimedBy(d.guildId))
-    if (!owner) { logRoute('PERSONA_FORWARD', { guildId: d.guildId }, 'skip (unclaimed guild)'); return null }
+    const owner = await homeTarget() // a forward is a conversation: the persona's home takes it (ADR-047)
+    if (!owner) { logRoute('PERSONA_FORWARD', { guildId: d.guildId }, 'skip (not the persona home)'); return null }
     const msgs = Array.isArray(d.messages) ? d.messages : []
     const target = msgs.find((m) => m.target) ?? msgs[msgs.length - 1]
     return {
@@ -929,12 +1005,12 @@ function route(type, d) {
   const mentions = Array.isArray(d.mentions) ? d.mentions : []
   const isGuild = typeof d.guildId === 'string' && d.guildId.length > 0
 
-  // A conversation in a guild belongs to whoever claimed that guild. Unlike the Claude listener there
-  // is no "any open session may answer" case here: this daemon can see every session at once, so
-  // picking one at random would not be a fallback, it would be a coin toss.
+  // A conversation in a guild belongs to the persona's HOME and nowhere else (ADR-047): the owner
+  // decides where the persona lives, and guild claims no longer pick a thread for a conversation.
+  // While the home is closed (or is a Claude session) this daemon stays quiet.
   if (isGuild) {
-    const owner = ownerOf(claimedBy(d.guildId))
-    if (!owner) { logRoute('MESSAGE_CREATED', { guildId: d.guildId }, 'skip (unclaimed guild)'); return null }
+    const owner = await homeTarget()
+    if (!owner) { logRoute('MESSAGE_CREATED', { guildId: d.guildId }, 'skip (not the persona home)'); return null }
     if (mentions.includes(personaUserId) && config.wake.addressed) {
       return {
         dir: owner.dir, threadId: owner.threadId,
@@ -1072,7 +1148,7 @@ async function deliver(type, ids, { dir, threadId, text }) {
 function connect() {
   try { socket = new WebSocket(config.gatewayUrl) } catch { return void setTimeout(connect, 15000) }
 
-  socket.addEventListener('message', (ev) => {
+  socket.addEventListener('message', async (ev) => {
     let frame
     try { frame = JSON.parse(String(ev.data)) } catch { return }
 
@@ -1103,7 +1179,7 @@ function connect() {
     if (!personaUserId) return
 
     const d = frame.d ?? {}
-    const target = route(frame.t, d)
+    const target = await route(frame.t, d)
     if (target) void deliver(frame.t, { boardId: d.boardId, guildId: d.guildId, channelId: d.channelId }, target)
   })
 
