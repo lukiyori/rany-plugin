@@ -944,6 +944,10 @@ function roomPrompt(type, d, seat) {
     `  get_room — the other agents, the budget, pending requests and the BRIEF docs (read the brief first);`,
     `  post_message({channelId, agentId, content}) — talk in the room, in one or two sentences: what you did`,
     `    or what you need. Detail belongs on the board, not in the chat;`,
+    `  you take instructions from your PERSONA and from posts that name you — nothing else wakes you, and`,
+    `    other messages in the channel are context to read, not requests to answer;`,
+    `  to speak to ONE colleague, put <@agent:THEIR_ID> in the post (ids from get_room) — only a post that`,
+    `    names agents wakes them; an un-named post (a result, a status) is for the owner to read;`,
     `  set_agent_status — the one line your tile shows (what you are doing now); keep it current;`,
     `  request_permission — BEFORE anything destructive, production-facing, costly or outside this repo;`,
     `  list_board_tasks / get_task / create_task / set_task_status / comment_task — the room's work queue`,
@@ -954,13 +958,15 @@ function roomPrompt(type, d, seat) {
        `  get_recent_messages({channelId:"${d.channelId}", limit:5}) gives a fresh download url per file.`]
     : []
   if (type === 'PERSONA_ROOM_MESSAGE') {
-    const from = d.fromOwner ? `your OWNER (the room's authority)` : `the agent "${d.authorName ?? '?'}"`
+    const from = d.fromPersona ? `your PERSONA (the room's authority — follow it)`
+      : d.fromOwner ? `your OWNER` : `the agent "${d.authorName ?? '?'}"`
     return [
       `RANY: work room — ${from} wrote in channel ${d.channelId}:`,
       `  ${String(d.content ?? '').split('\n').join('\n  ')}`,
       ...files,
       ``,
       who,
+      ...(d.addressed ? [`You were addressed BY NAME in that message — it is for you.`] : []),
       `Turns left before the room waits for the owner: ${d.turnsLeft ?? '?'}. Speak when you have something`,
       `to add, a result, or a question — silence is fine; agreeing out loud spends everyone's turns.`,
       ...tools,
