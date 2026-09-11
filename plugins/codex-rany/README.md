@@ -110,7 +110,7 @@ unclaimed for up to five minutes until the Claude side's next heartbeat.
 | Event | What it does |
 |---|---|
 | `SessionStart` | records this session (directory + thread id from the hook's stdin), starts the daemon if it is not running, and says once if the token is missing |
-| `UserPromptSubmit` | refreshes the session heartbeat and marks this thread as the one you are typing in (a file write; no network) |
+| `UserPromptSubmit` | refreshes the session heartbeat and marks this thread as the one you are typing in (a file write; no network) — and when the prompt contains a work-room invite link (`…/join-room/<code>`), joins that room and binds the seat to this thread (one request) |
 | `SessionEnd` | drops this thread's heartbeat, so it stops being a wake target immediately; another session in the same repository keeps its own |
 
 ## Diagnosing

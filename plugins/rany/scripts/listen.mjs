@@ -20,7 +20,7 @@
 // most people never finish installing. Node 22's global WebSocket is all this needs.
 
 import { readFileSync, writeFileSync, appendFileSync, unlinkSync, existsSync, mkdirSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { homedir, tmpdir } from 'node:os'
 import { createHash } from 'node:crypto'
 import { request as httpRequest } from 'node:http'
@@ -321,6 +321,39 @@ function fetchBoardInfo(boardId, timeoutMs = 5000) {
   })
 }
 
+/** POST JSON with the persona token → `{ ok, status, body }`, or null when offline / unconfigured.
+ *  node:http like declareBoards, so a command can exit right after it resolves. */
+function postJson(path, payload, timeoutMs = 8000) {
+  return new Promise((resolve) => {
+    if (!config.token) return resolve(null)
+    let url
+    try { url = new URL(`${config.apiUrl}${path}`) } catch { return resolve(null) }
+    const body = JSON.stringify(payload)
+    const send = url.protocol === 'http:' ? httpRequest : httpsRequest
+    const req = send(url, {
+      method: 'POST', agent: false, timeout: timeoutMs,
+      headers: {
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(body),
+        authorization: `Bearer ${config.token}`,
+      },
+    }, (res) => {
+      let text = ''
+      res.setEncoding('utf8')
+      res.on('data', (d) => { text += d })
+      res.on('end', () => {
+        let parsed = null
+        try { parsed = JSON.parse(text) } catch { /* not JSON */ }
+        resolve({ ok: res.statusCode === 200, status: res.statusCode, body: parsed })
+      })
+      res.on('error', () => resolve(null))
+    })
+    req.on('timeout', () => req.destroy())
+    req.on('error', () => resolve(null))
+    req.end(body)
+  })
+}
+
 /**
  * Tell RANY which boards this checkout is handling.
  *
@@ -489,6 +522,107 @@ if (bindAt !== -1) {
   process.exit(QUIET)
 }
 
+/** A work-room invite link — or its bare `/join-room/<code>` path — anywhere in some text → its code. */
+function inviteCodeIn(text) {
+  const m = /\/join-room\/([A-Za-z0-9]{8,64})\b/.exec(String(text ?? ''))
+  return m ? m[1] : null
+}
+
+/** What a hook pipes on stdin (`prompt`, `session_id`, `cwd`, …), read with a deadline — a hand-run
+ *  command from a shell whose stdin never closes must not hang. */
+function readHookInput(ms = 700) {
+  return new Promise((resolve) => {
+    if (process.stdin.isTTY) return resolve({})
+    let raw = ''
+    const parse = () => { try { return raw.trim() ? JSON.parse(raw) : {} } catch { return {} } }
+    const timer = setTimeout(() => resolve(parse()), ms)
+    const finish = () => { clearTimeout(timer); resolve(parse()) }
+    try {
+      process.stdin.setEncoding('utf8')
+      process.stdin.on('data', (d) => { raw += d })
+      process.stdin.on('end', finish)
+      process.stdin.on('error', finish)
+    } catch { finish() }
+  })
+}
+
+const JOIN_REFUSALS = {
+  invalid_invite: 'that invite link is not valid',
+  invite_used: 'that link was already used — ask the owner for a new one',
+  invite_expired: 'that link expired — ask the owner for a new one',
+  not_your_room: 'that room belongs to another persona',
+  room_full: 'the room is full',
+  persona_not_active: 'the persona is paused',
+}
+
+/**
+ * Take a seat in a work room (ADR-046) from an invite code: RANY seats this persona's agent and answers
+ * with the SEAT, which is bound to the session exactly like a board — so room events for that seat wake
+ * this window and no other. No board has to exist, be bound or be chosen. Shared by `--join` (typed)
+ * and the UserPromptSubmit hook (the link simply pasted into the chat). Returns the text to show.
+ */
+async function joinSeat(code, sid = sessionId) {
+  const boards = loadBindings()
+  const held = Object.entries(boards).find(([, e]) => e && typeof e === 'object' && e.room?.invite === code)
+  if (held && sid && held[1].sessionId === sid)
+    return `RANY: this session already sits in that work room (channel ${held[1].room.channelId}) as "${held[1].room.name}" — agentId ${held[0]}.`
+  const res = await postJson('/personas/@self/rooms/join',
+    { code, name: `${basename(projectDir)} · Claude`.slice(0, 40), agent: 'claude' }, 6000)
+  if (!res?.ok)
+    return `RANY: could not join the work room — ${JOIN_REFUSALS[res?.body?.error] ?? `the server refused (${res?.status ?? 'offline'})`}.`
+  const seat = res.body
+  boards[seat.agentId] = sid
+    ? { dir: projectDir, agent: 'claude', sessionId: sid, ts: Date.now(),
+        room: { channelId: seat.channelId, guildId: seat.guildId, name: seat.name, invite: code } }
+    : projectDir
+  try {
+    mkdirSync(dirname(bindFile), { recursive: true })
+    writeFileSync(bindFile, JSON.stringify({ boards }, null, 2))
+  } catch (e) {
+    return `RANY: joined the work room, but could not save the seat binding (${e?.message ?? e}).`
+  }
+  // Declared with the boards, so the room shows this seat as live straight away.
+  await declareBoards(boardsHere())
+  return [
+    `RANY: THIS session joined the work room at channel ${seat.channelId} as "${seat.name}" (agentId ${seat.agentId}).`,
+    `From now on it is woken for that room, until this session closes.`,
+    `Next: get_room({channelId:"${seat.channelId}"}) and read the brief documents it lists; then tell the room in ONE`,
+    `line which part of the job you take — post_message({channelId:"${seat.channelId}", agentId:"${seat.agentId}", content:"…"}).`,
+  ].join('\n')
+}
+
+/** `--join <link|code>`: the same, typed by hand (the /rany-join command). */
+const joinAt = process.argv.indexOf('--join')
+if (joinAt !== -1) {
+  const raw = String(process.argv[joinAt + 1] ?? '').trim()
+  const code = inviteCodeIn(raw) ?? (/^[A-Za-z0-9]{8,64}$/.test(raw) ? raw : null)
+  if (!code) {
+    process.stdout.write('RANY: --join needs the work-room invite link (RANY → the room → Invite agent)\n')
+    process.exit(QUIET)
+  }
+  process.stdout.write((await joinSeat(code)) + '\n')
+  process.exit(QUIET)
+}
+
+/**
+ * UserPromptSubmit: a work-room invite link PASTED into the chat joins the room by itself. The link is a
+ * web address — nothing in a coding session understands it on its own, and the agent fetching it would
+ * only find a page telling it to paste the link into a session. So the plugin reads the prompt before
+ * the model does, joins, and hands the model the seat as context. No link in the prompt = no work, no
+ * network, no output: this runs on every prompt.
+ */
+if (process.argv.includes('--prompt')) {
+  const hook = await readHookInput()
+  const code = inviteCodeIn(hook.prompt)
+  if (code && config.token) {
+    const sid = sessionId ?? (typeof hook.session_id === 'string' && hook.session_id ? hook.session_id : null)
+    process.stdout.write(JSON.stringify({
+      hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: await joinSeat(code, sid) },
+    }) + '\n')
+  }
+  process.exit(QUIET)
+}
+
 /** `--stop`: SessionEnd asks this session's listener to go away, so a closed terminal leaves no
  *  socket AND no binding — ADR-038's "closing the window drops the bind, re-bind to move it". */
 if (process.argv.includes('--stop')) {
@@ -607,6 +741,79 @@ function attachmentLines(atts, channelId) {
     `  get_recent_messages({channelId:"${channelId}", limit:5}) returns a fresh download url per file —`,
     `  download it and open it (an image included) before answering. Do not answer as if nothing was sent.`,
   ]
+}
+
+/**
+ * The wake text for a work-room event (ADR-046). Every variant names the SEAT — which agent this session
+ * is in that room — because the persona is one identity with several agents, and an agent that does not
+ * know which one it is would speak as the wrong colleague.
+ */
+function roomPrompt(type, d, seat) {
+  const who = `You are "${seat.name}" (agentId ${seat.agentId}) in the work room at channel ${d.channelId}, working from THIS repository.`
+  const tools = [
+    `Your room tools — always pass channelId:"${d.channelId}" and agentId:"${seat.agentId}":`,
+    `  get_room — the other agents, the budget, pending requests and the BRIEF docs (read the brief first);`,
+    `  post_message({channelId, agentId, content}) — talk in the room, in one or two sentences: what you did`,
+    `    or what you need. Detail belongs on the board, not in the chat;`,
+    `  set_agent_status — the one line your tile shows (what you are doing now); keep it current;`,
+    `  request_permission — BEFORE anything destructive, production-facing, costly or outside this repo;`,
+    `  list_board_tasks / get_task / create_task / set_task_status / comment_task — the room's work queue`,
+    `    (no board yet? create_board with roomChannelId, then put the job on it).`,
+  ]
+  if (type === 'PERSONA_ROOM_MESSAGE') {
+    const from = d.fromOwner ? `your OWNER (the room's authority)` : `the agent "${d.authorName ?? '?'}"`
+    return [
+      `RANY: work room — ${from} wrote in channel ${d.channelId}:`,
+      `  ${String(d.content ?? '').split('\n').join('\n  ')}`,
+      ...attachmentLines(d.attachments, d.channelId),
+      ``,
+      who,
+      `Turns left before the room waits for the owner: ${d.turnsLeft ?? '?'}. Speak when you have something`,
+      `to add, a result, or a question — silence is fine; agreeing out loud spends everyone's turns.`,
+      ...tools,
+      ``,
+      asPersona(),
+    ].join('\n')
+  }
+  if (type === 'PERSONA_ROOM_DECISION') {
+    return [
+      `RANY: your owner ${d.approved ? 'APPROVED' : 'DENIED'} your permission request in work room ${d.channelId}.`,
+      `  You asked: ${String(d.question ?? '')}`,
+      ...(d.note ? [`  Their note: ${d.note}`] : []),
+      ``,
+      who,
+      d.approved ? `Go ahead with exactly what was approved — nothing broader.`
+        : `Do not do it. Find another way, or ask again with a narrower request.`,
+      ...tools,
+      ``,
+      asPersona(),
+    ].join('\n')
+  }
+  // PERSONA_ROOM_UPDATED — an intervention. Say what it means for THIS agent: stop when it (or the
+  // room) was paused, removed or closed; otherwise it is news, not an instruction.
+  const mine = String(d.agentId ?? '') === String(seat.agentId)
+  const stop = d.change === 'room_paused' || d.change === 'closed'
+    || (mine && (d.change === 'agent_paused' || d.change === 'agent_removed'))
+  const what = {
+    agent_joined: mine ? 'you were invited into this room' : 'a new agent joined the room',
+    agent_renamed: mine ? `your seat is now called "${seat.name}"` : 'an agent was renamed',
+    agent_paused: mine ? 'the owner PAUSED your seat' : 'the owner paused an agent',
+    agent_resumed: mine ? 'the owner resumed your seat' : 'the owner resumed an agent',
+    agent_removed: mine ? 'the owner REMOVED you from the room' : 'the owner removed an agent',
+    room_paused: 'the owner PAUSED the whole room',
+    room_resumed: 'the owner resumed the room (fresh turn budget)',
+    budget: 'the owner changed the turn budget',
+    board: "the room's board changed",
+    budget_exhausted: 'the room used up its turn budget and is waiting for the owner',
+    closed: 'the owner CLOSED the room',
+  }[d.change] ?? `the room changed (${d.change})`
+  const next = stop
+    ? [`STOP working on this room's job now and do not post there until you are resumed. Leave what you`,
+       `were doing in a safe state${d.change === 'agent_removed' || d.change === 'closed' ? '.' : ' and say so in your status line.'}`]
+    : d.change === 'budget_exhausted' ? [`Do not post in the room until the owner writes there again.`]
+    : d.change === 'agent_joined' && mine ? [`Read the brief (get_room), then tell the room in one line which part you take.`]
+    : [`Nothing to do unless it changes your part of the job.`]
+  return [`RANY: work room ${d.channelId} — ${what}.`, ``, who, ...next, ...tools, ``, asPersona()].join('\n')
 }
 
 /**
@@ -778,6 +985,27 @@ function classify(type, d) {
       ``,
       asPersona(),
     ].join('\n')
+  }
+
+  // Work rooms (ADR-046). A room seats the owner's agents by BOARD, so each event names the boards it is
+  // for and the session that bound one of them wakes — the same claimedBy/ownedHere routing as a task,
+  // which is how the Cortex agent hears a thread that lives in the Cocktail server.
+  if (type === 'PERSONA_ROOM_MESSAGE' || type === 'PERSONA_ROOM_UPDATED' || type === 'PERSONA_ROOM_DECISION') {
+    if (config.wake.rooms === false) return null
+    const seats = type === 'PERSONA_ROOM_MESSAGE' ? (Array.isArray(d.targets) ? d.targets : [])
+      : type === 'PERSONA_ROOM_UPDATED' ? (Array.isArray(d.agents) ? d.agents : [])
+      : [{ agentId: d.agentId, boardId: d.boardId, name: d.agentName }]
+    // Prefer the seat the event is ABOUT (a pause, a decision), else any seat bound here.
+    // A seat joined by invite link is bound under its OWN id; a board-seated one under its board.
+    const bound = seats.filter((s) => s && (ownedHere(claimedBy(String(s.agentId)))
+      || (s.boardId && ownedHere(claimedBy(String(s.boardId))))))
+    const seat = bound.find((s) => String(s.agentId) === String(d.agentId ?? '')) ?? bound[0]
+    if (!seat) {
+      logRoute(type, { channelId: d.channelId }, 'skip (no seat bound here)')
+      return null
+    }
+    logRoute(type, { channelId: d.channelId, agentId: seat.agentId, boardId: seat.boardId }, 'wake')
+    return roomPrompt(type, d, seat)
   }
 
   if (type === 'PERSONA_FORWARD') {

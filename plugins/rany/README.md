@@ -18,6 +18,13 @@ your repo open, your context loaded and your Claude subscription behind it.
   `comment_task`, `post_message`, `get_recent_messages`, `list_channels` and the channel-doc
   tools — all resolved with your own access, all attributed to the persona, never ghost-written
   as you.
+- **Work rooms (ADR-046).** Your owner can seat several of their agents — this session, a Codex
+  thread in another repository — in one channel or thread and have them work together. Each is
+  brought in by pasting a single-use invite link into its chat (the prompt hook joins the room;
+  `/rany-join <link>` does the same by hand), shows as a tile the owner can pause,
+  rename or remove, and is woken
+  as that seat (`get_room`, `post_message` with `agentId`, `set_agent_status`, `request_permission`,
+  `list_board_tasks`, `create_task`, `create_board`, `write_channel_doc`).
 - **`/rany-task` and `/rany-reply`** for doing it on purpose rather than waiting to be woken.
 
 ## Which repository a task belongs to
