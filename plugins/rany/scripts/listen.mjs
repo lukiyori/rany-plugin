@@ -1244,7 +1244,9 @@ function connect() {
       heartbeat = setInterval(() => {
         try { socket.send(JSON.stringify({ op: OP.Heartbeat })) } catch { /* close handler follows */ }
       }, interval)
-      socket.send(JSON.stringify({ op: OP.Identify, d: { token: config.token } }))
+      // `features: ['home']`: this listener routes conversations by the persona's home (ADR-047), so the
+      // gateway may hand it conversations at all — older plugins, which woke the last-used window, get none.
+      socket.send(JSON.stringify({ op: OP.Identify, d: { token: config.token, features: ['home'] } }))
       return
     }
 

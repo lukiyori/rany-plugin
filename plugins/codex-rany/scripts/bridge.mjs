@@ -1158,7 +1158,9 @@ function connect() {
       heartbeat = setInterval(() => {
         try { socket.send(JSON.stringify({ op: OP.Heartbeat })) } catch { /* close handler follows */ }
       }, interval)
-      socket.send(JSON.stringify({ op: OP.Identify, d: { token: config.token } }))
+      // `features: ['home']`: this bridge routes conversations by the persona's home (ADR-047), so the
+      // gateway may hand it conversations at all — older plugins, which guessed a thread, get none.
+      socket.send(JSON.stringify({ op: OP.Identify, d: { token: config.token, features: ['home'] } }))
       return
     }
 
