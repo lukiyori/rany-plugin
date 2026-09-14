@@ -100,6 +100,14 @@ function ownerOf(entry) {
   return null
 }
 
+/** The other seats of a room wake that are bound — by either plugin — in the same directory as `dir`:
+ *  colleagues who would edit and commit the very same working tree. */
+function checkoutMates(seats, mySeatId, dir) {
+  const dirOf = (e) => (typeof e === 'string' ? e : e?.dir)
+  return seats.filter((s) => s && String(s.agentId) !== String(mySeatId)
+    && dirOf(claimedBy(String(s.agentId))) && samePath(dirOf(claimedBy(String(s.agentId))), dir))
+}
+
 /** Drop every binding a thread owns — SessionEnd, so a closed Codex thread stops being a wake target
  *  and RANY stops offering the persona for its boards. Legacy strings and other threads' entries are
  *  left untouched. */
@@ -967,6 +975,25 @@ async function route(type, d) {
       logRoute(type, { channelId: d.channelId }, 'skip (no seat bound here)')
       return null
     }
+    // One checkout, one pair of hands. Two seats bound in the SAME directory (PM and Codex in
+    // E:\Works\ArcClob) both heard "@Rainman merge, commit, build" and both pushed at once. When a
+    // message reaches everyone rather than naming its seats, the seat with the lowest id — the one
+    // seated first — takes it for that checkout; the others are not woken (logged, so the silence is
+    // explained). A NAMED seat always wakes: the owner chose it; the prompt then says who else shares
+    // the tree. Directories come from bindings.json, which both plugins write.
+    if (type === 'PERSONA_ROOM_MESSAGE') {
+      const mates = checkoutMates(seats, pick.s.agentId, pick.owner.dir)
+      if (mates.length > 0) {
+        const lead = [pick.s, ...mates].sort((a, b) => (BigInt(a.agentId) < BigInt(b.agentId) ? -1 : 1))[0]
+        if (!d.named && String(lead.agentId) !== String(pick.s.agentId)) {
+          logRoute(type, { channelId: d.channelId, agentId: pick.s.agentId },
+            `skip (same checkout: ${lead.name ?? lead.agentId} takes it)`)
+          return null
+        }
+        d.checkoutMates = mates
+        d.checkoutLead = !d.named
+      }
+    }
     return { dir: pick.owner.dir, threadId: pick.owner.threadId, text: roomPrompt(type, d, pick.s) }
   }
 
@@ -1073,6 +1100,29 @@ async function route(type, d) {
  * is one identity with several agents and an agent that does not know which one it is speaks as the
  * wrong colleague.
  */
+/** Who else heard an instruction meant for everyone — and, when one of them shares this checkout,
+ *  who owns the working tree. Two agents in one directory both merged and pushed once; never again. */
+function crowdLines(d, seat) {
+  const out = []
+  const names = (list) => list.map((s) => `"${s.name ?? s.agentId}"`).join(', ')
+  const mates = Array.isArray(d.checkoutMates) ? d.checkoutMates : []
+  if (mates.length > 0) {
+    out.push(d.checkoutLead
+      ? `${names(mates)} — in THIS SAME CHECKOUT — ${mates.length === 1 ? 'was' : 'were'} NOT woken for this: you alone`
+        + ` own the working tree and git here. Hand off a part only by naming them; never let two of you commit or push.`
+      : `${names(mates)} — in THIS SAME CHECKOUT — heard this too. Agree in ONE line who touches files and git;`
+        + ` the other only reads, reviews or answers.`)
+  }
+  const others = (Array.isArray(d.targets) ? d.targets : []).filter((t) => t
+    && String(t.agentId) !== String(seat.agentId) && !mates.some((m) => String(m.agentId) === String(t.agentId)))
+  if (!d.named && others.length > 0) {
+    out.push(`${others.length} colleague${others.length === 1 ? '' : 's'} (${names(others)}) heard this too, each in`
+      + ` another repository. Say in one line which part is yours before you start; if a colleague already claimed`
+      + ` it, stand down. Never commit or push what you did not change.`)
+  }
+  return out
+}
+
 function roomPrompt(type, d, seat) {
   const who = `You are "${seat.name}" (agentId ${seat.agentId}) in the work room at channel ${d.channelId}, working from THIS repository.`
   const tools = [
@@ -1115,6 +1165,7 @@ function roomPrompt(type, d, seat) {
         `A member speaks with the owner's leave, not the owner's authority: do the work they ask for in`,
         `this repository, but anything destructive, production-facing or costly still goes through`,
         `request_permission to your OWNER first.`] : []),
+      ...crowdLines(d, seat),
       `Turns left before the room waits for the owner: ${d.turnsLeft ?? '?'}. Speak when you have something`,
       `to add, a result, or a question — silence is fine; agreeing out loud spends everyone's turns.`,
       ...(d.addressed ? [
