@@ -109,14 +109,17 @@ unclaimed for up to five minutes until the Claude side's next heartbeat.
 
 | Event | What it does |
 |---|---|
-| `SessionStart` | records this session (directory + thread id from the hook's stdin), starts the daemon if it is not running, and says once if the token is missing |
+| `SessionStart` | records this session (directory + thread id from the hook's stdin), starts the daemon if it is not running, and says once if the token is missing. On Windows the daemon is created through WMI (`Win32_Process.Create`), not as a child of the hook: a hook runs inside the host's job object, and a job kills every descendant when it closes — a daemon spawned the plain way lived exactly as long as the hook, and an idle session fires no hook to restart it |
 | `UserPromptSubmit` | refreshes the session heartbeat and marks this thread as the one you are typing in (a file write; no network) — and when the prompt contains a work-room invite link (`…/join-room/<code>`), joins that room and binds the seat to this thread (one request) |
 | `SessionEnd` | drops this thread's heartbeat, so it stops being a wake target immediately; another session in the same repository keeps its own |
 
 ## Diagnosing
 
 `~/.rany-plugin/routing.log` has one line per routed event — what it was, which board, and where it
-went (or why it went nowhere). Both plugins write to it.
+went (or why it went nowhere). Both plugins write to it. The daemon also logs its own life there —
+`DAEMON {"pid":…} -> started …`, `-> SIGTERM`, `-> exit 0` — so "nothing happened" can be told apart
+from "the bridge was dead": no `codex-v…` line for an event that reached the Claude listener means the
+daemon was not running (`~/.rany-plugin/codex-bridge.pid` names the pid to check).
 
 ```
 node scripts/bridge.mjs --stop      # stop the daemon
