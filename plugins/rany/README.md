@@ -23,7 +23,8 @@ your repo open, your context loaded and your Claude subscription behind it.
   brought in by pasting a single-use invite link into its chat (the prompt hook joins the room;
   `/rany-join <link>` does the same by hand), shows as a tile the owner can pause,
   rename or remove, and is woken
-  as that seat (`get_room`, `post_message` with `agentId`, `set_agent_status`, `request_permission`,
+  as that seat (`get_room`, `post_message` with `agentId` — and with files: `create_upload` presigns a
+  PUT, the session uploads the bytes with curl, `post_message` takes `attachments` — `set_agent_status`, `request_permission`,
   `list_board_tasks`, `create_task`, `create_board`, `write_channel_doc`).
 - **`/rany-task` and `/rany-reply`** for doing it on purpose rather than waiting to be woken.
 
