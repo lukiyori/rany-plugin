@@ -25,8 +25,9 @@ your repo open, your context loaded and your Claude subscription behind it.
   old seat back by itself, no new link; `/rany-rejoin` by hand), shows as a tile the owner can pause,
   rename or remove — and a **terminal** tab in the chat window: a click on the tile's face shows,
   read-only, every tool call this session makes while it holds the seat (the `PostToolUse` hook posts
-  one line per call; never the content), and — when the session was started through
-  `term/rany-term.mjs` (see `/rany-term`) — the owner's REAL screen, byte for byte, owner-only — and is woken
+  one line per call; never the content), and — once `term/rany-term.mjs --install` has made plain
+  `claude` / `codex` run through the launcher (see `/rany-term`) — the owner's REAL screen, byte for
+  byte, owner-only — and is woken
   as that seat (`get_room`, `post_message` with `agentId` — and with files: `create_upload` presigns a
   PUT, the session uploads the bytes with curl, `post_message` takes `attachments` — `set_agent_status`, `request_permission`,
   `list_board_tasks`, `create_task`, `create_board`, `write_channel_doc`).

@@ -19,8 +19,8 @@
 // into this directory. Everything else is Node 22.
 
 import { spawnSync } from 'node:child_process'
-import { existsSync, readFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { basename, dirname, join } from 'node:path'
 import { homedir, tmpdir } from 'node:os'
 import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
@@ -59,12 +59,15 @@ if (!config.token) {
 
 const norm = (p) => p.replace(/[\\/]+/g, '/').replace(/\/$/, '').toLowerCase()
 
-/** The seat this directory holds, from the plugin's seat history (written on join / re-attach). */
-function rememberedSeat(dir) {
+/** The seat this directory holds for this KIND of agent (claude / codex — both plugins write the same
+ *  seat history), newest first. Nothing for the kind ⇒ any seat of the directory. */
+function rememberedSeat(dir, kind) {
   try {
     const repos = JSON.parse(readFileSync(join(homedir(), '.rany-plugin', 'seat-history.json'), 'utf8')).repos ?? {}
-    const seats = Object.entries(repos[norm(dir)] ?? {}).filter(([, s]) => (s?.agent ?? 'claude') === 'claude')
-    seats.sort((a, b) => String(b[1]?.lastJoined ?? '').localeCompare(String(a[1]?.lastJoined ?? '')))
+    const all = Object.entries(repos[norm(dir)] ?? {})
+    const mine = all.filter(([, s]) => (s?.agent ?? 'claude') === kind)
+    const seats = (mine.length ? mine : all)
+      .sort((a, b) => String(b[1]?.lastJoined ?? '').localeCompare(String(a[1]?.lastJoined ?? '')))
     return seats[0] ? { id: seats[0][0], ...seats[0][1] } : null
   } catch { return null }
 }
@@ -74,7 +77,84 @@ const argv = process.argv.slice(2)
 let seatArg = null
 const seatAt = argv.indexOf('--seat')
 if (seatAt !== -1) { seatArg = argv[seatAt + 1] ?? null; argv.splice(seatAt, 2) }
+
+// ---- shims: make it the DEFAULT --------------------------------------------------------------------
+// `rany-term --install` writes `claude` and `codex` shims into ~/.rany-plugin/bin and puts that directory
+// first on the user's PATH, so typing `claude` or `codex` anywhere IS this launcher: in a directory that
+// holds a seat the screen is mirrored, elsewhere the agent simply runs. The shim calls this file with the
+// agent's name; `resolveReal` then finds the actual program by walking PATH and skipping the shim
+// directory, so the shim never calls itself.
+const shimDir = join(homedir(), '.rany-plugin', 'bin')
+const AGENTS = ['claude', 'codex']
+
+function installShims() {
+  mkdirSync(shimDir, { recursive: true })
+  // The shim points at a STABLE copy in ~/.rany-plugin/term, not at this file: this file lives in a
+  // plugin-cache directory named after the version, which every plugin update leaves behind. Re-running
+  // --install after an update refreshes the copy; node-pty installs next to it, once.
+  const stable = join(homedir(), '.rany-plugin', 'term')
+  mkdirSync(stable, { recursive: true })
+  for (const f of ['rany-term.mjs', 'package.json']) writeFileSync(join(stable, f), readFileSync(join(here, f)))
+  const self = join(stable, 'rany-term.mjs')
+  for (const a of AGENTS) {
+    if (process.platform === 'win32') {
+      writeFileSync(join(shimDir, `${a}.cmd`), `@echo off\r\nnode "${self}" ${a} %*\r\n`)
+    } else {
+      const p = join(shimDir, a)
+      writeFileSync(p, `#!/bin/sh\nexec node "${self}" ${a} "$@"\n`)
+      chmodSync(p, 0o755)
+    }
+  }
+  let onPath = (process.env.PATH ?? '').split(process.platform === 'win32' ? ';' : ':').some((p) => norm(p) === norm(shimDir))
+  if (process.platform === 'win32' && !onPath) {
+    // This process's PATH predates a previous --install; ask the registry-backed USER Path before adding,
+    // so running --install twice (after a plugin update, say) does not stack entries.
+    const q = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+      "[Environment]::GetEnvironmentVariable('Path', 'User')"], { encoding: 'utf8' })
+    onPath = String(q.stdout ?? '').split(';').some((p) => norm(p.trim()) === norm(shimDir))
+  }
+  if (process.platform === 'win32' && !onPath) {
+    // The USER PATH, through .NET — `setx` truncates at 1024 characters and would eat the rest of it.
+    const ps = `[Environment]::SetEnvironmentVariable('Path', '${shimDir.replace(/'/g, "''")};' + [Environment]::GetEnvironmentVariable('Path', 'User'), 'User')`
+    const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { stdio: 'inherit' })
+    process.stdout.write(r.status === 0
+      ? `rany-term: shims in ${shimDir}, added to the front of your user PATH. Open a NEW terminal; from then on plain \`claude\` and \`codex\` mirror their screen wherever the directory holds a seat.\n`
+      : `rany-term: shims written to ${shimDir}, but PATH could not be changed — add that directory to the FRONT of your PATH by hand.\n`)
+  } else {
+    process.stdout.write(onPath
+      ? `rany-term: shims refreshed in ${shimDir} (already on PATH). Plain \`claude\` and \`codex\` mirror their screen wherever the directory holds a seat.\n`
+      : `rany-term: shims in ${shimDir}. Put it FIRST on your PATH (e.g. \`export PATH="${shimDir}:$PATH"\` in your shell profile); from then on plain \`claude\` and \`codex\` mirror their screen wherever the directory holds a seat.\n`)
+  }
+}
+
+function uninstallShims() {
+  for (const a of AGENTS) for (const f of [a, `${a}.cmd`]) { try { rmSync(join(shimDir, f), { force: true }) } catch { /* gone */ } }
+  process.stdout.write(`rany-term: shims removed from ${shimDir} (the PATH entry is harmless and left alone).\n`)
+}
+
+/** The real program behind a name: the first match on PATH outside the shim directory (Windows: with
+ *  a PATHEXT extension). Null when nothing is found, in which case the name is passed through as-is. */
+function resolveReal(name) {
+  if (/[\\/]/.test(name)) return name
+  const dirs = (process.env.PATH ?? '').split(process.platform === 'win32' ? ';' : ':').filter(Boolean)
+    .filter((p) => norm(p) !== norm(shimDir))
+  const exts = process.platform === 'win32'
+    ? (process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';').map((e) => e.toLowerCase()).concat([''])
+    : ['']
+  for (const d of dirs) for (const e of exts) {
+    const p = join(d, name + e)
+    try { if (statSync(p).isFile()) return p } catch { /* next */ }
+  }
+  return null
+}
+
+if (argv[0] === '--install') { installShims(); process.exit(0) }
+if (argv[0] === '--uninstall') { uninstallShims(); process.exit(0) }
+
 const command = argv.length ? argv : ['claude']
+const agentKind = /codex/i.test(basename(command[0])) ? 'codex' : 'claude'
+// Through a shim, `claude` must reach the real claude.cmd and not the shim again.
+command[0] = resolveReal(command[0]) ?? command[0]
 
 // ---- the mirror -------------------------------------------------------------------------------------
 function postJson(path, payload, timeoutMs = 6000) {
@@ -150,23 +230,26 @@ class Mirror {
 // ---- run --------------------------------------------------------------------------------------------
 const pty = loadPty()
 const cwd = process.cwd()
-const seat = seatArg ? { id: seatArg } : rememberedSeat(cwd)
+const seat = seatArg ? { id: seatArg } : rememberedSeat(cwd, agentKind)
 const mirror = new Mirror(seat?.id ?? null)
 
 const cols = process.stdout.columns || 120
 const rows = process.stdout.rows || 30
-// Windows: `claude` is claude.cmd on PATH; ConPTY runs it through cmd.exe. The arguments stay an ARRAY —
-// node-pty quotes each for the Windows command line; a hand-joined string with quotes inside is what
-// made cmd drop the command and sit at a prompt. Elsewhere the shell resolves the name.
-const [file, args] = process.platform === 'win32'
+// Windows: `claude` and `codex` are .cmd files on PATH; ConPTY runs those through cmd.exe. The arguments
+// stay an ARRAY — node-pty quotes each for the Windows command line; a hand-joined string with quotes
+// inside is what made cmd drop the command and sit at a prompt. A real .exe runs directly.
+const [file, args] = process.platform === 'win32' && !/\.exe$/i.test(command[0])
   ? ['cmd.exe', ['/d', '/c', ...command]]
   : [command[0], command.slice(1)]
 if (process.env.RANY_TERM_DEBUG) process.stderr.write(`rany-term: spawn ${file} ${JSON.stringify(args)} in ${cwd}\r\n`)
 const child = pty.spawn(file, args, { name: 'xterm-256color', cols, rows, cwd, env: { ...process.env, RANY_TERM: '1' } })
 
-process.stderr.write(seat?.id
-  ? `\x1b[2mrany-term: mirroring this terminal to work-room seat ${seat.name ? `"${seat.name}" ` : ''}(${seat.id}) — owner-only view in RANY.\x1b[0m\r\n`
-  : `\x1b[33mrany-term: no work-room seat remembered for ${cwd}; running without a mirror (join a room first, or pass --seat <agentId>).\x1b[0m\r\n`)
+// Through the shims this runs on EVERY `claude`/`codex`, most of them in directories with no seat —
+// those must look exactly like the plain program, so the no-seat case says nothing unless asked.
+if (seat?.id)
+  process.stderr.write(`\x1b[2mrany-term: mirroring this terminal to work-room seat ${seat.name ? `"${seat.name}" ` : ''}(${seat.id}) — owner-only view in RANY.\x1b[0m\r\n`)
+else if (process.env.RANY_TERM_DEBUG || seatArg === null && argv.length === 0)
+  process.stderr.write(`\x1b[33mrany-term: no work-room seat remembered for ${cwd}; running without a mirror (join a room first, or pass --seat <agentId>).\x1b[0m\r\n`)
 
 mirror.push('s', `${cols},${rows}`)
 mirror.push('r', `${cols},${rows}`)

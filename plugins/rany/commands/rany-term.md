@@ -1,37 +1,45 @@
 ---
 name: rany-term
-description: How to mirror THIS agent's real terminal to its RANY work-room seat — the owner sees the screen itself on the meet screen (ADR-050).
+description: Make the work-room "Screen" tab show THIS agent's real terminal — install the rany-term shims once, then plain `claude` / `codex` mirror their screen wherever the directory holds a seat (ADR-050).
 ---
 
-# Mirror the terminal to the work room
+# The real screen in the work room
 
-This cannot be turned on from inside a running session: a hook only sees tool calls, never the
-screen. The screen is caught by running the agent INSIDE the `rany-term` launcher, which owns a pty,
-shows you everything as usual, and ships the same bytes to RANY.
+This cannot be switched on from inside a running session: a hook only sees tool calls, never the
+screen. The screen is caught by running the agent INSIDE a pty the launcher owns — so the launcher
+has to be what starts the agent. Installed once, it is the default: `claude` and `codex` on the
+command line become shims that run the real program through the launcher. In a directory that
+holds a work-room seat the screen is mirrored; anywhere else the agent simply runs.
 
-Tell the owner (in one line) to start the session this way next time, from a shell in this repository:
+Tell the owner (in one line) to run this ONCE, in any shell:
+
+```
+node "${CLAUDE_PLUGIN_ROOT}/term/rany-term.mjs" --install
+```
+
+then open a NEW terminal and start the agent as always (`claude`, `codex`, `claude --resume`, …).
+This session is not mirrored until it is restarted that way. `--uninstall` removes the shims.
+
+Without the shims the launcher still works by hand:
 
 ```
 node "${CLAUDE_PLUGIN_ROOT}/term/rany-term.mjs"                  # runs `claude` here
-node "${CLAUDE_PLUGIN_ROOT}/term/rany-term.mjs" claude --resume  # any command + args
-```
-
-A PowerShell alias makes it a word:
-
-```
-function rany-term { node "$env:USERPROFILE\.claude\plugins\cache\rany-plugins\rany\<version>\term\rany-term.mjs" @args }
+node "${CLAUDE_PLUGIN_ROOT}/term/rany-term.mjs" codex            # or codex, or any command + args
+node "${CLAUDE_PLUGIN_ROOT}/term/rany-term.mjs" --seat <agentId> # name the seat explicitly
 ```
 
 First run installs `node-pty` (one native package) into the plugin's `term/` directory.
 
 ## What this decides
 
-- The launcher picks the seat this repository holds (`~/.rany-plugin/seat-history.json`; `--seat <agentId>`
-  overrides) and posts the pty's output, resizes and start/end marks to
-  `POST /personas/@self/rooms/{agentId}/term` in ~120 ms batches. No seat = it just runs the agent.
-- RANY keeps it as a capped Redis stream (minutes, not history) and shows it to the room's **owner only**:
-  the raw screen includes everything typed into that shell. Room members see the tool-call log (ADR-049)
-  instead.
-- Nothing flows back. The seat hears its owner through the room; a keyboard into an agent's shell is
-  what ADR-037 forbids.
+- `--install` writes `~/.rany-plugin/bin/claude(.cmd)` and `codex(.cmd)` and puts that directory FIRST
+  on the user PATH (Windows: the user `Path` through .NET, never `setx`, which truncates). The shim
+  runs the launcher with the agent's name; the launcher finds the REAL program on PATH skipping the
+  shim directory, so it never calls itself. Claude/Codex updates are untouched.
+- The seat is the one this directory holds for that agent kind (`seat-history.json`, written on join
+  and re-attach; `--seat` overrides). Output, resizes and start/end go to
+  `POST /personas/@self/rooms/{agentId}/term` in ~120 ms batches; RANY keeps a capped Redis stream
+  and shows it to the room's **owner only** — a raw screen includes what was typed. Members see the
+  tool-call log (ADR-049).
+- Nothing flows back. The seat hears its owner through the room (ADR-037).
 - Costs no model tokens: bytes are copied, not read by anything.
