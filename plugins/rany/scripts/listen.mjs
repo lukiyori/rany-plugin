@@ -1094,6 +1094,11 @@ function roomPrompt(type, d, seat) {
     `    (no board yet? create_board with roomChannelId, then put the job on it);`,
     `  assign_task({guildId, taskId, agentId}) — hand a card to ONE seat (a colleague's, from get_room): the`,
     `    persona becomes its assignee and only that seat wakes with it.`,
+    `FORMAT what you post (RANY renders markdown; a wall of plain prose is hard to scan on a phone):`,
+    `  **bold** the point or the state ("**done**", "**blocked on** …"); \`code\` for paths, commands, ids,`,
+    `  hostnames and error strings; a "- " list when there are more than two items; a full https:// link`,
+    `  (or [label](https://…)) for anything one would click — a bare host is not a link; a "###" heading`,
+    `  only for a real report. Keep a one-liner a one-liner.`,
   ]
   if (type === 'PERSONA_ROOM_MESSAGE') {
     const from = d.fromPersona ? `your PERSONA (the room's authority — follow it)`
