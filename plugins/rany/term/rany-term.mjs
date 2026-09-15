@@ -155,10 +155,13 @@ const mirror = new Mirror(seat?.id ?? null)
 
 const cols = process.stdout.columns || 120
 const rows = process.stdout.rows || 30
-// Windows: `claude` is claude.cmd on PATH; ConPTY runs it through cmd.exe. Elsewhere the shell resolves it.
+// Windows: `claude` is claude.cmd on PATH; ConPTY runs it through cmd.exe. The arguments stay an ARRAY —
+// node-pty quotes each for the Windows command line; a hand-joined string with quotes inside is what
+// made cmd drop the command and sit at a prompt. Elsewhere the shell resolves the name.
 const [file, args] = process.platform === 'win32'
-  ? ['cmd.exe', ['/d', '/s', '/c', command.map((a) => (/\s/.test(a) ? `"${a}"` : a)).join(' ')]]
+  ? ['cmd.exe', ['/d', '/c', ...command]]
   : [command[0], command.slice(1)]
+if (process.env.RANY_TERM_DEBUG) process.stderr.write(`rany-term: spawn ${file} ${JSON.stringify(args)} in ${cwd}\r\n`)
 const child = pty.spawn(file, args, { name: 'xterm-256color', cols, rows, cwd, env: { ...process.env, RANY_TERM: '1' } })
 
 process.stderr.write(seat?.id
