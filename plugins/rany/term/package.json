@@ -1,0 +1,11 @@
+{
+  "name": "rany-term",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Run a coding agent inside a pty and mirror its terminal, byte for byte, to its RANY work-room seat (ADR-050).",
+  "type": "module",
+  "bin": { "rany-term": "./rany-term.mjs" },
+  "dependencies": {
+    "node-pty": "^1.1.0"
+  }
+}
