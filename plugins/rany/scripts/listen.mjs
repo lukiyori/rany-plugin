@@ -20,6 +20,7 @@
 // most people never finish installing. Node 22's global WebSocket is all this needs.
 
 import { readFileSync, writeFileSync, appendFileSync, unlinkSync, existsSync, mkdirSync, statSync } from 'node:fs'
+import { spawn } from 'node:child_process'
 import { basename, dirname, join } from 'node:path'
 import { homedir, tmpdir } from 'node:os'
 import { createHash } from 'node:crypto'
@@ -889,6 +890,35 @@ if (process.argv.includes('--beat')) {
   process.exit(QUIET)
 }
 
+/** Keep ~/.rany-plugin/term ready for the shims (ADR-050): a current copy of the launcher, and node-pty
+ *  installed — started detached when missing, at most once every ten minutes so a failing npm does not
+ *  respawn on every turn. Never throws, never prints. */
+function prepareTerm() {
+  try {
+    const pluginRoot = dirname(dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')))
+    const src = join(pluginRoot, 'term')
+    const stable = join(homedir(), '.rany-plugin', 'term')
+    if (!existsSync(join(src, 'rany-term.mjs'))) return
+    mkdirSync(stable, { recursive: true })
+    for (const f of ['rany-term.mjs', 'package.json']) {
+      const next = readFileSync(join(src, f))
+      let cur = null
+      try { cur = readFileSync(join(stable, f)) } catch { /* first time */ }
+      if (!cur || !cur.equals(next)) writeFileSync(join(stable, f), next)
+    }
+    if (existsSync(join(stable, 'node_modules', 'node-pty', 'package.json'))) return
+    const lock = join(stable, '.installing')
+    try { if (Date.now() - statSync(lock).mtimeMs < 10 * 60_000) return } catch { /* not running */ }
+    writeFileSync(lock, String(process.pid))
+    const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
+    const child = spawn(npm, ['install', '--omit=dev', '--no-fund', '--no-audit', '--loglevel=error'],
+      { cwd: stable, detached: true, stdio: 'ignore', windowsHide: true, shell: process.platform === 'win32' })
+    child.on('error', () => { /* no npm: the launcher installs on first use instead */ })
+    child.unref()
+    if (process.env.RANY_TERM_DEBUG) process.stderr.write(`prepareTerm: npm install started in ${stable}\n`)
+  } catch (e) { if (process.env.RANY_TERM_DEBUG) process.stderr.write(`prepareTerm: ${e?.message ?? e}\n`) }
+}
+
 /** One terminal line for a PostToolUse payload: the tool and the one thing that identifies the call —
  *  a path, a command, a pattern. Never the content: an Edit's new text or a message body is the agent's
  *  work, not its activity, and the terminal is read by everyone who can read the room. */
@@ -959,6 +989,14 @@ if (!config.token) {
   if (msg) process.stdout.write(msg + '\n')
   process.exit(msg ? WAKE : QUIET)
 }
+
+// The real-screen launcher (ADR-050) needs node-pty, a native package Node does not ship. Rather than
+// make the owner watch an npm install the first time they type `claude`, prepare it here, in the
+// background, once per machine: refresh the stable launcher copy the shims point at (so a plugin update
+// reaches them without another --install) and, if node-pty is missing, start `npm install` detached and
+// forget about it. Silent on every failure — this is a convenience, never a reason to disturb a session.
+// Before the reminder below, which may end this process with a wake.
+prepareTerm()
 
 // Re-bind reminder (once per session): this repo has handled boards before, but a session-scoped
 // binding dies with its window, so a fresh session owns nothing until you say so. Rather than leave

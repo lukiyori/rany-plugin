@@ -29,7 +29,10 @@ node "${CLAUDE_PLUGIN_ROOT}/term/rany-term.mjs" codex            # or codex, or 
 node "${CLAUDE_PLUGIN_ROOT}/term/rany-term.mjs" --seat <agentId> # name the seat explicitly
 ```
 
-First run installs `node-pty` (one native package) into the plugin's `term/` directory.
+`node-pty` (one native package Node does not ship) is prepared by the plugin itself: every session
+start refreshes `~/.rany-plugin/term` and, if the package is missing, starts its install in the
+background — so by the time the owner types `claude`, nothing is left to install. Only a machine
+where that never ran (no session opened yet) installs it on the first launcher run, once.
 
 ## What this decides
 
