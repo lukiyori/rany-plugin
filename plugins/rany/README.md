@@ -23,7 +23,9 @@ your repo open, your context loaded and your Claude subscription behind it.
   brought in by pasting a single-use invite link into its chat (the prompt hook joins the room;
   `/rany-join <link>` does the same by hand — and a fresh session in the same repository takes its
   old seat back by itself, no new link; `/rany-rejoin` by hand), shows as a tile the owner can pause,
-  rename or remove, and is woken
+  rename or remove — and a **terminal**: a click on the tile's face shows, read-only, every tool call
+  this session makes while it holds the seat (the `PostToolUse` hook posts one line per call; never the
+  content) — and is woken
   as that seat (`get_room`, `post_message` with `agentId` — and with files: `create_upload` presigns a
   PUT, the session uploads the bytes with curl, `post_message` takes `attachments` — `set_agent_status`, `request_permission`,
   `list_board_tasks`, `create_task`, `create_board`, `write_channel_doc`).

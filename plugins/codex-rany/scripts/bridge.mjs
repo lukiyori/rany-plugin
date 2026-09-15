@@ -179,6 +179,36 @@ function forgetSeat(dir, agentId) {
 const seatsForRepo = (dir) => Object.entries(loadSeatHistory()[norm(dir)] ?? {})
   .filter(([, s]) => s?.agent === 'codex')
 
+/** One terminal line for a PostToolUse payload (db/0366): the tool and the one thing that identifies the
+ *  call — a path, a command, a pattern — never the content, which is the agent's work, not its activity.
+ *  Codex names its tools differently from Claude Code; unknown shapes fall back to the name alone. */
+function toolLine(hook) {
+  const name = typeof hook?.tool_name === 'string' ? hook.tool_name : ''
+  if (!name) return null
+  const input = hook.tool_input && typeof hook.tool_input === 'object' ? hook.tool_input : {}
+  const cwd = typeof hook.cwd === 'string' && hook.cwd ? hook.cwd : process.cwd()
+  const rel = (p) => typeof p === 'string' ? p.replace(/[\\/]+/g, '/').replace(new RegExp('^' + norm(cwd).replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '/', 'i'), '') : ''
+  const one = (s, max = 220) => String(s ?? '').replace(/\s+/g, ' ').trim().slice(0, max)
+  const cmd = Array.isArray(input.command) ? input.command.join(' ') : input.command
+  let detail
+  switch (name) {
+    case 'shell': case 'shell_command': case 'exec_command': case 'local_shell': case 'Bash':
+      detail = one(input.description || cmd); break
+    case 'apply_patch': detail = one(input.path || (typeof input.input === 'string' ? (/\*\*\* (?:Update|Add|Delete) File: (.+)/.exec(input.input)?.[1] ?? '') : ''), 200); break
+    case 'read_file': case 'write_file': case 'Read': case 'Edit': case 'Write':
+      detail = rel(input.path ?? input.file_path); break
+    case 'grep': case 'Grep': detail = `"${one(input.pattern, 80)}"`; break
+    case 'update_plan': detail = Array.isArray(input.plan) ? `${input.plan.length} steps` : ''; break
+    default: {
+      const m = /^mcp__(?:plugin_)?(\w+?)(?:_\w+)?__(\w+)$/.exec(name)
+      const shown = m ? `${m[1]} ${m[2]}` : name
+      const where = ['channelId', 'taskId', 'guildId', 'boardId'].filter((k) => input[k]).map((k) => `${k}=${input[k]}`).join(' ')
+      return one(`${shown}${where ? ' ' + where : ''}`, 260)
+    }
+  }
+  return one(detail ? `${name} ${detail}` : name, 260)
+}
+
 /** POST JSON with the persona token → `{ ok, status, body }`, or null when offline / unconfigured. */
 /** GET JSON with the persona token → the parsed body, or null (offline, unconfigured, not 200). */
 function getJson(path, timeoutMs = 5000) {
@@ -803,6 +833,16 @@ if (has('--ensure') || has('--ping') || has('--beat')) {
   const hook = await hookInput()
   noteSession(typeof hook.cwd === 'string' && hook.cwd ? hook.cwd : process.cwd(),
     typeof hook.session_id === 'string' && hook.session_id ? hook.session_id : undefined)
+  // The seat's TERMINAL (db/0366, task #86): every tool call this thread makes while it holds a work-room
+  // seat is one line on the meet screen. Best-effort — a failed push never costs the agent its turn.
+  if (has('--beat') && config.token && typeof hook.tool_name === 'string') {
+    const threadId = typeof hook.session_id === 'string' && hook.session_id ? hook.session_id : null
+    const seats = threadId ? Object.entries(loadBindings())
+      .filter(([, e]) => e && typeof e === 'object' && e.room && String(e.threadId) === threadId).map(([id]) => id) : []
+    const line = seats.length ? toolLine(hook) : null
+    if (line) await Promise.all(seats.map((id) =>
+      postJson(`/personas/@self/rooms/${id}/activity`, { lines: [{ kind: 'tool', text: line }] }, 4000)))
+  }
   // A work-room invite link PASTED into the chat joins the room by itself (ADR-046). The link is a web
   // address nothing in a coding session understands on its own, so the hook reads the prompt before the
   // model does, seats THIS thread and hands the model the seat as context. No link = no network.

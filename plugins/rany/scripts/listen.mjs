@@ -866,6 +866,18 @@ if (process.argv.includes('--prompt')) {
  * interval; every other tool call costs a stat and nothing else.
  */
 if (process.argv.includes('--beat')) {
+  // The seat's TERMINAL (db/0366, task #86): every tool call this session makes while it holds a work-room
+  // seat is one line on the meet screen — "Edit web/src/x.tsx", "Bash npm run build". The hook hands us the
+  // call on stdin; a session with no seat reads nothing and sends nothing. Best-effort: a failed push must
+  // never cost the agent its turn (async hook, short timeout, no retry).
+  const seats = Object.entries(loadBindings())
+    .filter(([, e]) => e && typeof e === 'object' && e.room && e.sessionId === sessionId).map(([id]) => id)
+  if (config.token && seats.length > 0) {
+    const hook = await readHookInput()
+    const line = toolLine(hook)
+    if (line) await Promise.all(seats.map((id) =>
+      postJson(`/personas/@self/rooms/${id}/activity`, { lines: [{ kind: 'tool', text: line }] }, 4000)))
+  }
   const mark = join(stateDir, `beat-${sessionId ?? projectKey}`)
   let last = 0
   try { last = statSync(mark).mtimeMs } catch { /* never beaten */ }
@@ -875,6 +887,37 @@ if (process.argv.includes('--beat')) {
     await declareBoards(boards) // even with no boards: it is also the persona home's heartbeat (ADR-047)
   }
   process.exit(QUIET)
+}
+
+/** One terminal line for a PostToolUse payload: the tool and the one thing that identifies the call —
+ *  a path, a command, a pattern. Never the content: an Edit's new text or a message body is the agent's
+ *  work, not its activity, and the terminal is read by everyone who can read the room. */
+function toolLine(hook) {
+  const name = typeof hook?.tool_name === 'string' ? hook.tool_name : ''
+  if (!name) return null
+  const input = hook.tool_input && typeof hook.tool_input === 'object' ? hook.tool_input : {}
+  const rel = (p) => typeof p === 'string' ? p.replace(/[\\/]+/g, '/').replace(new RegExp('^' + norm(projectDir).replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '/', 'i'), '') : ''
+  const one = (s, max = 220) => String(s ?? '').replace(/\s+/g, ' ').trim().slice(0, max)
+  let detail
+  switch (name) {
+    case 'Read': case 'Edit': case 'Write': case 'MultiEdit': case 'NotebookEdit':
+      detail = rel(input.file_path ?? input.notebook_path); break
+    case 'Bash': case 'PowerShell':
+      detail = one(input.description || input.command); break
+    case 'Grep': detail = `"${one(input.pattern, 80)}"${input.path ? ' in ' + rel(input.path) : ''}`; break
+    case 'Glob': detail = one(input.pattern, 120); break
+    case 'Agent': case 'Task': detail = one(input.description || input.prompt, 120); break
+    case 'WebFetch': case 'WebSearch': detail = one(input.url || input.query, 160); break
+    case 'TodoWrite': detail = Array.isArray(input.todos) ? `${input.todos.length} items` : ''; break
+    default: {
+      // MCP tools: "rany post_message" plus the ids that say where, never the text.
+      const m = /^mcp__(?:plugin_)?(\w+?)(?:_\w+)?__(\w+)$/.exec(name)
+      const shown = m ? `${m[1]} ${m[2]}` : name
+      const where = ['channelId', 'taskId', 'guildId', 'boardId'].filter((k) => input[k]).map((k) => `${k}=${input[k]}`).join(' ')
+      return one(`${shown}${where ? ' ' + where : ''}`, 260)
+    }
+  }
+  return one(detail ? `${name} ${detail}` : name, 260)
 }
 
 /** `--stop`: SessionEnd asks this session's listener to go away, so a closed terminal leaves no
