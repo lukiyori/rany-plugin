@@ -34,6 +34,10 @@ start refreshes `~/.rany-plugin/term` and, if the package is missing, starts its
 background — so by the time the owner types `claude`, nothing is left to install. Only a machine
 where that never ran (no session opened yet) installs it on the first launcher run, once.
 
+**Codex is different:** it is not run in a pty (its TUI flickered inside ConPTY and the frames were
+unreadable). The `codex` shim is a plain pass-through, and the Codex bridge daemon feeds the Screen tab
+from the thread's own rollout transcript — nothing to start. Only Claude Code uses the pty mirror.
+
 ## What this decides
 
 - `--install` writes `~/.rany-plugin/bin/claude(.cmd)` and `codex(.cmd)` and puts that directory FIRST

@@ -1,29 +1,24 @@
 ---
 name: rany-term
-description: Make the work-room "Screen" tab show THIS Codex thread's real terminal — install the rany-term shims once, then plain `codex` / `claude` mirror their screen wherever the directory holds a seat (ADR-050).
+description: Why the work-room "Screen" tab shows what THIS Codex thread did without anything to start — the bridge daemon streams the thread's own transcript (ADR-050, Codex variant).
 ---
 
-# The real screen in the work room
+# The Screen tab for a Codex seat
 
-No hook sees the screen; the bytes are caught only by running the agent inside a pty the launcher
-owns. The launcher ships with the Claude Code plugin's files (`plugins/rany/term/rany-term.mjs` in the
-same mirror) and is agent-agnostic — it runs `codex` exactly as it runs `claude`.
+Nothing to install, nothing to start. Codex writes everything it does to its rollout file
+(`~/.codex/sessions/<y>/<m>/<d>/rollout-<ts>-<threadId>.jsonl`) as it happens; the RANY bridge daemon —
+already running for every Codex seat — tails that file and posts each completed item as a terminal
+line to the seat's Screen: what the owner wrote (`›`), what Codex answered, every command (`$ …`, with
+its output and a non-zero exit code), every file change (`✎`), every MCP tool call (`⚙`). Reasoning is
+not shown: the screen is what was done, not what was thought.
 
-Tell the owner (in one line) to run this ONCE, in any shell, with the path of that file on this
-machine (Claude Code's plugin cache: `~/.claude/plugins/cache/rany-plugins/rany/<version>/term/`):
+Codex is deliberately NOT run inside a pty: its TUI redraws many times a second and flickered inside
+ConPTY, and the mirrored frames were unreadable. The transcript is exact and calm.
 
-```
-node <path>/rany-term.mjs --install
-```
+If the owner asks why the Screen tab is empty for this thread:
+- the daemon must be running (`~/.rany-plugin/codex-bridge.pid`; any prompt restarts it);
+- this thread must hold a seat (`$rany-join` / `$rany-rejoin`);
+- lines appear from the moment the seat was taken — with a little of the recent transcript before it.
 
-then open a NEW terminal and start Codex as always. `codex` becomes a shim that runs the real
-program through the launcher; in a directory that holds a work-room seat the screen is mirrored,
-elsewhere Codex simply runs. This thread is not mirrored until it is restarted that way.
-
-## What this decides
-
-- The seat is the one this directory holds for Codex (`~/.rany-plugin/seat-history.json`, written on
-  join and re-attach; `--seat <agentId>` overrides).
-- RANY keeps the screen as a capped Redis stream and shows it to the room's **owner only** — a raw
-  screen includes what was typed. Members see the tool-call log (ADR-049).
-- Nothing flows back to the agent (ADR-037). No model tokens are spent: bytes are copied, not read.
+The view is the room **owner's** only (a transcript includes what was typed); members see the tool-call
+log (ADR-049). Nothing flows back to Codex (ADR-037). No model tokens are spent.

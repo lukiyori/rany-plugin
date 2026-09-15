@@ -18,7 +18,7 @@
 //
 // Zero dependencies. Node 22's global WebSocket is all this needs.
 
-import { readFileSync, writeFileSync, appendFileSync, unlinkSync, existsSync, mkdirSync, readdirSync, rmSync } from 'node:fs'
+import { readFileSync, writeFileSync, appendFileSync, unlinkSync, existsSync, mkdirSync, readdirSync, rmSync, statSync, openSync, readSync, closeSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 import { createHash } from 'node:crypto'
@@ -999,6 +999,175 @@ process.on('unhandledRejection', (e) => logRoute('CRASH', {}, `unhandledRejectio
 
 void refreshClaims()
 setInterval(() => void refreshClaims(), CLAIM_REFRESH_MS).unref?.()
+
+// ---- the seat's Screen, from Codex's own transcript (ADR-050, Codex variant) -------------------------
+//
+// Codex draws its TUI many times a second; run inside a pty (the Claude launcher's way) it flickered and
+// the mirrored frames were unreadable. Codex also writes everything it does to a rollout file
+// (~/.codex/sessions/<y>/<m>/<d>/rollout-<ts>-<threadId>.jsonl) as it happens — every message, command,
+// file change and tool call as a completed item. So for Codex the Screen tab is fed from THERE: this
+// daemon tails the rollout of every thread that holds a work-room seat and posts what it finds as
+// terminal lines to the same `/term` stream. No pty, no launcher, no flicker — and nothing for the owner
+// to install or start: the seat's screen appears because the daemon is running.
+const CODEX_SESSIONS = join(homedir(), '.codex', 'sessions')
+const TAIL_MS = 1500
+const TAIL_KEEPALIVE_MS = 5000
+const TAIL_BACKFILL = 48 * 1024   // on attach, show roughly the last screen's worth, not the whole file
+const tails = new Map()           // agentId -> { threadId, path, offset, partial, queue, lastPost }
+
+/** The rollout file of a thread: newest day directory first, so an old thread id does not cost a scan
+ *  of every month. */
+function findRollout(threadId) {
+  const days = []
+  try {
+    for (const y of readdirSync(CODEX_SESSIONS)) for (const m of readdirSync(join(CODEX_SESSIONS, y)))
+      for (const d of readdirSync(join(CODEX_SESSIONS, y, m))) days.push(join(CODEX_SESSIONS, y, m, d))
+  } catch { return null }
+  days.sort().reverse()
+  const suffix = `-${threadId}.jsonl`
+  for (const dir of days) {
+    try { const hit = readdirSync(dir).find((f) => f.startsWith('rollout-') && f.endsWith(suffix)); if (hit) return join(dir, hit) }
+    catch { /* unreadable day */ }
+  }
+  return null
+}
+
+const A = { dim: '\x1b[2m', off: '\x1b[0m', bold: '\x1b[1m', green: '\x1b[32m', cyan: '\x1b[36m', yellow: '\x1b[33m', magenta: '\x1b[35m', red: '\x1b[31m' }
+const clip = (s, n) => { s = String(s ?? ''); return s.length > n ? s.slice(0, n - 1) + '…' : s }
+const textOf = (content) => Array.isArray(content) ? content.map((c) => c?.text ?? '').join('') : String(content ?? '')
+const indent = (s, n = 20, w = 1500) => clip(String(s ?? '').replace(/\r/g, ''), w).split('\n').slice(0, n).map((l) => '  ' + l).join('\r\n')
+
+/** One rollout line → terminal text (with \r\n), or null for lines the screen does not need. */
+function screenLine(row) {
+  const p = row?.payload
+  if (!p) return null
+  const at = A.dim + String(row.timestamp ?? '').slice(11, 19) + A.off + ' '
+  if (row.type === 'event_msg') {
+    if (p.type === 'task_started') return `${at}${A.dim}── turn ──${A.off}`
+    if (p.type === 'turn_aborted') return `${at}${A.red}turn aborted${A.off}`
+    if (p.type !== 'item_completed') return null
+    const it = p.item ?? {}
+    switch (it.type) {
+      case 'UserMessage': {
+        const t = textOf(it.content).trim()
+        if (!t || t.startsWith('<') || t.startsWith('# AGENTS.md')) return null
+        return `${at}${A.green}›${A.off} ${clip(t.replace(/\s*\n\s*/g, ' ⏎ '), 600)}`
+      }
+      case 'AgentMessage': {
+        const t = textOf(it.content).trim()
+        return t ? `${at}${A.bold}${clip(t, 2000).replace(/\n/g, '\r\n' + ' '.repeat(9))}${A.off}` : null
+      }
+      case 'CommandExecution': {
+        // Codex wraps every command in a shell (`powershell.exe -Command …`, `bash -lc …`); the screen
+        // shows the command, not the wrapper — Codex's own parse of it when present.
+        const parsed = Array.isArray(it.parsed_cmd) ? it.parsed_cmd.map((c) => c?.cmd).filter(Boolean).join(' ; ') : ''
+        const raw = Array.isArray(it.command) ? it.command : [String(it.command ?? '')]
+        const cmd = parsed || (raw.length >= 3 && /(powershell|pwsh|cmd)(\.exe)?$/i.test(raw[0]) && /^(-Command|-c|\/c)$/i.test(raw[1]) ? raw.slice(2).join(' ')
+          : raw.length >= 3 && /(bash|sh|zsh)$/i.test(raw[0]) && /^-l?c$/.test(raw[1]) ? raw.slice(2).join(' ')
+          : raw.join(' '))
+        const lines = [`${at}${A.cyan}$ ${clip(cmd.replace(/\s+/g, ' '), 300)}${A.off}`]
+        const out = String(it.aggregated_output ?? it.output ?? '').trim()
+        if (out) lines.push(A.dim + indent(out) + A.off)
+        if (it.exit_code != null && it.exit_code !== 0) lines.push(`${' '.repeat(9)}${A.red}exit ${it.exit_code}${A.off}`)
+        return lines.join('\r\n')
+      }
+      case 'FileChange': {
+        const ch = it.changes && typeof it.changes === 'object' ? Object.entries(it.changes) : []
+        if (!ch.length) return `${at}${A.yellow}✎ file change${A.off}`
+        return ch.slice(0, 12).map(([path, c], i) =>
+          `${i === 0 ? at : ' '.repeat(9)}${A.yellow}✎ ${c?.type ?? 'update'}${A.off} ${clip(path, 200)}`).join('\r\n')
+          + (ch.length > 12 ? `\r\n${' '.repeat(9)}${A.dim}… ${ch.length - 12} more${A.off}` : '')
+      }
+      case 'McpToolCall': {
+        let args = ''
+        try { args = JSON.stringify(it.arguments ?? {}) } catch { /* unprintable */ }
+        return `${at}${A.magenta}⚙ ${it.server ?? 'mcp'} ${it.tool ?? '?'}${A.off} ${A.dim}${clip(args, 220)}${A.off}`
+      }
+      case 'SubAgentActivity': return `${at}${A.dim}sub-agent activity${A.off}`
+      case 'ContextCompaction': return `${at}${A.dim}context compacted${A.off}`
+      default: return null // Reasoning, Extension, …: the screen shows what was done, not the thinking
+    }
+  }
+  return null
+}
+
+function postTerm(agentId, chunks) {
+  return postJson(`/personas/@self/rooms/${agentId}/term`, { chunks }, 6000)
+}
+
+/** Read what was appended to a rollout since last time and post it as screen lines. */
+async function pumpTail(agentId, t) {
+  let size
+  try { size = statSync(t.path).size } catch { return }
+  if (size < t.offset) { t.offset = 0; t.partial = '' } // rotated / rewritten
+  if (size > t.offset) {
+    const fd = openSync(t.path, 'r')
+    try {
+      const len = Math.min(size - t.offset, 4 * 1024 * 1024)
+      const buf = Buffer.alloc(len)
+      readSync(fd, buf, 0, len, t.offset)
+      t.offset += len
+      const text = t.partial + buf.toString('utf8')
+      const lines = text.split('\n')
+      t.partial = lines.pop() ?? ''
+      const out = []
+      for (const l of lines) {
+        if (!l.trim()) continue
+        let row
+        try { row = JSON.parse(l) } catch { continue }
+        const s = screenLine(row)
+        if (s) out.push(s)
+      }
+      if (out.length) {
+        const chunks = []
+        if (!t.attached) { chunks.push({ t: 's', d: 'attach' }); t.attached = true }
+        chunks.push({ t: 'o', d: Buffer.from(out.join('\r\n') + '\r\n', 'utf8').toString('base64') })
+        t.lastPost = Date.now()
+        await postTerm(agentId, chunks)
+      }
+    } finally { closeSync(fd) }
+  }
+  if (Date.now() - (t.lastPost ?? 0) >= TAIL_KEEPALIVE_MS) {
+    t.lastPost = Date.now()
+    await postTerm(agentId, [{ t: 's', d: 'alive' }])
+  }
+}
+
+/** Every Codex seat bound on this machine gets a tail; seats that vanish lose theirs. */
+async function tailRollouts() {
+  if (!config.token) return
+  const bindings = loadBindings()
+  const wanted = new Map()
+  for (const [id, e] of Object.entries(bindings))
+    if (e && typeof e === 'object' && e.room && e.threadId && (e.agent ?? 'codex') === 'codex') wanted.set(id, String(e.threadId))
+  for (const id of [...tails.keys()]) if (!wanted.has(id)) tails.delete(id)
+  for (const [id, threadId] of wanted) {
+    let t = tails.get(id)
+    if (!t || t.threadId !== threadId) {
+      const path = findRollout(threadId)
+      if (!path) continue // the thread has not written yet; try again next tick
+      let size = 0
+      try { size = statSync(path).size } catch { continue }
+      // Start a little before the end so the screen opens with recent context, dropping the cut line.
+      const offset = Math.max(0, size - TAIL_BACKFILL)
+      t = { threadId, path, offset, partial: '', attached: false, lastPost: 0 }
+      if (offset > 0) {
+        const fd = openSync(path, 'r')
+        try {
+          const probe = Buffer.alloc(Math.min(64 * 1024, size - offset))
+          readSync(fd, probe, 0, probe.length, offset)
+          const nl = probe.indexOf(10)
+          if (nl >= 0) t.offset = offset + nl + 1
+        } finally { closeSync(fd) }
+      }
+      tails.set(id, t)
+      await postTerm(id, [{ t: 'o', d: Buffer.from(`${A.dim}── rany: following this Codex thread's transcript (${basename(path)}) ──${A.off}\r\n`, 'utf8').toString('base64') }])
+    }
+    try { await pumpTail(id, t) } catch (e) { logRoute('TERM', { agentId: id }, `tail error: ${e?.message ?? e}`) }
+  }
+}
+void tailRollouts()
+setInterval(() => void tailRollouts(), TAIL_MS).unref?.()
 
 /** Who the session speaks as. Every queued message carries it, because a session that is not told
  *  signs as the model underneath ("— Codex") under a comment RANY already labels with the persona's

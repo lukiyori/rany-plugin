@@ -158,6 +158,15 @@ const agentKind = /codex/i.test(basename(command[0])) ? 'codex' : 'claude'
 // Through a shim, `claude` must reach the real claude.cmd and not the shim again.
 command[0] = resolveReal(command[0]) ?? command[0]
 
+// Codex is NOT run in a pty: its TUI redraws many times a second and flickered inside ConPTY, and the
+// mirrored frames were unreadable. Its Screen comes from its own transcript instead — the Codex bridge
+// daemon tails the thread's rollout file and posts what Codex did as lines (see plugins/codex-rany).
+// So the shim is a pass-through: same console, same stdin, exit code forwarded.
+if (agentKind === 'codex') {
+  const r = spawnSync(command[0], command.slice(1), { stdio: 'inherit', shell: process.platform === 'win32' && !/\.exe$/i.test(command[0]) })
+  process.exit(r.status ?? 1)
+}
+
 // ---- the mirror -------------------------------------------------------------------------------------
 function postJson(path, payload, timeoutMs = 6000) {
   return new Promise((resolve) => {
