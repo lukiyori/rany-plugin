@@ -225,7 +225,10 @@ class Mirror {
     if (this.queue.length > 0) this.timer = setTimeout(() => void this.flush(), FLUSH_MS)
   }
   keepalive() {
-    if (Date.now() - this.lastFlush >= KEEPALIVE_MS && this.queue.length === 0) this.push('s', 'alive')
+    // The keepalive carries the SIZE rather than a bare mark: the viewer opens on the tail of the stream,
+    // and a tail without an `r` in it would render at the wrong width and scramble a full-screen TUI.
+    if (Date.now() - this.lastFlush >= KEEPALIVE_MS && this.queue.length === 0)
+      this.push('r', `${process.stdout.columns || cols},${process.stdout.rows || rows}`)
   }
 }
 
@@ -244,7 +247,21 @@ const [file, args] = process.platform === 'win32' && !/\.exe$/i.test(command[0])
   ? ['cmd.exe', ['/d', '/c', ...command]]
   : [command[0], command.slice(1)]
 if (process.env.RANY_TERM_DEBUG) process.stderr.write(`rany-term: spawn ${file} ${JSON.stringify(args)} in ${cwd}\r\n`)
-const child = pty.spawn(file, args, { name: 'xterm-256color', cols, rows, cwd, env: { ...process.env, RANY_TERM: '1' } })
+// Windows: the in-box ConPTY re-renders the screen from its own buffer and flickers on TUIs that redraw
+// many times a second (Codex). node-pty ships Windows Terminal's current conpty.dll; prefer it, and fall
+// back to the in-box one only if that build refuses to load. `conptyInheritCursor` keeps the first frame
+// from jumping to the top-left of the outer terminal.
+const ptyOpts = { name: 'xterm-256color', cols, rows, cwd, env: { ...process.env, RANY_TERM: '1' } }
+let child
+if (process.platform === 'win32') {
+  try { child = pty.spawn(file, args, { ...ptyOpts, useConptyDll: true, conptyInheritCursor: true }) }
+  catch (e) {
+    if (process.env.RANY_TERM_DEBUG) process.stderr.write(`rany-term: bundled conpty unavailable (${e?.message ?? e}); using the in-box one\r\n`)
+    child = pty.spawn(file, args, { ...ptyOpts, conptyInheritCursor: true })
+  }
+} else {
+  child = pty.spawn(file, args, ptyOpts)
+}
 
 // Through the shims this runs on EVERY `claude`/`codex`, most of them in directories with no seat —
 // those must look exactly like the plain program, so the no-seat case says nothing unless asked.
