@@ -96,12 +96,14 @@ function installShims() {
   mkdirSync(stable, { recursive: true })
   for (const f of ['rany-term.mjs', 'package.json']) writeFileSync(join(stable, f), readFileSync(join(here, f)))
   const self = join(stable, 'rany-term.mjs')
-  for (const a of AGENTS) {
+  // `rany-term` itself becomes a command too (`rany-term --install`, `--uninstall`, `--seat …`).
+  for (const a of [...AGENTS, 'rany-term']) {
+    const lead = a === 'rany-term' ? '' : `${a} `
     if (process.platform === 'win32') {
-      writeFileSync(join(shimDir, `${a}.cmd`), `@echo off\r\nnode "${self}" ${a} %*\r\n`)
+      writeFileSync(join(shimDir, `${a}.cmd`), `@echo off\r\nnode "${self}" ${lead}%*\r\n`)
     } else {
       const p = join(shimDir, a)
-      writeFileSync(p, `#!/bin/sh\nexec node "${self}" ${a} "$@"\n`)
+      writeFileSync(p, `#!/bin/sh\nexec node "${self}" ${lead}"$@"\n`)
       chmodSync(p, 0o755)
     }
   }
@@ -128,7 +130,7 @@ function installShims() {
 }
 
 function uninstallShims() {
-  for (const a of AGENTS) for (const f of [a, `${a}.cmd`]) { try { rmSync(join(shimDir, f), { force: true }) } catch { /* gone */ } }
+  for (const a of [...AGENTS, 'rany-term']) for (const f of [a, `${a}.cmd`]) { try { rmSync(join(shimDir, f), { force: true }) } catch { /* gone */ } }
   process.stdout.write(`rany-term: shims removed from ${shimDir} (the PATH entry is harmless and left alone).\n`)
 }
 

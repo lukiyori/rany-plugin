@@ -18,7 +18,8 @@ node "${CLAUDE_PLUGIN_ROOT}/term/rany-term.mjs" --install
 ```
 
 then open a NEW terminal and start the agent as always (`claude`, `codex`, `claude --resume`, …).
-This session is not mirrored until it is restarted that way. `--uninstall` removes the shims.
+This session is not mirrored until it is restarted that way. From then on `rany-term` is a command
+too: `rany-term --install` refreshes after a plugin update, `rany-term --uninstall` removes the shims.
 
 Without the shims the launcher still works by hand:
 
