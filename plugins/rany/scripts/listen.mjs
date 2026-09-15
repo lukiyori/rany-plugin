@@ -325,6 +325,123 @@ function boardLabel(boardId, h) {
   return `board ${boardId}`
 }
 
+/**
+ * The work-room SEATS this repository has held (db/0365), per directory like board history — so a fresh
+ * session can take its seat back without the owner minting another invite link. A seat binding dies
+ * with the window (ADR-038); the seat row on the server does not, and the persona's token is enough to
+ * re-attach it. Shared with the Codex bridge (one file, `agent` says whose seat it is).
+ */
+const seatHistoryFile = join(homedir(), '.rany-plugin', 'seat-history.json')
+
+function loadSeatHistory() {
+  try { return JSON.parse(readFileSync(seatHistoryFile, 'utf8')).repos ?? {} } catch { return {} }
+}
+
+function saveSeatHistory(repos) {
+  try { mkdirSync(dirname(seatHistoryFile), { recursive: true }); writeFileSync(seatHistoryFile, JSON.stringify({ repos }, null, 2)) }
+  catch { /* best effort — the binding itself still saved */ }
+}
+
+/** Remember (or refresh) a seat this repo joined, with what the wake-ups need to name it. */
+function recordSeat(agentId, seat) {
+  const repos = loadSeatHistory()
+  const key = norm(projectDir)
+  const seats = repos[key] ?? {}
+  seats[String(agentId)] = {
+    channelId: String(seat.channelId), guildId: seat.guildId ? String(seat.guildId) : null,
+    name: seat.name ?? null, agent: 'claude', dir: projectDir, lastJoined: new Date().toISOString(),
+  }
+  repos[key] = seats
+  saveSeatHistory(repos)
+}
+
+/** The seat is gone for good (removed by the owner, room closed): stop offering to take it back. */
+function forgetSeat(agentId) {
+  const repos = loadSeatHistory()
+  const seats = repos[norm(projectDir)]
+  if (!seats || !seats[String(agentId)]) return
+  delete seats[String(agentId)]
+  saveSeatHistory(repos)
+}
+
+/** This repo's remembered Claude seats. */
+const seatsForRepo = () => Object.entries(loadSeatHistory()[norm(projectDir)] ?? {})
+  .filter(([, s]) => (s?.agent ?? 'claude') === 'claude')
+
+/** Is a session other than this one holding that binding right now? True only when its listener is
+ *  still alive — a window that crashed without SessionEnd leaves a stale entry, and a stale entry must
+ *  not keep a seat from its rightful next session. */
+function heldByAnotherLiveSession(id) {
+  const e = claimedBy(id)
+  if (!e || typeof e !== 'object' || !e.sessionId || e.sessionId === sessionId) return false
+  try {
+    const pid = Number(readFileSync(join(stateDir, 'sessions',
+      createHash('sha256').update(String(e.sessionId)).digest('hex').slice(0, 16) + '.pid'), 'utf8').trim())
+    if (!pid) return false
+    process.kill(pid, 0)
+    return true
+  } catch { return false }
+}
+
+const REATTACH_REFUSALS = {
+  no_agent: 'the seat no longer exists (removed, or the room was closed)',
+  no_room: 'the room is gone',
+  persona_not_active: 'the persona is paused',
+}
+
+/**
+ * Take a remembered seat back for THIS session (db/0365): the server re-attaches it under the persona's
+ * token, the binding is written exactly as a join writes it, and the seat is declared live. A seat the
+ * server no longer has is forgotten, so the next session is not offered it again.
+ */
+async function reattachSeat(agentId, h, sid = sessionId) {
+  const res = await postJson(`/personas/@self/rooms/${agentId}/reattach`, { agent: 'claude' }, 6000)
+  if (!res?.ok) {
+    if (res?.body?.error === 'no_agent' || res?.body?.error === 'no_room') forgetSeat(agentId)
+    return `RANY: could not take back seat "${h?.name ?? agentId}" in work room ${h?.channelId ?? '?'} — `
+      + `${REATTACH_REFUSALS[res?.body?.error] ?? `the server refused (${res?.status ?? 'offline'})`}.`
+  }
+  const seat = res.body
+  const boards = loadBindings()
+  boards[seat.agentId] = sid
+    ? { dir: projectDir, agent: 'claude', sessionId: sid, ts: Date.now(),
+        room: { channelId: seat.channelId, guildId: seat.guildId, name: seat.name, invite: null } }
+    : projectDir
+  try {
+    mkdirSync(dirname(bindFile), { recursive: true })
+    writeFileSync(bindFile, JSON.stringify({ boards }, null, 2))
+  } catch (e) {
+    return `RANY: took back the seat, but could not save the binding (${e?.message ?? e}).`
+  }
+  recordSeat(seat.agentId, seat)
+  await declareBoards(boardsHere())
+  return [
+    `RANY: THIS session holds its seat "${seat.name}" in work room ${seat.channelId} again (agentId ${seat.agentId})`
+      + `${seat.state === 'paused' ? ' — the owner has it PAUSED, so wait to be resumed' : ''}.`,
+    `It is woken for that room until this session closes. Nothing to do now; when the room speaks to you,`,
+    `get_room({channelId:"${seat.channelId}"}) catches you up and post_message({channelId:"${seat.channelId}", agentId:"${seat.agentId}", …}) answers.`,
+  ].join('\n')
+}
+
+/**
+ * SessionStart: every seat this repo held that no window holds now comes back to THIS session by itself
+ * — the owner should not have to mint a link because a terminal was closed. A seat another live window
+ * holds is left there and only mentioned; `/rany-rejoin <agentId>` moves it deliberately.
+ */
+async function reattachRememberedSeats() {
+  const lines = []
+  const mine = new Set(boardsHere())
+  for (const [id, h] of seatsForRepo()) {
+    if (mine.has(id)) continue
+    if (heldByAnotherLiveSession(id)) {
+      lines.push(`RANY: seat "${h?.name ?? id}" in work room ${h?.channelId ?? '?'} is held by another open window of this repo; /rany-rejoin ${id} moves it here.`)
+      continue
+    }
+    lines.push(await reattachSeat(id, h))
+  }
+  return lines
+}
+
 /** Resolve a board id to its name + space via the persona token (server ADR: GET
  *  /personas/@self/boards/{id}). Best-effort: an older server, offline, or no access yields null and
  *  the binding is stored by id alone. Uses node:http like declareBoards so `--bind` can exit cleanly. */
@@ -664,6 +781,7 @@ async function joinSeat(code, sid = sessionId) {
   } catch (e) {
     return `RANY: joined the work room, but could not save the seat binding (${e?.message ?? e}).`
   }
+  recordSeat(seat.agentId, seat) // so the next session in this repo takes the seat back by itself (db/0365)
   // Declared with the boards, so the room shows this seat as live straight away.
   await declareBoards(boardsHere())
   return [
@@ -691,6 +809,25 @@ if (joinAt !== -1) {
     process.exit(QUIET)
   }
   process.stdout.write((await joinSeat(code)) + '\n')
+  process.exit(QUIET)
+}
+
+/** `--rejoin [agentId]`: take a seat this repo held back into THIS session without a new link (db/0365).
+ *  No argument: every remembered seat not held by a live window. */
+const rejoinAt = process.argv.indexOf('--rejoin')
+if (rejoinAt !== -1) {
+  const raw = String(process.argv[rejoinAt + 1] ?? '').trim()
+  if (raw && !/^[0-9]+$/.test(raw)) {
+    process.stdout.write('RANY: --rejoin takes a seat id (the agentId a join printed), or no argument for every seat this repo held\n')
+    process.exit(QUIET)
+  }
+  if (raw) {
+    const h = seatsForRepo().find(([id]) => id === raw)?.[1]
+    process.stdout.write((await reattachSeat(raw, h)) + '\n')
+  } else {
+    const lines = await reattachRememberedSeats()
+    process.stdout.write((lines.length ? lines.join('\n') : 'RANY: this repo holds no remembered work-room seat. Paste an invite link to join a room.') + '\n')
+  }
   process.exit(QUIET)
 }
 
@@ -784,21 +921,26 @@ if (!config.token) {
 // binding dies with its window, so a fresh session owns nothing until you say so. Rather than leave
 // you to remember which boards and their numbers, list them by name and hand over the one-liners.
 if (sessionId && !alreadyReminded(sessionId)) {
+  markReminded(sessionId) // once per session, whatever comes of it — don't recompute every turn
+  // Work-room seats come back by themselves (db/0365): a seat is the persona's, not the invite link's,
+  // so a closed terminal must not cost the owner another link. Boards stay a reminder — binding a board
+  // is a choice about which window does the work, and two windows in one repo are ordinary.
+  const lines = await reattachRememberedSeats()
   const mineNow = new Set(boardsHere())
   const forgotten = historyForRepo().filter(([id]) => !mineNow.has(id))
   if (forgotten.length > 0) {
-    markReminded(sessionId)
-    const msg = [
+    lines.push(
       `RANY: this repo has handled these boards before, but none are bound to THIS session:`,
       ...forgotten.map(([id, h]) => `  • ${boardLabel(id, h)}`),
       ``,
       `A binding belongs to one session and does not carry over. To handle them here, run:`,
       ...forgotten.map(([id]) => `  /rany-bind ${id}`),
-    ].join('\n')
-    process.stdout.write(msg + '\n')
+    )
+  }
+  if (lines.length > 0) {
+    process.stdout.write(lines.join('\n') + '\n')
     process.exit(WAKE)
   }
-  markReminded(sessionId) // nothing to remind, but don't recompute every turn
 }
 
 if (!claimLock()) process.exit(QUIET)

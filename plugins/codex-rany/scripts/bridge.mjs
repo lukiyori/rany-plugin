@@ -148,6 +148,37 @@ function boardLabel(boardId, h) {
   return `board ${boardId}`
 }
 
+/** The work-room SEATS a repository has held (db/0365), per directory like board history — so a fresh
+ *  thread takes its seat back without the owner minting another invite link. Shared with the Claude
+ *  plugin (one file; `agent` says whose seat it is). */
+const seatHistoryFile = join(HOME, 'seat-history.json')
+function loadSeatHistory() {
+  try { return JSON.parse(readFileSync(seatHistoryFile, 'utf8')).repos ?? {} } catch { return {} }
+}
+function saveSeatHistory(repos) {
+  try { mkdirSync(HOME, { recursive: true }); writeFileSync(seatHistoryFile, JSON.stringify({ repos }, null, 2)) }
+  catch { /* best effort — the binding itself still saved */ }
+}
+function recordSeat(dir, agentId, seat) {
+  const repos = loadSeatHistory()
+  const seats = repos[norm(dir)] ?? {}
+  seats[String(agentId)] = {
+    channelId: String(seat.channelId), guildId: seat.guildId ? String(seat.guildId) : null,
+    name: seat.name ?? null, agent: 'codex', dir, lastJoined: new Date().toISOString(),
+  }
+  repos[norm(dir)] = seats
+  saveSeatHistory(repos)
+}
+function forgetSeat(dir, agentId) {
+  const repos = loadSeatHistory()
+  const seats = repos[norm(dir)]
+  if (!seats || !seats[String(agentId)]) return
+  delete seats[String(agentId)]
+  saveSeatHistory(repos)
+}
+const seatsForRepo = (dir) => Object.entries(loadSeatHistory()[norm(dir)] ?? {})
+  .filter(([, s]) => s?.agent === 'codex')
+
 /** POST JSON with the persona token → `{ ok, status, body }`, or null when offline / unconfigured. */
 /** GET JSON with the persona token → the parsed body, or null (offline, unconfigured, not 200). */
 function getJson(path, timeoutMs = 5000) {
@@ -616,6 +647,7 @@ async function joinSeat({ code, dir, threadId }) {
   } catch (e) {
     return `RANY: joined the work room, but could not save the seat binding (${e?.message ?? e}).`
   }
+  recordSeat(dir, seat.agentId, seat) // so the next thread in this repo takes the seat back by itself (db/0365)
   noteSession(dir, threadId ?? undefined)
   const s = { dir, threadId: threadId ?? undefined }
   await declareBoards(claimKey(s), boardsForSession(loadBindings(), s))
@@ -625,6 +657,93 @@ async function joinSeat({ code, dir, threadId }) {
     `Next: get_room({channelId:"${seat.channelId}"}) and read the brief documents it lists; then tell the room in ONE`,
     `line which part of the job you take — post_message({channelId:"${seat.channelId}", agentId:"${seat.agentId}", content:"…"}).`,
   ].join('\n')
+}
+
+const REATTACH_REFUSALS = {
+  no_agent: 'the seat no longer exists (removed, or the room was closed)',
+  no_room: 'the room is gone',
+  persona_not_active: 'the persona is paused',
+}
+
+/** Is another LIVE thread holding that binding? A thread that vanished without SessionEnd leaves a stale
+ *  entry, and a stale entry must not keep a seat from its rightful next thread — so "live" means its
+ *  session heartbeat file is still fresh. */
+function heldByAnotherLiveThread(id, threadId) {
+  const e = claimedBy(id)
+  if (!e || typeof e !== 'object' || !e.threadId || String(e.threadId) === String(threadId)) return false
+  return liveSessions().some((row) => row.threadId && String(row.threadId) === String(e.threadId))
+}
+
+/**
+ * Take a remembered seat back for THIS thread (db/0365): the server re-attaches it under the persona's
+ * token, the binding is written exactly as a join writes it, and the seat is declared live. A seat the
+ * server no longer has is forgotten, so the next thread is not offered it again.
+ */
+async function reattachSeat({ agentId, h, dir, threadId }) {
+  const res = await postJson(`/personas/@self/rooms/${agentId}/reattach`, { agent: 'codex' }, 6000)
+  if (!res?.ok) {
+    if (res?.body?.error === 'no_agent' || res?.body?.error === 'no_room') forgetSeat(dir, agentId)
+    return `RANY: could not take back seat "${h?.name ?? agentId}" in work room ${h?.channelId ?? '?'} — `
+      + `${REATTACH_REFUSALS[res?.body?.error] ?? `the server refused (${res?.status ?? 'offline'})`}.`
+  }
+  const seat = res.body
+  const boards = loadBindings()
+  boards[seat.agentId] = threadId
+    ? { dir, agent: 'codex', threadId, ts: Date.now(),
+        room: { channelId: seat.channelId, guildId: seat.guildId, name: seat.name, invite: null } }
+    : dir
+  try {
+    mkdirSync(HOME, { recursive: true })
+    writeFileSync(bindFile, JSON.stringify({ boards }, null, 2))
+  } catch (e) {
+    return `RANY: took back the seat, but could not save the binding (${e?.message ?? e}).`
+  }
+  recordSeat(dir, seat.agentId, seat)
+  noteSession(dir, threadId ?? undefined)
+  const s = { dir, threadId: threadId ?? undefined }
+  await declareBoards(claimKey(s), boardsForSession(loadBindings(), s))
+  return [
+    `RANY: THIS Codex thread holds its seat "${seat.name}" in work room ${seat.channelId} again (agentId ${seat.agentId})`
+      + `${seat.state === 'paused' ? ' — the owner has it PAUSED, so wait to be resumed' : ''}.`,
+    `Room messages for that seat are queued into this thread until it closes. Nothing to do now; when the room`,
+    `speaks to you, get_room({channelId:"${seat.channelId}"}) catches you up and post_message({channelId:"${seat.channelId}", agentId:"${seat.agentId}", …}) answers.`,
+  ].join('\n')
+}
+
+/** SessionStart: every seat this repo held that no live thread holds now comes back to THIS thread by
+ *  itself. A seat another live thread holds is only mentioned; `$rany-rejoin <agentId>` moves it. */
+async function reattachRememberedSeats({ dir, threadId }) {
+  const lines = []
+  const bindings = loadBindings()
+  const mine = new Set(boardsForSession(bindings, { dir, threadId }))
+  for (const [id, h] of seatsForRepo(dir)) {
+    if (mine.has(id)) continue
+    if (heldByAnotherLiveThread(id, threadId)) {
+      lines.push(`RANY: seat "${h?.name ?? id}" in work room ${h?.channelId ?? '?'} is held by another open Codex thread of this repo; $rany-rejoin ${id} moves it here.`)
+      continue
+    }
+    lines.push(await reattachSeat({ agentId: id, h, dir, threadId }))
+  }
+  return lines
+}
+
+/** `--rejoin [agentId]`: take a seat this repo held back into THIS thread without a new link (db/0365). */
+if (has('--rejoin')) {
+  const raw = String(arg('--rejoin') ?? '').trim()
+  const dir = process.cwd()
+  const threadId = lastPromptedThread(dir)
+  if (raw && !/^[0-9]+$/.test(raw)) {
+    process.stdout.write('RANY: --rejoin takes a seat id (the agentId a join printed), or no argument for every seat this repo held\n')
+    process.exit(0)
+  }
+  if (raw) {
+    const h = seatsForRepo(dir).find(([id]) => id === raw)?.[1]
+    process.stdout.write((await reattachSeat({ agentId: raw, h, dir, threadId })) + '\n')
+  } else {
+    const lines = await reattachRememberedSeats({ dir, threadId })
+    process.stdout.write((lines.length ? lines.join('\n') : 'RANY: this repo holds no remembered work-room seat. Paste an invite link to join a room.') + '\n')
+  }
+  process.exit(0)
 }
 
 /** `--home`: make this thread the persona's home (ADR-047) — the rany-home skill's fallback when the
@@ -733,6 +852,10 @@ if (has('--ensure') || has('--ping') || has('--beat')) {
   if (config.token && has('--ensure')) {
     const dir = typeof hook.cwd === 'string' && hook.cwd ? hook.cwd : process.cwd()
     const threadId = typeof hook.session_id === 'string' ? hook.session_id : undefined
+    // Work-room seats come back by themselves (db/0365): a seat is the persona's, not the invite link's,
+    // so a closed thread must not cost the owner another link. Boards stay a reminder — binding one is a
+    // choice about which thread does the work.
+    const lines = threadId ? await reattachRememberedSeats({ dir, threadId }) : []
     const boards = loadBindings()
     const boundHere = (id) => {
       const e = boards[String(id)]
@@ -740,17 +863,17 @@ if (has('--ensure') || has('--ping') || has('--beat')) {
     }
     const forgotten = historyForRepo(dir).filter(([id]) => !boundHere(id))
     if (forgotten.length > 0) {
+      lines.push(
+        'RANY: this repo has handled these boards before, but none are bound to THIS Codex thread:',
+        ...forgotten.map(([id, h]) => '  • ' + boardLabel(id, h)),
+        '',
+        'A binding belongs to one thread and does not carry over. To handle them here, run:',
+        ...forgotten.map(([id]) => '  /rany-bind ' + id),
+      )
+    }
+    if (lines.length > 0) {
       process.stdout.write(JSON.stringify({
-        hookSpecificOutput: {
-          hookEventName: 'SessionStart',
-          additionalContext: [
-            'RANY: this repo has handled these boards before, but none are bound to THIS Codex thread:',
-            ...forgotten.map(([id, h]) => '  • ' + boardLabel(id, h)),
-            '',
-            'A binding belongs to one thread and does not carry over. To handle them here, run:',
-            ...forgotten.map(([id]) => '  /rany-bind ' + id),
-          ].join('\n'),
-        },
+        hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: lines.join('\n') },
       }) + '\n')
     }
   }

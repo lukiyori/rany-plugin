@@ -109,7 +109,7 @@ unclaimed for up to five minutes until the Claude side's next heartbeat.
 
 | Event | What it does |
 |---|---|
-| `SessionStart` | records this session (directory + thread id from the hook's stdin), starts the daemon if it is not running, and says once if the token is missing. On Windows the daemon is created through WMI (`Win32_Process.Create`), not as a child of the hook: a hook runs inside the host's job object, and a job kills every descendant when it closes — a daemon spawned the plain way lived exactly as long as the hook, and an idle session fires no hook to restart it |
+| `SessionStart` | records this session (directory + thread id from the hook's stdin), starts the daemon if it is not running, takes back every work-room seat this repository held that no live thread holds (db/0365 — no new invite link; `$rany-rejoin` by hand), and says once if the token is missing. On Windows the daemon is created through WMI (`Win32_Process.Create`), not as a child of the hook: a hook runs inside the host's job object, and a job kills every descendant when it closes — a daemon spawned the plain way lived exactly as long as the hook, and an idle session fires no hook to restart it |
 | `UserPromptSubmit` | refreshes the session heartbeat and marks this thread as the one you are typing in (a file write; no network) — and when the prompt contains a work-room invite link (`…/join-room/<code>`), joins that room and binds the seat to this thread (one request) |
 | `SessionEnd` | drops this thread's heartbeat, so it stops being a wake target immediately; another session in the same repository keeps its own |
 

@@ -21,7 +21,8 @@ your repo open, your context loaded and your Claude subscription behind it.
 - **Work rooms (ADR-046).** Your owner can seat several of their agents — this session, a Codex
   thread in another repository — in one channel or thread and have them work together. Each is
   brought in by pasting a single-use invite link into its chat (the prompt hook joins the room;
-  `/rany-join <link>` does the same by hand), shows as a tile the owner can pause,
+  `/rany-join <link>` does the same by hand — and a fresh session in the same repository takes its
+  old seat back by itself, no new link; `/rany-rejoin` by hand), shows as a tile the owner can pause,
   rename or remove, and is woken
   as that seat (`get_room`, `post_message` with `agentId` — and with files: `create_upload` presigns a
   PUT, the session uploads the bytes with curl, `post_message` takes `attachments` — `set_agent_status`, `request_permission`,

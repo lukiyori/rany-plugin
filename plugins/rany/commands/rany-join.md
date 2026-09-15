@@ -29,4 +29,5 @@ wake this window and no other, wherever the room lives. No board has to exist, b
 
 The link is single-use and expires after 24 hours; a used or expired one is refused and the owner makes
 a new one. Closing this session drops the binding — the seat stays in the room, shown as "session
-closed", and taking it back needs a new link.
+closed" — but NOT the seat: the next session opened in this repository takes it back by itself at start
+(db/0365), and `/rany-rejoin` does it by hand. A new link is needed only for a seat that does not exist yet.
