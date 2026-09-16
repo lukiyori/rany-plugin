@@ -19,7 +19,7 @@
 // into this directory. Everything else is Node 22.
 
 import { spawnSync } from 'node:child_process'
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
 import { homedir, tmpdir } from 'node:os'
 import { request as httpRequest } from 'node:http'
@@ -31,7 +31,7 @@ const require = createRequire(import.meta.url)
 
 // ---- the one dependency, fetched on first run -----------------------------------------------------
 function loadPty() {
-  try { return require('node-pty') } catch { /* not installed yet */ }
+  try { return fixSpawnHelper(require('node-pty')) } catch { /* not installed yet */ }
   process.stderr.write('rany-term: first run — installing node-pty (once)…\n')
   const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
   const r = spawnSync(npm, ['install', '--omit=dev', '--no-fund', '--no-audit', '--loglevel=error'],
@@ -40,7 +40,25 @@ function loadPty() {
     process.stderr.write('rany-term: npm install failed; run it by hand in ' + here + '\n')
     process.exit(1)
   }
-  return require('node-pty')
+  return fixSpawnHelper(require('node-pty'))
+}
+
+// macOS / Linux: node-pty forks through a small `spawn-helper` binary shipped in its prebuilds, and npm can
+// unpack it WITHOUT the execute bit — every spawn then dies with "posix_spawnp failed" and `claude` never
+// starts. Restoring the bit is cheap and idempotent, so it runs on every load.
+function fixSpawnHelper(pty) {
+  if (process.platform === 'win32') return pty
+  let root
+  try { root = dirname(require.resolve('node-pty/package.json')) } catch { return pty }
+  for (const dir of ['prebuilds', join('build', 'Release')]) {
+    let entries = []
+    try { entries = dir === 'prebuilds' ? readdirSync(join(root, dir)).map((d) => join(root, dir, d)) : [join(root, dir)] } catch { continue }
+    for (const d of entries) {
+      const helper = join(d, 'spawn-helper')
+      try { if ((statSync(helper).mode & 0o111) === 0) chmodSync(helper, 0o755) } catch { /* absent or not ours to change */ }
+    }
+  }
+  return pty
 }
 
 // ---- config: the same places the plugin reads ------------------------------------------------------
@@ -269,7 +287,15 @@ if (process.platform === 'win32') {
     child = pty.spawn(file, args, { ...ptyOpts, conptyInheritCursor: true })
   }
 } else {
-  child = pty.spawn(file, args, ptyOpts)
+  try { child = pty.spawn(file, args, ptyOpts) }
+  catch (e) {
+    // The mirror is a nicety; the agent is the point. A pty that cannot start must never cost the user
+    // their `claude` — run the real program directly (no Screen mirror) and say why, once.
+    process.stderr.write(`[33mrany-term: could not start a terminal mirror (${e?.message ?? e}); running ${basename(file)} without it.[0m
+`)
+    const r = spawnSync(file, args, { stdio: 'inherit', cwd, env: process.env })
+    process.exit(r.status ?? (r.error ? 127 : 1))
+  }
 }
 
 // Through the shims this runs on EVERY `claude`/`codex`, most of them in directories with no seat —
