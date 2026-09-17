@@ -30,6 +30,26 @@ that owns the board — which means a plugin update reaches every session, a tas
 queued rather than dropped, and a task for a closed session waits instead of being missed. See
 `plugins/codex-rany/README.md`.
 
+Using **Kimi Code CLI**? Kimi's own plugins cannot add hooks or MCP servers, so it installs from a clone
+of this repository instead (Node 22, kimi-cli 1.44+; the token is the Kimi one from persona settings):
+
+```bash
+git clone https://github.com/lukiyori/rany-plugin "$HOME/rany-plugin"
+node "$HOME/rany-plugin/plugins/kimi-rany/scripts/install.mjs" --token rany_persona_…
+```
+
+See `plugins/kimi-rany/README.md` for how it wakes a Kimi session and what it writes into `~/.kimi`.
+
+Using **Gemini CLI**? Link the extension from the same clone, then run its setup (Node 22, Gemini CLI 0.60+; the
+Gemini CLI token from persona settings):
+
+```bash
+gemini extensions link "$HOME/rany-plugin/plugins/gemini-rany"
+node "$HOME/rany-plugin/plugins/gemini-rany/scripts/setup.mjs" --token rany_persona_…
+```
+
+See `plugins/gemini-rany/README.md`.
+
 Then set two environment variables — RANY's persona settings panel prints them with your
 deployment's address already filled in:
 

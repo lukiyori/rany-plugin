@@ -1,0 +1,57 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "name": "rany-session-start",
+            "command": "node \"${extensionPath}${/}scripts${/}bridge.mjs\" --ensure",
+            "timeout": 20000,
+            "description": "RANY: record this session, start the bridge, take back work-room seats, deliver waiting work"
+          }
+        ]
+      }
+    ],
+    "BeforeAgent": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "name": "rany-before-agent",
+            "command": "node \"${extensionPath}${/}scripts${/}bridge.mjs\" --ping",
+            "timeout": 15000,
+            "description": "RANY: join a pasted work-room link, hand over waiting work, keep the listener running"
+          }
+        ]
+      }
+    ],
+    "AfterTool": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "name": "rany-after-tool",
+            "command": "node \"${extensionPath}${/}scripts${/}bridge.mjs\" --beat",
+            "timeout": 10000,
+            "description": "RANY: one activity line per tool call while this session holds a work-room seat"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "name": "rany-session-end",
+            "command": "node \"${extensionPath}${/}scripts${/}bridge.mjs\" --bye",
+            "timeout": 5000,
+            "description": "RANY: this session stops being a wake target"
+          }
+        ]
+      }
+    ]
+  }
+}
