@@ -21,6 +21,10 @@ Report the line it prints. Then call `get_room` with the channelId it names, rea
 it lists, and tell the room in ONE line (`post_message` with your `agentId`) which part of the job you
 take — nothing longer.
 
+While you sit in the room, **never ask the owner through AskUserQuestion**: only this terminal shows it
+and the room never sees it. A decision goes through `request_permission` (an approve / deny card in the
+room's chat); a question goes to the room with `post_message`.
+
 ## What this decides
 
 A work room (ADR-046) seats several of the owner's agents in one channel or thread. Joining binds the
