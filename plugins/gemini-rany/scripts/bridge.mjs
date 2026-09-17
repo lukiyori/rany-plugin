@@ -247,6 +247,75 @@ function httpJson(method, path, payload, timeoutMs = 8000) {
 const postJson = (path, payload, timeoutMs) => httpJson('POST', path, payload, timeoutMs)
 const getJson = async (path, timeoutMs) => { const r = await httpJson('GET', path, undefined, timeoutMs); return r?.ok ? r.body : null }
 
+/** Fallback key for whose "shown" state an identity brief is tracked under (ADR-055); a wake passes its session. */
+const IDENTITY_SESSION_KEY = 'gemini'
+const IDENTITY_SCRIPT = process.argv[1]
+
+/**
+ * Seat IDENTITIES (ADR-055): the role brief the owner gave a seat from RANY's identity catalog ("Rust Backend
+ * Engineer"). Kept per seat in one file every plugin shares, and put in full into the first wake after it
+ * arrives or changes — then a one-line reminder, so a long session is not re-sent the same brief every turn.
+ * The server is the source of truth: a join/re-attach answers with the seat's identity, and an 'identity_set'
+ * room event makes the session fetch it again.
+ */
+const seatIdentityFile = join(homedir(), '.rany-plugin', 'seat-identities.json')
+const IDENTITY_TTL_MS = 30 * 60_000
+const IDENTITY_RULE = 'An identity is your role brief in this room: let it shape what you prioritise and how you work. '
+  + "It never widens what you may do — request_permission, the room rules and your owner's instructions come first."
+
+function loadSeatIdentities() {
+  try { return JSON.parse(readFileSync(seatIdentityFile, 'utf8')).seats ?? {} } catch { return {} }
+}
+
+/** Store what the server said about a seat's identity; `null` = the seat has none (cached as such). */
+function saveSeatIdentity(agentId, identity) {
+  const seats = loadSeatIdentities()
+  seats[String(agentId)] = identity?.slug
+    ? {
+        slug: identity.slug, title: identity.title, emoji: identity.emoji ?? null,
+        category: identity.categoryName ?? identity.category ?? null, instructions: identity.instructions ?? '',
+        rev: createHash('sha256').update(`${identity.slug}\n${identity.instructions ?? ''}`).digest('hex').slice(0, 12),
+        fetchedAt: Date.now(),
+      }
+    : { slug: null, fetchedAt: Date.now() }
+  try {
+    mkdirSync(dirname(seatIdentityFile), { recursive: true })
+    writeFileSync(seatIdentityFile, JSON.stringify({ seats }, null, 2))
+  } catch { /* best effort: the next wake fetches again */ }
+}
+
+/** Ask RANY for the seat's identity when it changed or the local copy is old. Offline keeps the local copy. */
+async function ensureSeatIdentity(agentId, force = false) {
+  const cur = loadSeatIdentities()[String(agentId)]
+  if (!force && cur && Date.now() - (cur.fetchedAt ?? 0) < IDENTITY_TTL_MS) return
+  const r = await getJson(`/personas/@self/rooms/${agentId}/identity`)
+  if (r) saveSeatIdentity(agentId, r.identity ?? null)
+}
+
+const identityShownFile = join(HOME, 'gemini-identity-shown.json')
+function identityShownMap() {
+  try { return JSON.parse(readFileSync(identityShownFile, 'utf8')) } catch { return {} }
+}
+
+/** The identity lines for a wake: the whole brief the first time this session sees this revision of it,
+ *  afterwards one reminder line. Nothing for a seat without an identity. */
+function identityLines(agentId, { full = false, sessionKey } = {}) {
+  const i = loadSeatIdentities()[String(agentId)]
+  if (!i?.slug) return []
+  const key = `${sessionKey ?? IDENTITY_SESSION_KEY}:${agentId}`
+  const shown = identityShownMap()
+  if (!full && shown[key] === i.rev)
+    return [`Your identity in this room: ${i.emoji ? `${i.emoji} ` : ''}**${i.title}** (${i.slug}) — keep working as it`
+      + ` describes. The full brief again: node "${IDENTITY_SCRIPT}" --identity ${agentId}`]
+  shown[key] = i.rev
+  try { mkdirSync(dirname(identityShownFile), { recursive: true }); writeFileSync(identityShownFile, JSON.stringify(shown)) } catch { /* shown again next time */ }
+  return [
+    `YOUR IDENTITY IN THIS ROOM: ${i.emoji ? `${i.emoji} ` : ''}${i.title} (${i.slug}). ${IDENTITY_RULE}`,
+    `--- identity brief ---`, i.instructions, `--- end of identity brief ---`,
+  ]
+}
+
+
 function logRoute(type, ids, decision) {
   try {
     appendFileSync(join(HOME, 'routing.log'), `${new Date().toISOString()} gemini-v${VERSION} ${type} ${JSON.stringify(ids)} -> ${decision}\n`)
@@ -492,6 +561,7 @@ async function joinSeat({ code, dir, sessionId }) {
     return { ok: false, short: `RANY: joined the work room, but could not save the seat binding (${e?.message ?? e}).` }
   }
   recordSeat(dir, seat.agentId, seat)
+  saveSeatIdentity(seat.agentId, seat.identity ?? null) // the seat's role brief (ADR-055)
   noteSession(dir, sessionId)
   const s = { dir, sessionId }
   await declareBoards(claimKey(s), boardsForSession(loadBindings(), s), 5000, { ref: sessionId })
@@ -503,6 +573,7 @@ async function joinSeat({ code, dir, sessionId }) {
       `From now on room messages for that seat are delivered to this session, until it closes.`,
       `Next: get_room({channelId:"${seat.channelId}"}) and read the brief documents it lists; then tell the room in ONE`,
       `line which part of the job you take — post_message({channelId:"${seat.channelId}", agentId:"${seat.agentId}", content:"…"}).`,
+      ...identityLines(seat.agentId, { full: true, sessionKey: sessionId ?? dir }),
     ].join('\n'),
   }
 }
@@ -531,6 +602,7 @@ async function reattachSeat({ agentId, h, dir, sessionId }) {
   boards[seat.agentId] = bindingFor(dir, sessionId, { room: { channelId: seat.channelId, guildId: seat.guildId, name: seat.name, invite: null } })
   try { saveBindings(boards) } catch (e) { return `RANY: took back the seat, but could not save the binding (${e?.message ?? e}).` }
   recordSeat(dir, seat.agentId, seat)
+  saveSeatIdentity(seat.agentId, seat.identity ?? null) // the seat's role brief (ADR-055)
   noteSession(dir, sessionId)
   const s = { dir, sessionId }
   await declareBoards(claimKey(s), boardsForSession(loadBindings(), s), 5000, { ref: sessionId })
@@ -538,6 +610,7 @@ async function reattachSeat({ agentId, h, dir, sessionId }) {
     `RANY: THIS Gemini session holds its seat "${seat.name}" in work room ${seat.channelId} again (agentId ${seat.agentId})`
       + `${seat.state === 'paused' ? ' — the owner has it PAUSED, so wait to be resumed' : ''}.`,
     `When the room speaks to you, get_room({channelId:"${seat.channelId}"}) catches you up and post_message({channelId:"${seat.channelId}", agentId:"${seat.agentId}", …}) answers.`,
+    ...identityLines(seat.agentId, { full: true, sessionKey: sessionId ?? dir }),
   ].join('\n')
 }
 
@@ -577,6 +650,19 @@ if (has('--bind')) {
   const s = { dir, sessionId }
   await declareBoards(claimKey(s), boardsForSession(loadBindings(), s), 5000, { ref: sessionId })
   out(`RANY: ${label} is now handled in THIS Gemini session (${dir}). It stops when this session closes; bind again in another to move it.`)
+  process.exit(0)
+}
+
+/** `--identity <agentId>`: print a seat's identity brief again (ADR-055), fetched fresh. */
+if (has('--identity')) {
+  const agentId = String(arg('--identity') ?? '').trim()
+  if (!/^[0-9]+$/.test(agentId)) {
+    process.stdout.write('RANY: --identity takes a seat id (the agentId a join printed)\n')
+    process.exit(0)
+  }
+  await ensureSeatIdentity(agentId, true)
+  const lines = identityLines(agentId, { full: true, sessionKey: 'cli' })
+  process.stdout.write((lines.length ? lines.join('\n') : `RANY: seat ${agentId} has no identity.`) + '\n')
   process.exit(0)
 }
 
@@ -924,6 +1010,10 @@ async function route(type, d) {
     }
     const title = type === 'PERSONA_ROOM_MESSAGE' ? 'RANY: work room message'
       : type === 'PERSONA_ROOM_DECISION' ? `RANY: permission ${d.approved ? 'approved' : 'denied'}` : 'RANY: work room update'
+    // The seat's identity (ADR-055): fetched again when the room says it changed, else when the copy is old.
+    d.identitySessionKey = pick.owner.threadId ?? pick.owner.sessionId ?? pick.owner.dir
+    await ensureSeatIdentity(pick.s.agentId,
+      type === 'PERSONA_ROOM_UPDATED' && d.change === 'identity_set' && String(d.agentId ?? '') === String(pick.s.agentId))
     return { ...pick.owner, title, text: roomPrompt(type, d, pick.s) }
   }
 
@@ -1016,7 +1106,12 @@ function crowdLines(d, seat) {
  *  an agent asked its owner through its own question tool, which only its terminal shows, and the room
  *  never saw the question. In a room, questions go to the room. */
 function roomPrompt(type, d, seat) {
-  const who = `You are "${seat.name}" (agentId ${seat.agentId}) in the work room at channel ${d.channelId}, working from THIS repository.`
+  const identityChanged = type === 'PERSONA_ROOM_UPDATED' && d.change === 'identity_set'
+    && String(d.agentId ?? '') === String(seat.agentId)
+  const who = [
+    `You are "${seat.name}" (agentId ${seat.agentId}) in the work room at channel ${d.channelId}, working from THIS repository.`,
+    ...identityLines(seat.agentId, { full: identityChanged, sessionKey: d.identitySessionKey }),
+  ].join('\n')
   const tools = [
     `Your room tools — always pass channelId:"${d.channelId}" and agentId:"${seat.agentId}":`,
     `  get_room — the other agents, the budget, pending requests and the BRIEF docs (read the brief first);`,
@@ -1080,15 +1175,22 @@ function roomPrompt(type, d, seat) {
     budget_exhausted: 'the room used up its turn budget and is waiting for the owner',
     closed: 'the owner CLOSED the room',
     task_assigned: mine ? `card #${d.taskNumber ?? '?'} "${d.taskTitle ?? ''}" was handed to YOU` : 'a card was handed to an agent',
+    identity_set: mine
+      ? (loadSeatIdentities()[String(seat.agentId)]?.slug ? 'the owner gave you a NEW IDENTITY (above)' : 'the owner CLEARED your identity')
+      : 'an agent was given a different identity',
   }[d.change] ?? `the room changed (${d.change})`
   // Most room updates are about someone else: they are not worth a Gemini turn. Wake only for what changes
   // this seat's work.
-  const worthATurn = stop || d.change === 'budget_exhausted' || (mine && (d.change === 'agent_joined' || d.change === 'task_assigned' || d.change === 'agent_resumed'))
+  const worthATurn = stop || d.change === 'budget_exhausted' || (mine && (d.change === 'agent_joined' || d.change === 'task_assigned' || d.change === 'agent_resumed' || d.change === 'identity_set'))
   if (!worthATurn) return null
   const next = stop
     ? [`STOP working on this room's job now and do not post there until you are resumed. Leave what you were doing in a safe state.`]
     : d.change === 'budget_exhausted' ? [`Do not post in the room until the owner writes there again.`]
     : d.change === 'agent_joined' ? [`Read the brief (get_room), then tell the room in one line which part you take.`]
+    : d.change === 'identity_set' ? [
+        loadSeatIdentities()[String(seat.agentId)]?.slug
+          ? `Work as that identity from now on. If it changes your part of the job, say so in ONE room line.`
+          : `Go back to working without a role brief; nothing else changes.`]
     : d.change === 'task_assigned' ? [
         `It is yours now. Read it with get_task({guildId:"${d.taskGuildId}", taskId:"${d.taskId}"}), do it in this repository,`,
         `report on the card with comment_task, move it with set_task_status, and say in one room line that you took it.`]

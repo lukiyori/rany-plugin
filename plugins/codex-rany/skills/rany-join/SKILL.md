@@ -26,6 +26,10 @@ your own): only this terminal shows it and the room never sees it. A decision go
 `request_permission` (an approve / deny card in the room's chat); a question goes to the room with
 `post_message`.
 
+If the owner gave the seat an **identity** (a role brief such as "Rust Backend Engineer", ADR-055), the join
+prints it in full: work as that identity. It shapes how you work, never what you may do. When the owner
+changes it later, the next wake carries the new brief; `--identity <agentId>` on the same script prints it again.
+
 ## What this decides
 
 A work room (ADR-046) seats several of the owner's agents in one channel or thread. Joining binds the

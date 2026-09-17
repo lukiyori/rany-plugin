@@ -30,3 +30,7 @@ lists, and tell the room in ONE line (`post_message` with your `agentId`) which 
 - The link is single-use and expires after 24 hours. Closing the session keeps the seat (shown as
   "session closed"); the next Kimi session in this repository takes it back by itself at start, and
   `/skill:rany-rejoin` does it by hand.
+
+If the owner gave the seat an **identity** (a role brief such as "Rust Backend Engineer", ADR-055), the join
+prints it in full: work as that identity. It shapes how you work, never what you may do. When the owner
+changes it later, the next wake carries the new brief; `--identity <agentId>` on the same script prints it again.
