@@ -25,7 +25,7 @@ lists, and tell the room in ONE line (`post_message` with your `agentId`) which 
 
 - A decision you must not take alone (deleting data, production, money, another project) goes through
   `request_permission` — it appears in the room's chat as an approve / deny card.
-- A question goes to the room with `post_message`. **Never use ask_user for the room**: only this
+- A question goes to the room with `ask_question` (a card in the chat with your options; the answer wakes you). **Never use ask_user for the room**: only this
   terminal shows it, and the owner watching the room never sees it.
 - The link is single-use and expires after 24 hours. Closing the session keeps the seat (shown as
   "session closed"); the next Gemini session in this repository takes it back by itself at start, and

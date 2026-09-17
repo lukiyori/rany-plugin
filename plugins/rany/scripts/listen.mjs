@@ -952,6 +952,28 @@ if (process.argv.includes('--prompt')) {
  * lapse and the room showed a busy agent as "session closed". Throttled to one declare per refresh
  * interval; every other tool call costs a stat and nothing else.
  */
+/** `--ask-guard` (PreToolUse on AskUserQuestion): a session that holds a work-room seat must ask the ROOM.
+ *  The built-in question prompt only shows in this terminal, so the owner reading the room never sees it and
+ *  the agent waits forever. Deny it with the tool to use instead; a session without a seat is untouched. */
+if (process.argv.includes('--ask-guard')) {
+  const seats = Object.entries(loadBindings())
+    .filter(([, e]) => e && typeof e === 'object' && e.room && e.sessionId === sessionId)
+  if (seats.length > 0) {
+    const [agentId, e] = seats[0]
+    process.stdout.write(JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'deny',
+        permissionDecisionReason: `This session sits in a RANY work room (seat ${agentId}); the room cannot see `
+          + `AskUserQuestion. Ask with the RANY MCP tool ask_question({channelId:"${e.room.channelId}", `
+          + `agentId:"${agentId}", question, options}) — it becomes a card in the room's chat and the answer `
+          + `wakes you. For a risky action use request_permission instead.`,
+      },
+    }) + '\n')
+  }
+  process.exit(QUIET)
+}
+
 if (process.argv.includes('--beat')) {
   // The seat's TERMINAL (db/0366, task #86): every tool call this session makes while it holds a work-room
   // seat is one line on the meet screen — "Edit web/src/x.tsx", "Bash npm run build". The hook hands us the
@@ -1219,9 +1241,11 @@ function roomPrompt(type, d, seat) {
     `    post_message with attachments:[{key, filename, contentType, size}]; images show inline;`,
     `  set_agent_status — the one line your tile shows (what you are doing now); keep it current;`,
     `  request_permission — BEFORE anything destructive, production-facing, costly or outside this repo;`,
+    `  ask_question({channelId, agentId, question, options?}) — any other question for your owner: a card in the`,
+    `    chat with your options and a free-text answer; the answer wakes you (PERSONA_ROOM_ANSWER);`,
     `  NEVER ask your owner through AskUserQuestion while you sit in a room: only this terminal`,
     `    shows it and the room never sees it — a decision goes through request_permission (a card in the`,
-    `    chat), a question through post_message;`,
+    `    chat), a question through ask_question;`,
     `  list_board_tasks / get_task / create_task / set_task_status / comment_task — the room's work queue`,
     `    (no board yet? create_board with roomChannelId, then put the job on it);`,
     `  assign_task({guildId, taskId, agentId}) — hand a card to ONE seat (a colleague's, from get_room): the`,
@@ -1255,6 +1279,19 @@ function roomPrompt(type, d, seat) {
         `The room shows you as typing until you post. If the answer needs more than a moment of work,`,
         `post ONE line first — what you understood and what you are about to do — then do it and report;`,
         `a room that hears nothing for minutes cannot tell a working agent from a deaf one.`] : []),
+      ...tools,
+      ``,
+      asPersona(),
+    ].join('\n')
+  }
+  if (type === 'PERSONA_ROOM_ANSWER') {
+    return [
+      `RANY: your owner ANSWERED your question in work room ${d.channelId}.`,
+      `  You asked: ${String(d.question ?? '')}`,
+      `  Answer: ${String(d.answer ?? '')}`,
+      ``,
+      who,
+      `Carry on with that answer. If it changes your part of the job, say so in ONE room line.`,
       ...tools,
       ``,
       asPersona(),
@@ -1497,7 +1534,8 @@ async function classify(type, d) {
   // Work rooms (ADR-046). A room seats the owner's agents by BOARD, so each event names the boards it is
   // for and the session that bound one of them wakes — the same claimedBy/ownedHere routing as a task,
   // which is how the Cortex agent hears a thread that lives in the Cocktail server.
-  if (type === 'PERSONA_ROOM_MESSAGE' || type === 'PERSONA_ROOM_UPDATED' || type === 'PERSONA_ROOM_DECISION') {
+  if (type === 'PERSONA_ROOM_MESSAGE' || type === 'PERSONA_ROOM_UPDATED' || type === 'PERSONA_ROOM_DECISION'
+    || type === 'PERSONA_ROOM_ANSWER') {
     if (config.wake.rooms === false) return null
     // Record a handoff whoever it is for: the card's assignment event, which follows, must not wake
     // this session's board either (see taskSeatsFile).

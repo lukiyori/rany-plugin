@@ -1374,7 +1374,8 @@ async function route(type, d) {
   // — the server picks the board bound in the guild the question came from — so it lands in the
   // thread that owns that project rather than whichever one was last used.
   // Work rooms (ADR-046): each event names the seats' BOARDS; the thread that bound one of them wakes.
-  if (type === 'PERSONA_ROOM_MESSAGE' || type === 'PERSONA_ROOM_UPDATED' || type === 'PERSONA_ROOM_DECISION') {
+  if (type === 'PERSONA_ROOM_MESSAGE' || type === 'PERSONA_ROOM_UPDATED' || type === 'PERSONA_ROOM_DECISION'
+    || type === 'PERSONA_ROOM_ANSWER') {
     if (config.wake.rooms === false) return null
     // Record a handoff whoever it is for: the card's assignment event, which follows, must not wake a
     // board-bound thread either (see taskSeatsFile).
@@ -1566,9 +1567,11 @@ function roomPrompt(type, d, seat) {
     `    post_message with attachments:[{key, filename, contentType, size}]; images show inline;`,
     `  set_agent_status — the one line your tile shows (what you are doing now); keep it current;`,
     `  request_permission — BEFORE anything destructive, production-facing, costly or outside this repo;`,
+    `  ask_question({channelId, agentId, question, options?}) — any other question for your owner: a card in the`,
+    `    chat with your options and a free-text answer; the answer wakes you (PERSONA_ROOM_ANSWER);`,
     `  NEVER ask your owner through request_user_input (or any question tool of your own) while you sit in a room: only this terminal`,
     `    shows it and the room never sees it — a decision goes through request_permission (a card in the`,
-    `    chat), a question through post_message;`,
+    `    chat), a question through ask_question;`,
     `  list_board_tasks / get_task / create_task / set_task_status / comment_task — the room's work queue`,
     `    (no board yet? create_board with roomChannelId, then put the job on it);`,
     `  assign_task({guildId, taskId, agentId}) — hand a card to ONE seat (a colleague's, from get_room): the`,
@@ -1606,6 +1609,19 @@ function roomPrompt(type, d, seat) {
         `The room shows you as typing until you post. If the answer needs more than a moment of work,`,
         `post ONE line first — what you understood and what you are about to do — then do it and report;`,
         `a room that hears nothing for minutes cannot tell a working agent from a deaf one.`] : []),
+      ...tools,
+      ``,
+      asPersona(),
+    ].join('\n')
+  }
+  if (type === 'PERSONA_ROOM_ANSWER') {
+    return [
+      `RANY: your owner ANSWERED your question in work room ${d.channelId}.`,
+      `  You asked: ${String(d.question ?? '')}`,
+      `  Answer: ${String(d.answer ?? '')}`,
+      ``,
+      who,
+      `Carry on with that answer. If it changes your part of the job, say so in ONE room line.`,
       ...tools,
       ``,
       asPersona(),

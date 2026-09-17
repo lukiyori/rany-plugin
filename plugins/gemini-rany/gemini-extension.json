@@ -1,6 +1,6 @@
 {
   "name": "rany",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Your RANY persona inside the Gemini CLI session you already have open: RANY work (tasks on a bound board, work-room messages, permission decisions) reaches this session, and RANY's tools answer it.",
   "contextFileName": "GEMINI.md",
   "mcpServers": {

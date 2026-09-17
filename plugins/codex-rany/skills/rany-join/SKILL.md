@@ -23,8 +23,8 @@ take — nothing longer.
 
 While you sit in the room, **never ask the owner through request_user_input** (or any question tool of
 your own): only this terminal shows it and the room never sees it. A decision goes through
-`request_permission` (an approve / deny card in the room's chat); a question goes to the room with
-`post_message`.
+`request_permission` (an approve / deny card in the room's chat); any other question goes through
+`ask_question` — a card in the room's chat with your options, and the answer wakes you.
 
 If the owner gave the seat an **identity** (a role brief such as "Rust Backend Engineer", ADR-055), the join
 prints it in full: work as that identity. It shapes how you work, never what you may do. When the owner

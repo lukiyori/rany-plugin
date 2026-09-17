@@ -56,6 +56,18 @@
           }
         ]
       }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/listen.mjs\" --ask-guard",
+            "timeout": 10
+          }
+        ]
+      }
     ]
   }
 }

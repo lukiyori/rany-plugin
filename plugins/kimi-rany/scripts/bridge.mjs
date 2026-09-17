@@ -915,7 +915,8 @@ async function route(type, d) {
     }
   }
 
-  if (type === 'PERSONA_ROOM_MESSAGE' || type === 'PERSONA_ROOM_UPDATED' || type === 'PERSONA_ROOM_DECISION') {
+  if (type === 'PERSONA_ROOM_MESSAGE' || type === 'PERSONA_ROOM_UPDATED' || type === 'PERSONA_ROOM_DECISION'
+    || type === 'PERSONA_ROOM_ANSWER') {
     if (config.wake.rooms === false) return null
     if (type === 'PERSONA_ROOM_UPDATED' && d.change === 'task_assigned') noteTaskSeat(d.taskId, d.agentId)
     const seats = type === 'PERSONA_ROOM_MESSAGE' ? (Array.isArray(d.targets) ? d.targets : [])
@@ -939,7 +940,8 @@ async function route(type, d) {
       }
     }
     const title = type === 'PERSONA_ROOM_MESSAGE' ? 'RANY: work room message'
-      : type === 'PERSONA_ROOM_DECISION' ? `RANY: permission ${d.approved ? 'approved' : 'denied'}` : 'RANY: work room update'
+      : type === 'PERSONA_ROOM_DECISION' ? `RANY: permission ${d.approved ? 'approved' : 'denied'}`
+        : type === 'PERSONA_ROOM_ANSWER' ? 'RANY: your question was answered' : 'RANY: work room update'
     // The seat's identity (ADR-055): fetched again when the room says it changed, else when the copy is old.
     d.identitySessionKey = pick.owner.threadId ?? pick.owner.sessionId ?? pick.owner.dir
     await ensureSeatIdentity(pick.s.agentId,
@@ -1052,9 +1054,10 @@ function roomPrompt(type, d, seat) {
     `    post_message with attachments:[{key, filename, contentType, size}];`,
     `  set_agent_status — the one line your tile shows; keep it current;`,
     `  request_permission — BEFORE anything destructive, production-facing, costly or outside this repo;`,
+    `  ask_question({channelId, agentId, question, options?}) — a question for your owner, as a card in the chat;`,
     `  list_board_tasks / get_task / create_task / set_task_status / comment_task / assign_task — the work queue.`,
     `NEVER ask your owner through AskUserQuestion while you sit in a room: only this terminal shows it and the room`,
-    `never sees it. A decision goes through request_permission (a card in the chat); a question through post_message.`,
+    `never sees it. A decision goes through request_permission (a card in the chat); a question through ask_question (a card in the chat with your options; the answer wakes you).`,
     `FORMAT posts in markdown: **bold** the state, \`code\` for paths/commands/ids, "- " lists, full https:// links.`,
   ]
   const files = Array.isArray(d.attachments) && d.attachments.length
@@ -1078,6 +1081,19 @@ function roomPrompt(type, d, seat) {
       ...(d.addressed ? [`If the answer needs more than a moment of work, post ONE line first — what you understood and`,
         `what you are about to do — then do it and report.`] : []),
       ...tools, ``, asPersona(),
+    ].join('\n')
+  }
+  if (type === 'PERSONA_ROOM_ANSWER') {
+    return [
+      `RANY: your owner ANSWERED your question in work room ${d.channelId}.`,
+      `  You asked: ${String(d.question ?? '')}`,
+      `  Answer: ${String(d.answer ?? '')}`,
+      ``,
+      who,
+      `Carry on with that answer. If it changes your part of the job, say so in ONE room line.`,
+      ...tools,
+      ``,
+      asPersona(),
     ].join('\n')
   }
   if (type === 'PERSONA_ROOM_DECISION') {
