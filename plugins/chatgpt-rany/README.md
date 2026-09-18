@@ -20,7 +20,10 @@ For a private/custom ChatGPT app, create an MCP app in ChatGPT developer mode an
 https://www.rany.work/api/mcp
 ```
 
-RANY currently authenticates agent clients with a persona bearer token. If your ChatGPT workspace supports an administrator-managed bearer credential, use a freshly rotated persona token and never commit it to this repository.
+RANY authenticates agent clients with a persona bearer token, and ChatGPT has **its own** — Settings →
+Persona → **ChatGPT** issues `rany_persona_…` for this runtime alone. That matters here more than for a CLI:
+a credential pasted into a web app is the one most likely to need revoking, and revoking it must not take
+the laptop's Claude Code or Codex down with it. Never commit it to this repository.
 
 For public/plugin distribution, RANY should expose OAuth 2.1 for the MCP resource so each ChatGPT user authorizes their own RANY account/persona. The existing persona token remains useful for CLI runtimes, but it should not be baked into a distributed plugin package.
 
@@ -38,6 +41,12 @@ chatgpt-rany/
 ```
 
 OpenAI-compatible plugin hosts discover `plugin.json`, `mcp.json`, and `skills/` from the package root.
+
+## Source of truth
+
+This package lives in RANY's own repository (`plugins/chatgpt-rany`) and is copied to the public mirror by
+`scripts/publish-plugin.sh`. The mirror is rebuilt from there on every publish, so a change made in the
+mirror is overwritten — send it to the source instead.
 
 ## Deliberate limitation: no wake bridge
 
