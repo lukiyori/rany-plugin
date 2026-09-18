@@ -30,6 +30,12 @@ that owns the board — which means a plugin update reaches every session, a tas
 queued rather than dropped, and a task for a closed session waits instead of being missed. See
 `plugins/codex-rany/README.md`.
 
+Using **ChatGPT**? `plugins/chatgpt-rany` is a portable Agent Plugins package pointed at the same hosted
+RANY MCP server, with ChatGPT-oriented task and reply skills. It has no wake bridge and does not pretend
+to: ChatGPT has no inbound door, so it reads and answers when you ask it to, and nothing wakes it from
+RANY. Give it its own persona token (Settings → Persona → **ChatGPT**). See
+`plugins/chatgpt-rany/README.md`.
+
 Using **Kimi Code CLI**? Kimi's own plugins cannot add hooks or MCP servers, so it installs from a clone
 of this repository instead (Node 22, kimi-cli 1.44+; the token is the Kimi one from persona settings):
 
