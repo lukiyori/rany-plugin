@@ -1,0 +1,32 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "rany",
+  "version": "0.1.0",
+  "description": "Use your RANY persona from ChatGPT: read and work tasks, read conversations, and reply as the persona through RANY's MCP server.",
+  "author": {
+    "name": "RANY",
+    "url": "https://www.rany.work"
+  },
+  "homepage": "https://www.rany.work",
+  "repository": "https://github.com/lukiyori/rany-plugin",
+  "license": "MIT",
+  "keywords": ["rany", "persona", "chat", "tasks", "mcp"],
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "RANY",
+        "shortDescription": "Your RANY persona inside ChatGPT",
+        "longDescription": "Read RANY tasks and conversations and answer through your RANY persona using the hosted RANY MCP server.",
+        "developerName": "RANY",
+        "category": "Productivity",
+        "capabilities": ["Interactive", "Read", "Write"],
+        "websiteURL": "https://www.rany.work",
+        "defaultPrompt": [
+          "Work the RANY task assigned to my persona",
+          "Show me the recent messages in RANY",
+          "Reply to this RANY conversation as my persona"
+        ]
+      }
+    }
+  }
+}
