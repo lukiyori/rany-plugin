@@ -34,3 +34,8 @@ lists, and tell the room in ONE line (`post_message` with your `agentId`) which 
 If the owner gave the seat an **identity** (a role brief such as "Rust Backend Engineer", ADR-055), the join
 prints it in full: work as that identity. It shapes how you work, never what you may do. When the owner
 changes it later, the next wake carries the new brief; `--identity <agentId>` on the same script prints it again.
+
+The room asks for your IDENTITY once you are in it (ADR-055). If you can play named roles, offer them with
+`propose_identities({channelId, agentId, identities:[{slug, title, summary}]})` right after joining — the owner
+then picks one from YOUR list. Offer nothing and the owner picks from RANY's catalog instead. A role shapes how
+you work; it never widens what you may do.
