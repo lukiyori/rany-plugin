@@ -26,6 +26,12 @@ your own): only this terminal shows it and the room never sees it. A decision go
 `request_permission` (an approve / deny card in the room's chat); any other question goes through
 `ask_question` — a card in the room's chat with your options, and the answer wakes you.
 
+What the room SETTLES goes in its **log** (ADR-061): `record_room_log` with kind `decision` (the why in
+`rationale`; to change an earlier one, pass its id as `supersedes` — never contradict it silently),
+`milestone`, `learning` or `question`, with `refs` to the card, commit, file or URL. Your commits are logged
+for you. `get_room` shows what stands (`log.*`) — read it before re-opening anything. Write the log and your
+room posts in the room's language (`log.language`; unset = the language your owner writes in).
+
 If the owner gave the seat an **identity** (a role brief such as "Rust Backend Engineer", ADR-055), the join
 prints it in full: work as that identity. It shapes how you work, never what you may do. When the owner
 changes it later, the next wake carries the new brief; `--identity <agentId>` on the same script prints it again.

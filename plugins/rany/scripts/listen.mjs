@@ -20,7 +20,7 @@
 // most people never finish installing. Node 22's global WebSocket is all this needs.
 
 import { readFileSync, writeFileSync, appendFileSync, unlinkSync, existsSync, mkdirSync, statSync } from 'node:fs'
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { basename, dirname, join } from 'node:path'
 import { homedir, tmpdir } from 'node:os'
 import { createHash } from 'node:crypto'
@@ -984,8 +984,13 @@ if (process.argv.includes('--beat')) {
   if (config.token && seats.length > 0) {
     const hook = await readHookInput()
     const line = toolLine(hook)
-    if (line) await Promise.all(seats.map((id) =>
-      postJson(`/personas/@self/rooms/${id}/activity`, { lines: [{ kind: 'tool', text: line }] }, 4000)))
+    // A commit is also a BREADCRUMB in the room log (ADR-061): the room's history shows what was committed
+    // where, without the agent having to remember to say so. A repeated sha is refused server-side.
+    const crumb = commitCrumb(hook)
+    await Promise.all(seats.flatMap((id) => [
+      line ? postJson(`/personas/@self/rooms/${id}/activity`, { lines: [{ kind: 'tool', text: line }] }, 4000) : null,
+      crumb ? postJson(`/personas/@self/rooms/${id}/log`, crumb, 4000) : null,
+    ]))
   }
   const mark = join(stateDir, `beat-${sessionId ?? projectKey}`)
   let last = 0
@@ -1025,6 +1030,37 @@ function prepareTerm() {
     child.unref()
     if (process.env.RANY_TERM_DEBUG) process.stderr.write(`prepareTerm: npm install started in ${stable}\n`)
   } catch (e) { if (process.env.RANY_TERM_DEBUG) process.stderr.write(`prepareTerm: ${e?.message ?? e}\n`) }
+}
+
+/** The commit a `git commit` just made, as a room-log breadcrumb (ADR-061) — read from git's own summary line
+ *  ("[main 1a2b3c4] subject"), then the full sha and the remote from the checkout. Null for anything else,
+ *  including a commit that failed (no summary line). A remote with credentials in it is cleaned server-side. */
+function commitCrumb(hook) {
+  const name = hook?.tool_name
+  if (name !== 'Bash' && name !== 'PowerShell') return null
+  const cmd = String(hook.tool_input?.command ?? '')
+  if (!/\bgit\b[^\n|;&]*\bcommit\b/.test(cmd)) return null
+  const r = hook.tool_response
+  const out = typeof r === 'string' ? r
+    : [r?.stdout, r?.output, r?.stderr].filter((x) => typeof x === 'string').join('\n')
+  const m = /^\[([^\]\s]+)(?: \([^)]*\))? ([0-9a-f]{7,40})\] (.+)$/m.exec(out)
+  if (!m) return null
+  const cwd = typeof hook.cwd === 'string' && hook.cwd ? hook.cwd : projectDir
+  const git = (...args) => {
+    try {
+      const x = spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8', timeout: 3000, windowsHide: true })
+      return x.status === 0 ? x.stdout.trim() : null
+    } catch { return null }
+  }
+  const sha = git('rev-parse', '--verify', `${m[2]}^{commit}`) ?? m[2]
+  // git@host:group/repo.git → https://host/group/repo, so the Room Log can link the commit.
+  const origin = git('remote', 'get-url', 'origin')
+  const repo = origin ? origin.replace(/^git@([^:]+):(.+)$/, 'https://$1/$2') : null
+  return {
+    kind: 'commit',
+    title: m[3].trim().slice(0, 200),
+    refs: [{ type: 'commit', value: sha, repo, branch: m[1] }],
+  }
 }
 
 /** One terminal line for a PostToolUse payload: the tool and the one thing that identifies the call —
@@ -1253,7 +1289,14 @@ function roomPrompt(type, d, seat) {
     `  list_board_tasks / get_task / create_task / set_task_status / comment_task — the room's work queue`,
     `    (no board yet? create_board with roomChannelId, then put the job on it);`,
     `  assign_task({guildId, taskId, agentId}) — hand a card to ONE seat (a colleague's, from get_room): the`,
-    `    persona becomes its assignee and only that seat wakes with it.`,
+    `    persona becomes its assignee and only that seat wakes with it;`,
+    `  record_room_log({channelId, agentId, kind, title, body?, rationale?, supersedes?, resolves?, refs?}) — the`,
+    `    room's LOG of what it now KNOWS: a decision (with the why in rationale; to change one, supersede its id —`,
+    `    never contradict it silently), a milestone reached, a learning others need, an open question. Attach`,
+    `    refs (task, commit, file, URL). Your commits are logged for you. get_room shows what stands (log.*) —`,
+    `    read it before re-opening anything; get_room_log has the whole history.`,
+    `LANGUAGE: write the log AND your room posts in the room's language (get_room → log.language); when it is`,
+    `  unset, in the language your owner writes in.`,
     `FORMAT what you post (RANY renders markdown; a wall of plain prose is hard to scan on a phone):`,
     `  **bold** the point or the state ("**done**", "**blocked on** …"); \`code\` for paths, commands, ids,`,
     `  hostnames and error strings; a "- " list when there are more than two items; a full https:// link`,

@@ -27,6 +27,10 @@ lists, and tell the room in ONE line (`post_message` with your `agentId`) which 
   `request_permission` — it appears in the room's chat as an approve / deny card.
 - A question goes to the room with `ask_question` (a card in the chat with your options; the answer wakes you). **Never use AskUserQuestion for the room**: only this
   terminal shows it, and the owner watching the room never sees it.
+- What the room settles goes in its **log**: `record_room_log` (kind decision / milestone / learning / question;
+  a decision carries its why in `rationale` and replaces an earlier one with `supersedes`), and after every commit
+  kind `commit` with `refs: [{type: "commit", value: <sha>, branch}]`. `get_room` shows what stands. Write it — and
+  your room posts — in the room's language (`log.language`; unset = the language your owner writes in).
 - The link is single-use and expires after 24 hours. Closing the session keeps the seat (shown as
   "session closed"); the next Kimi session in this repository takes it back by itself at start, and
   `/skill:rany-rejoin` does it by hand.

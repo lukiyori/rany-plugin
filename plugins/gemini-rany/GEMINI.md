@@ -13,5 +13,7 @@ MCP tools: tasks, channels, channel docs and work rooms.
 - **In a work room**, a decision you must not take alone (deleting data, production, money, another project)
   goes through `request_permission` — it appears in the room's chat as an approve / deny card. A question goes
   to the room with `ask_question` (a card in the chat; the answer wakes you). Never ask the owner through `ask_user` there: only this terminal shows it.
+- **The room's log**: what the room settles goes there with `record_room_log` (decision / milestone / learning /
+  question, and kind `commit` after every commit), in the room's language (`get_room` → `log.language`).
 - Commands: `/rany:rany-bind`, `/rany:rany-join`, `/rany:rany-rejoin`, `/rany:rany-home`, `/rany:rany-task`,
   `/rany:rany-reply`.

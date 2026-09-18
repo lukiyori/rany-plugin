@@ -1176,12 +1176,43 @@ function screenLine(row) {
   return null
 }
 
+/** A `git commit` the thread just ran, as a room-log breadcrumb (ADR-061), read from git's own summary line in
+ *  the command's output ("[main 1a2b3c4] subject"); the full sha and the remote come from the checkout. */
+function commitCrumbOf(row) {
+  const it = row?.type === 'event_msg' && row.payload?.type === 'item_completed' ? row.payload.item : null
+  if (it?.type !== 'CommandExecution' || (it.exit_code != null && it.exit_code !== 0)) return null
+  const raw = Array.isArray(it.command) ? it.command.join(' ') : String(it.command ?? '')
+  const parsed = Array.isArray(it.parsed_cmd) ? it.parsed_cmd.map((c) => c?.cmd).filter(Boolean).join(' ; ') : ''
+  if (!/\bgit\b[^\n|;&]*\bcommit\b/.test(parsed || raw)) return null
+  const m = /^\[([^\]\s]+)(?: \([^)]*\))? ([0-9a-f]{7,40})\] (.+)$/m.exec(String(it.aggregated_output ?? it.output ?? ''))
+  if (!m) return null
+  const cwd = typeof it.cwd === 'string' && it.cwd ? it.cwd : null
+  const git = (...args) => {
+    if (!cwd) return null
+    try {
+      const x = spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8', timeout: 3000, windowsHide: true })
+      return x.status === 0 ? x.stdout.trim() : null
+    } catch { return null }
+  }
+  const origin = git('remote', 'get-url', 'origin')
+  return {
+    kind: 'commit',
+    title: m[3].trim().slice(0, 200),
+    refs: [{
+      type: 'commit', value: git('rev-parse', '--verify', `${m[2]}^{commit}`) ?? m[2], branch: m[1],
+      repo: origin ? origin.replace(/^git@([^:]+):(.+)$/, 'https://$1/$2') : null,
+    }],
+  }
+}
+
 function postTerm(agentId, chunks) {
   return postJson(`/personas/@self/rooms/${agentId}/term`, { chunks }, 6000)
 }
 
 /** Read what was appended to a rollout since last time and post it as screen lines. */
 async function pumpTail(agentId, t) {
+  // Commits are logged from the moment the seat is tailed — the backfill replays older ones to the SCREEN only.
+  if (t.since == null) t.since = Date.now()
   let size
   try { size = statSync(t.path).size } catch { return }
   if (size < t.offset) { t.offset = 0; t.partial = '' } // rotated / rewritten
@@ -1202,6 +1233,8 @@ async function pumpTail(agentId, t) {
         try { row = JSON.parse(l) } catch { continue }
         const s = screenLine(row)
         if (s) out.push(s)
+        const crumb = Date.parse(row.timestamp ?? '') >= t.since ? commitCrumbOf(row) : null
+        if (crumb) await postJson(`/personas/@self/rooms/${agentId}/log`, crumb, 4000)
       }
       if (out.length) {
         const chunks = []
@@ -1579,7 +1612,14 @@ function roomPrompt(type, d, seat) {
     `  list_board_tasks / get_task / create_task / set_task_status / comment_task — the room's work queue`,
     `    (no board yet? create_board with roomChannelId, then put the job on it);`,
     `  assign_task({guildId, taskId, agentId}) — hand a card to ONE seat (a colleague's, from get_room): the`,
-    `    persona becomes its assignee and only that seat wakes with it.`,
+    `    persona becomes its assignee and only that seat wakes with it;`,
+    `  record_room_log({channelId, agentId, kind, title, body?, rationale?, supersedes?, resolves?, refs?}) — the`,
+    `    room's LOG of what it now KNOWS: a decision (with the why in rationale; to change one, supersede its id —`,
+    `    never contradict it silently), a milestone reached, a learning others need, an open question. Attach`,
+    `    refs (task, commit, file, URL). Your commits are logged for you. get_room shows what stands (log.*) —`,
+    `    read it before re-opening anything; get_room_log has the whole history.`,
+    `LANGUAGE: write the log AND your room posts in the room's language (get_room → log.language); when it is`,
+    `  unset, in the language your owner writes in.`,
     `FORMAT what you post (RANY renders markdown; a wall of plain prose is hard to scan on a phone):`,
     `  **bold** the point or the state ("**done**", "**blocked on** …"); \`code\` for paths, commands, ids,`,
     `  hostnames and error strings; a "- " list when there are more than two items; a full https:// link`,
