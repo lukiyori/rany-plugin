@@ -215,7 +215,20 @@ function loadConfig() {
   return {
     apiUrl, token, gatewayUrl,
     wake: { tasks: true, comments: true, addressed: true, forwards: true, asks: true, ownerMentions: false, ...(file.wake ?? {}) },
+    // Off by default (ADR-068): opening a session in a directory is not a request to work for a room.
+    // A seat wakes its session and a wake re-sends the whole accumulated context, so a seat taken on
+    // the strength of a `cd` spends the owner's budget on work they did not open that window for.
+    seats: { autoReattach: envFlag(process.env.RANY_AUTO_REATTACH) ?? file.seats?.autoReattach ?? false },
   }
+}
+
+/** `1`/`true`/`yes`/`on` → true, `0`/`false`/`no`/`off` → false, anything else (incl. unset) → null. */
+function envFlag(raw) {
+  const v = String(raw ?? '').trim().toLowerCase()
+  if (!v) return null
+  if (['1', 'true', 'yes', 'on'].includes(v)) return true
+  if (['0', 'false', 'no', 'off'].includes(v)) return false
+  return null
 }
 const config = loadConfig()
 
@@ -614,16 +627,29 @@ async function reattachSeat({ agentId, h, dir, sessionId }) {
   ].join('\n')
 }
 
-async function reattachRememberedSeats({ dir, sessionId }) {
+async function reattachRememberedSeats({ dir, sessionId, deliberate = false }) {
   const lines = []
   const mine = new Set(boardsForSession(loadBindings(), { dir, sessionId }))
+  const offer = []
   for (const [id, h] of seatsForRepo(dir)) {
     if (mine.has(id)) continue
     if (heldByAnotherLiveSession(id, sessionId)) {
       lines.push(`RANY: seat "${h?.name ?? id}" in work room ${h?.channelId ?? '?'} is held by another open Gemini session of this repo; /rany:rany-rejoin ${id} moves it here.`)
       continue
     }
+    if (!deliberate && !config.seats.autoReattach) { offer.push([id, h]); continue }
     lines.push(await reattachSeat({ agentId: id, h, dir, sessionId }))
+  }
+  // Named, not taken (ADR-068). One compact block, not the full identity brief a taken seat prints.
+  if (offer.length > 0) {
+    lines.push(
+      `RANY: this repo has held these work-room seats, and no open session holds them now:`,
+      ...offer.map(([id, h]) => `  • "${h?.name ?? id}" in room ${h?.channelId ?? '?'} — /rany:rany-rejoin ${id}`),
+      ``,
+      `THIS session has NOT taken them: a seat wakes its session for the room, and this window may be`,
+      `open for something else. Take one with the command above, or all of them with /rany:rany-rejoin.`,
+      `To have them come back by themselves, set {"seats":{"autoReattach":true}} in ~/.rany-plugin/gemini.json.`,
+    )
   }
   return lines
 }
@@ -686,7 +712,8 @@ if (has('--rejoin')) {
     const h = seatsForRepo(dir).find(([id]) => id === raw)?.[1]
     out(await reattachSeat({ agentId: raw, h, dir, sessionId }))
   } else {
-    const lines = await reattachRememberedSeats({ dir, sessionId })
+    // Someone typed the command: take them, whatever `seats.autoReattach` says.
+    const lines = await reattachRememberedSeats({ dir, sessionId, deliberate: true })
     out(lines.length ? lines.join('\n') : 'RANY: this repo holds no remembered work-room seat. Paste an invite link to join a room.')
   }
   process.exit(0)

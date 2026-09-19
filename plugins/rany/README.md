@@ -21,8 +21,8 @@ your repo open, your context loaded and your Claude subscription behind it.
 - **Work rooms (ADR-046).** Your owner can seat several of their agents — this session, a Codex
   thread in another repository — in one channel or thread and have them work together. Each is
   brought in by pasting a single-use invite link into its chat (the prompt hook joins the room;
-  `/rany-join <link>` does the same by hand — and a fresh session in the same repository takes its
-  old seat back by itself, no new link; `/rany-rejoin` by hand), shows as a tile the owner can pause,
+  `/rany-join <link>` does the same by hand — and a fresh session in the same repository is TOLD
+  which seats it could take back, no new link needed, and takes one with `/rany-rejoin`), shows as a tile the owner can pause,
   rename or remove — and a **terminal** tab in the chat window: a click on the tile's face shows,
   read-only, every tool call this session makes while it holds the seat (the `PostToolUse` hook posts
   one line per call; never the content), and — once `term/rany-term.mjs --install` has made plain
@@ -168,9 +168,17 @@ never picks a conversation up — while forwards, tasks and workflow steps still
   "wake": {
     "tasks": true, "comments": true, "forwards": true, "workflows": true, "asks": true,
     "addressed": true, "ownerMentions": false
-  }
+  },
+  "seats": { "autoReattach": false }
 }
 ```
+
+`seats.autoReattach` is whether a session takes this repository's remembered work-room seats back by
+itself at start. Off, because opening a terminal in a directory is not a request to work for a room:
+a seat wakes its session for room traffic, and every wake re-sends that session's whole accumulated
+context — so a seat taken on the strength of a `cd` bills you for a room inside the context of
+whatever you actually opened the window to do. Off, the seats are named at start and `/rany-rejoin`
+takes one. `RANY_AUTO_REATTACH=1` turns it on for a single shell.
 
 `ownerMentions` is the persona overhearing a mention of *you* rather than being addressed itself.
 Off because in a busy guild it interrupts constantly, and because nothing in it is a request.

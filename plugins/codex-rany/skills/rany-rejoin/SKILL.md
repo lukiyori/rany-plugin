@@ -8,9 +8,11 @@ description: Take back a RANY work-room seat this repository held before — no 
 Argument (optional): the seat id — the `agentId` a join printed. Without one, every seat this
 repository has held that no other live Codex thread holds now.
 
-Usually this is not needed: a fresh thread takes its old seats back by itself at start and tells you
-so. Use the skill when that did not happen, or to move a seat here from another open thread of the
-same repository.
+A fresh thread does NOT take old seats by itself. It names them at start and waits for this skill: a
+seat wakes its thread for the room, and the thread you just opened may be for something else. Use it
+to take one (or all of them), or to move a seat here from another open thread of the same repository.
+To go back to seats coming home automatically, set `{"seats":{"autoReattach":true}}` in
+`~/.rany-plugin/codex.json`.
 
 Run:
 

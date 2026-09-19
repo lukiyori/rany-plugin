@@ -596,7 +596,23 @@ function loadConfig() {
       ownerMentions: false,
       ...(file.wake ?? {}),
     },
+    // Off by default (ADR-068): opening a thread in a directory is not a request to work for a room.
+    // A seat wakes its thread for room traffic and a wake re-sends the whole accumulated context, so
+    // a seat taken on the strength of a `cd` spends the owner's budget inside whatever they actually
+    // opened that thread to do. Remembered seats are NAMED at start; `$rany-rejoin` takes one.
+    seats: {
+      autoReattach: envFlag(process.env.RANY_AUTO_REATTACH) ?? file.seats?.autoReattach ?? false,
+    },
   }
+}
+
+/** `1`/`true`/`yes`/`on` → true, `0`/`false`/`no`/`off` → false, anything else (incl. unset) → null. */
+function envFlag(raw) {
+  const v = String(raw ?? '').trim().toLowerCase()
+  if (!v) return null
+  if (['1', 'true', 'yes', 'on'].includes(v)) return true
+  if (['0', 'false', 'no', 'off'].includes(v)) return false
+  return null
 }
 
 const config = loadConfig()
@@ -814,17 +830,30 @@ async function reattachSeat({ agentId, h, dir, threadId }) {
 
 /** SessionStart: every seat this repo held that no live thread holds now comes back to THIS thread by
  *  itself. A seat another live thread holds is only mentioned; `$rany-rejoin <agentId>` moves it. */
-async function reattachRememberedSeats({ dir, threadId }) {
+async function reattachRememberedSeats({ dir, threadId, deliberate = false }) {
   const lines = []
   const bindings = loadBindings()
   const mine = new Set(boardsForSession(bindings, { dir, threadId }))
+  const offer = []
   for (const [id, h] of seatsForRepo(dir)) {
     if (mine.has(id)) continue
     if (heldByAnotherLiveThread(id, threadId)) {
       lines.push(`RANY: seat "${h?.name ?? id}" in work room ${h?.channelId ?? '?'} is held by another open Codex thread of this repo; $rany-rejoin ${id} moves it here.`)
       continue
     }
+    if (!deliberate && !config.seats.autoReattach) { offer.push([id, h]); continue }
     lines.push(await reattachSeat({ agentId: id, h, dir, threadId }))
+  }
+  // Named, not taken (ADR-068). One compact block, not the full identity brief a taken seat prints.
+  if (offer.length > 0) {
+    lines.push(
+      `RANY: this repo has held these work-room seats, and no open thread holds them now:`,
+      ...offer.map(([id, h]) => `  • "${h?.name ?? id}" in room ${h?.channelId ?? '?'} — $rany-rejoin ${id}`),
+      ``,
+      `THIS thread has NOT taken them: a seat wakes its thread for the room, and this one may be open`,
+      `for something else. Take one with the command above, or all of them with $rany-rejoin.`,
+      `To have them come back by themselves, set {"seats":{"autoReattach":true}} in ~/.rany-plugin/codex.json.`,
+    )
   }
   return lines
 }
@@ -842,7 +871,8 @@ if (has('--rejoin')) {
     const h = seatsForRepo(dir).find(([id]) => id === raw)?.[1]
     process.stdout.write((await reattachSeat({ agentId: raw, h, dir, threadId })) + '\n')
   } else {
-    const lines = await reattachRememberedSeats({ dir, threadId })
+    // Someone typed the command: take them, whatever `seats.autoReattach` says.
+    const lines = await reattachRememberedSeats({ dir, threadId, deliberate: true })
     process.stdout.write((lines.length ? lines.join('\n') : 'RANY: this repo holds no remembered work-room seat. Paste an invite link to join a room.') + '\n')
   }
   process.exit(0)

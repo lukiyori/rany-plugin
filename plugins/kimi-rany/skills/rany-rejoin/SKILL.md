@@ -8,8 +8,10 @@ description: Take back a RANY work-room seat this repository held before — no 
 Argument (optional): the seat id — the `agentId` a join printed. Without one, every seat this repository
 has held that no other live Kimi session holds now.
 
-Usually this is not needed: a fresh session takes its old seats back by itself at start. Use it when that
-did not happen, or to move a seat here from another open session of the same repository.
+A fresh session does NOT take old seats by itself. It names them at start and waits for this skill: a
+seat wakes its session for the room, and the window you just opened may be for something else. Use it to
+take one (or all of them), or to move a seat here from another open session of the same repository. To go
+back to seats coming home automatically, set `{"seats":{"autoReattach":true}}` in `~/.rany-plugin/kimi.json`.
 
 Run with the Shell tool:
 

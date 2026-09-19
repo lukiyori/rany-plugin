@@ -427,20 +427,44 @@ async function reattachSeat(agentId, h, sid = sessionId) {
 }
 
 /**
- * SessionStart: every seat this repo held that no window holds now comes back to THIS session by itself
- * — the owner should not have to mint a link because a terminal was closed. A seat another live window
- * holds is left there and only mentioned; `/rany-rejoin <agentId>` moves it deliberately.
+ * The seats this repo has held that no live window holds now.
+ *
+ * `deliberate` is the whole distinction. `/rany-rejoin` is someone asking for the seat, so it takes
+ * it. SessionStart is not: opening a terminal in a directory is not a request to work for a room.
+ * A seat makes its session wake for room traffic, and every wake re-sends that session's whole
+ * accumulated context — so a seat taken on the strength of a `cd` bills the owner for a room they
+ * were not in, inside the context of whatever they actually opened the window to do. At session
+ * start the seats are therefore NAMED, not taken, unless `seats.autoReattach` says otherwise; that
+ * is the same contract boards have had since ADR-038 ("a binding belongs to one session").
+ *
+ * A seat another live window holds is never taken here whatever the setting — moving it is
+ * `/rany-rejoin <agentId>` and nothing else.
  */
-async function reattachRememberedSeats() {
+async function reattachRememberedSeats({ deliberate = false } = {}) {
   const lines = []
   const mine = new Set(boardsHere())
+  const offer = []
   for (const [id, h] of seatsForRepo()) {
     if (mine.has(id)) continue
     if (heldByAnotherLiveSession(id)) {
       lines.push(`RANY: seat "${h?.name ?? id}" in work room ${h?.channelId ?? '?'} is held by another open window of this repo; /rany-rejoin ${id} moves it here.`)
       continue
     }
+    if (!deliberate && !config.seats.autoReattach) { offer.push([id, h]); continue }
     lines.push(await reattachSeat(id, h))
+  }
+  // One compact block for everything on offer — not a full identity brief each, which is what a seat
+  // actually taken prints. Nothing here has woken anything; it is a list and two commands.
+  if (offer.length > 0) {
+    lines.push(
+      `RANY: this repo has held these work-room seats, and no open window holds them now:`,
+      ...offer.map(([id, h]) => `  • "${h?.name ?? id}" in room ${h?.channelId ?? '?'} — /rany-rejoin ${id}`),
+      ``,
+      `THIS session has NOT taken them: a seat wakes its session for the room, and this window may be`,
+      `open for something else. Take one with the command above, or all of them with /rany-rejoin.`,
+      `To have them come back by themselves in every session, set {"seats":{"autoReattach":true}} in`,
+      `~/.rany-plugin/rany.json (or RANY_AUTO_REATTACH=1 for one shell).`,
+    )
   }
   return lines
 }
@@ -710,7 +734,26 @@ function loadConfig() {
     // Backstop only. The Stop hook respawns this after every turn, and the pidfile keeps that to
     // one live listener; this just guarantees an abandoned process eventually goes away.
     maxMinutes: file.maxMinutes ?? 480,
+    // Taking a remembered work-room seat back is OFF by default, and the default is the whole point.
+    // A seat makes its session wake for the room, and a woken session pays for its whole accumulated
+    // context on every wake — so a session that silently inherits a seat can spend an owner's budget
+    // on work they never opened that terminal to do. Boards already require `/rany-bind` per session
+    // for the same reason ("a binding belongs to one session"); a seat is the stronger claim of the
+    // two and had the weaker gate. Turn it on per machine with `"seats": {"autoReattach": true}` in
+    // rany.json, or per shell with RANY_AUTO_REATTACH=1.
+    seats: {
+      autoReattach: envFlag(process.env.RANY_AUTO_REATTACH) ?? file.seats?.autoReattach ?? false,
+    },
   }
+}
+
+/** `1`/`true`/`yes`/`on` → true, `0`/`false`/`no`/`off` → false, anything else (incl. unset) → null. */
+function envFlag(raw) {
+  const v = String(raw ?? '').trim().toLowerCase()
+  if (!v) return null
+  if (['1', 'true', 'yes', 'on'].includes(v)) return true
+  if (['0', 'false', 'no', 'off'].includes(v)) return false
+  return null
 }
 
 function alive(pid) {
@@ -912,7 +955,8 @@ if (rejoinAt !== -1) {
     const h = seatsForRepo().find(([id]) => id === raw)?.[1]
     process.stdout.write((await reattachSeat(raw, h)) + '\n')
   } else {
-    const lines = await reattachRememberedSeats()
+    // Someone typed the command: take them, whatever `seats.autoReattach` says.
+    const lines = await reattachRememberedSeats({ deliberate: true })
     process.stdout.write((lines.length ? lines.join('\n') : 'RANY: this repo holds no remembered work-room seat. Paste an invite link to join a room.') + '\n')
   }
   process.exit(QUIET)
@@ -1147,9 +1191,10 @@ prepareTerm()
 // you to remember which boards and their numbers, list them by name and hand over the one-liners.
 if (sessionId && !alreadyReminded(sessionId)) {
   markReminded(sessionId) // once per session, whatever comes of it — don't recompute every turn
-  // Work-room seats come back by themselves (db/0365): a seat is the persona's, not the invite link's,
-  // so a closed terminal must not cost the owner another link. Boards stay a reminder — binding a board
-  // is a choice about which window does the work, and two windows in one repo are ordinary.
+  // Seats and boards are both offers now, and for the same reason: which window does a piece of work
+  // is a choice, and two windows in one repo are ordinary. A seat is still the persona's rather than
+  // the invite link's (db/0365), so no new link is ever needed — `/rany-rejoin` takes it back. What
+  // changed in ADR-068 is only that taking it is asked for rather than assumed.
   const lines = await reattachRememberedSeats()
   const mineNow = new Set(boardsHere())
   const forgotten = historyForRepo().filter(([id]) => !mineNow.has(id))
