@@ -519,6 +519,7 @@ const JOIN_REFUSALS = {
   invite_expired: 'that link expired — ask the owner for a new one',
   not_your_room: 'that room belongs to another persona',
   room_full: 'the room is full',
+  seat_gone: 'that seat was removed from the room — ask the owner for a new link',
   persona_not_active: 'the persona is paused',
 }
 
@@ -549,9 +550,15 @@ async function joinSeat({ code, dir, sessionId }) {
   await declareBoards(claimKey(s), boardsForSession(loadBindings(), s), 5000, { ref: sessionId })
   return {
     ok: true,
-    short: `RANY: this Kimi session joined the work room at channel ${seat.channelId} as "${seat.name}" (agentId ${seat.agentId}).`,
+    short: seat.woke
+      ? `RANY: this Kimi session took back the seat "${seat.name}" in the work room at channel ${seat.channelId} (agentId ${seat.agentId}).`
+      : `RANY: this Kimi session joined the work room at channel ${seat.channelId} as "${seat.name}" (agentId ${seat.agentId}).`,
     brief: [
-      `RANY: THIS Kimi session joined the work room at channel ${seat.channelId} as "${seat.name}" (agentId ${seat.agentId}).`,
+      // A wake link (db/0427) hands over a seat that was already in the room — say so, because the room's
+      // history, the seat's name and its identity are the ones it had before, not a fresh start.
+      seat.woke
+        ? `RANY: THIS Kimi session took back the seat "${seat.name}" in the work room at channel ${seat.channelId} (agentId ${seat.agentId}) — it kept its name, identity and history.`
+        : `RANY: THIS Kimi session joined the work room at channel ${seat.channelId} as "${seat.name}" (agentId ${seat.agentId}).`,
       `From now on room messages for that seat are delivered to this session, until it closes.`,
       `Next: get_room({channelId:"${seat.channelId}"}) and read the brief documents it lists; then tell the room in ONE`,
       `line which part of the job you take — post_message({channelId:"${seat.channelId}", agentId:"${seat.agentId}", content:"…"}).`,

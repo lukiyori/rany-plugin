@@ -733,6 +733,7 @@ const JOIN_REFUSALS = {
   invite_expired: 'that link expired — ask the owner for a new one',
   not_your_room: 'that room belongs to another persona',
   room_full: 'the room is full',
+  seat_gone: 'that seat was removed from the room — ask the owner for a new link',
   persona_not_active: 'the persona is paused',
 }
 
@@ -767,7 +768,11 @@ async function joinSeat({ code, dir, threadId }) {
   const s = { dir, threadId: threadId ?? undefined }
   await declareBoards(claimKey(s), boardsForSession(loadBindings(), s))
   return [
-    `RANY: THIS Codex thread joined the work room at channel ${seat.channelId} as "${seat.name}" (agentId ${seat.agentId}).`,
+    // A wake link (db/0427) hands over a seat that was already in the room — say so, because the room's
+    // history, the seat's name and its identity are the ones it had before, not a fresh start.
+    seat.woke
+      ? `RANY: THIS Codex thread took back the seat "${seat.name}" in the work room at channel ${seat.channelId} (agentId ${seat.agentId}) — it kept its name, identity and history.`
+      : `RANY: THIS Codex thread joined the work room at channel ${seat.channelId} as "${seat.name}" (agentId ${seat.agentId}).`,
     `From now on room messages for that seat are queued into this thread, until it closes.`,
     `Next: get_room({channelId:"${seat.channelId}"}) and read the brief documents it lists; then tell the room in ONE`,
     `line which part of the job you take — post_message({channelId:"${seat.channelId}", agentId:"${seat.agentId}", content:"…"}).`,
@@ -1632,7 +1637,7 @@ function roomPrompt(type, d, seat) {
     `  request_permission — BEFORE anything destructive, production-facing, costly or outside this repo;`,
     `  propose_identities({channelId, agentId, identities}) — RIGHT AFTER you join: if you can play named`,
     `    roles, offer them (slug, title, name, summary) — the name is what your seat is CALLED with that role,`,
-    `    so two seats of one product are not both just "Cortex"; the owner picks one. Nothing to offer? Say`,
+    `    so two seats of one product do not carry the same name; the owner picks one. Nothing to offer? Say`,
     `    nothing and the owner picks from RANY's catalog;`,
     `  ask_question({channelId, agentId, question, options?}) — any other question for your owner: a card in the`,
     `    chat with your options and a free-text answer; the answer wakes you (PERSONA_ROOM_ANSWER);`,

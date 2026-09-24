@@ -1,5 +1,10 @@
 {
   "mcpServers": {
+    "rany-mail": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/mail.mjs"]
+    },
     "rany": {
       "type": "http",
       "url": "${RANY_API_URL:-https://www.rany.work/api}/mcp",

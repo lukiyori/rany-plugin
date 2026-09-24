@@ -51,4 +51,6 @@ The link is single-use and expires after 24 hours; a used or expired one is refu
 a new one. Closing the thread drops the binding — the seat stays in the room, shown as "session
 closed" — but NOT the seat: the next Codex thread opened in this repository takes it back by itself at
 start (db/0365), and `$rany-rejoin` does it by hand. A new link is needed only for a seat that does not
-exist yet.
+exist yet — or when the owner presses **wake** on a seat's tile, which hands out a link that takes THAT
+seat back (db/0427). Such a link says so: the join reports the seat taken back, with its name, identity
+and history.
