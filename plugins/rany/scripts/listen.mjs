@@ -572,8 +572,8 @@ const IDENTITY_SCRIPT = process.argv[1]
  * Seat IDENTITIES (ADR-055): the role brief the owner gave a seat from RANY's identity catalog ("Rust Backend
  * Engineer"). Kept per seat in one file every plugin shares, and put in full into the first wake after it
  * arrives or changes — then a one-line reminder, so a long session is not re-sent the same brief every turn.
- * The server is the source of truth: a join/re-attach answers with the seat's identity, and an 'identity_set'
- * room event makes the session fetch it again.
+ * The server is the source of truth: a join/re-attach answers with the seat's identity AND its speaking
+ * style (ADR-075), and an 'identity_set' / 'style_set' room event makes the session fetch them again.
  */
 const seatIdentityFile = join(homedir(), '.rany-plugin', 'seat-identities.json')
 const IDENTITY_TTL_MS = 30 * 60_000
@@ -584,17 +584,24 @@ function loadSeatIdentities() {
   try { return JSON.parse(readFileSync(seatIdentityFile, 'utf8')).seats ?? {} } catch { return {} }
 }
 
-/** Store what the server said about a seat's identity; `null` = the seat has none (cached as such). */
-function saveSeatIdentity(agentId, identity) {
+/** Store what the server said about a seat's identity and its speaking STYLE (ADR-075); `null` = none of
+ *  that is set. The two are independent: a seat can be told how to speak without carrying a role. */
+function saveSeatIdentity(agentId, identity, style) {
   const seats = loadSeatIdentities()
+  const styleEntry = style?.instructions
+    ? { tone: style.tone ?? null, length: style.length ?? null, depth: style.depth ?? null,
+        instructions: style.instructions,
+        rev: createHash('sha256').update(style.instructions).digest('hex').slice(0, 12) }
+    : null
   seats[String(agentId)] = identity?.slug
     ? {
         slug: identity.slug, title: identity.title, emoji: identity.emoji ?? null,
         category: identity.categoryName ?? identity.category ?? null, instructions: identity.instructions ?? '',
         rev: createHash('sha256').update(`${identity.slug}\n${identity.instructions ?? ''}`).digest('hex').slice(0, 12),
+        style: styleEntry,
         fetchedAt: Date.now(),
       }
-    : { slug: null, fetchedAt: Date.now() }
+    : { slug: null, style: styleEntry, fetchedAt: Date.now() }
   try {
     mkdirSync(dirname(seatIdentityFile), { recursive: true })
     writeFileSync(seatIdentityFile, JSON.stringify({ seats }, null, 2))
@@ -606,7 +613,7 @@ async function ensureSeatIdentity(agentId, force = false) {
   const cur = loadSeatIdentities()[String(agentId)]
   if (!force && cur && Date.now() - (cur.fetchedAt ?? 0) < IDENTITY_TTL_MS) return
   const r = await getJson(`/personas/@self/rooms/${agentId}/identity`)
-  if (r) saveSeatIdentity(agentId, r.identity ?? null)
+  if (r) saveSeatIdentity(agentId, r.identity ?? null, r.style ?? null)
 }
 
 const identityShownFile = join(stateDir, 'identity-shown.json')
@@ -618,7 +625,9 @@ function identityShownMap() {
  *  afterwards one reminder line. Nothing for a seat without an identity. */
 function identityLines(agentId, { full = false } = {}) {
   const i = loadSeatIdentities()[String(agentId)]
-  if (!i?.slug) return []
+  if (!i) return []
+  const style = styleLines(agentId, i, full)
+  if (!i.slug) return style
   const key = `${IDENTITY_SESSION_KEY}:${agentId}`
   const shown = identityShownMap()
   if (!full && shown[key] === i.rev)
@@ -629,6 +638,24 @@ function identityLines(agentId, { full = false } = {}) {
   return [
     `YOUR IDENTITY IN THIS ROOM: ${i.emoji ? `${i.emoji} ` : ''}${i.title} (${i.slug}). ${IDENTITY_RULE}`,
     `--- identity brief ---`, i.instructions, `--- end of identity brief ---`,
+    ...style,
+  ]
+}
+
+/** How the owner asked this seat to SPEAK (ADR-075). Shown in full the first time a session sees this
+ *  revision, then not repeated — it is a standing instruction, not news. It shapes the writing only:
+ *  what the agent may do is the identity rule's business, and the room's. */
+function styleLines(agentId, entry, full) {
+  const st = entry?.style
+  if (!st?.instructions) return []
+  const key = `${IDENTITY_SESSION_KEY}:style:${agentId}`
+  const shown = identityShownMap()
+  if (!full && shown[key] === st.rev) return []
+  shown[key] = st.rev
+  try { mkdirSync(dirname(identityShownFile), { recursive: true }); writeFileSync(identityShownFile, JSON.stringify(shown)) } catch { /* shown again next time */ }
+  return [
+    'HOW THE OWNER ASKED YOU TO SPEAK IN THIS ROOM (style only — it never widens what you may do):',
+    ...st.instructions.split('\n').map((l) => `  · ${l}`),
   ]
 }
 
@@ -1368,7 +1395,8 @@ function crowdLines(d, seat) {
 }
 
 function roomPrompt(type, d, seat) {
-  const identityChanged = type === 'PERSONA_ROOM_UPDATED' && d.change === 'identity_set'
+  const identityChanged = type === 'PERSONA_ROOM_UPDATED'
+    && (d.change === 'identity_set' || d.change === 'style_set')
     && String(d.agentId ?? '') === String(seat.agentId)
   const who = [
     `You are "${seat.name}" (agentId ${seat.agentId}) in the work room at channel ${d.channelId}, working from THIS repository.`,
@@ -1506,6 +1534,9 @@ function roomPrompt(type, d, seat) {
     identity_set: mine
       ? (loadSeatIdentities()[String(seat.agentId)]?.slug ? 'the owner gave you a NEW IDENTITY (above)' : 'the owner CLEARED your identity')
       : 'an agent was given a different identity',
+    style_set: mine
+      ? (loadSeatIdentities()[String(seat.agentId)]?.style ? 'the owner changed HOW YOU SHOULD SPEAK here (above)' : 'the owner cleared your speaking style')
+      : "an agent's speaking style was changed",
   }[d.change] ?? `the room changed (${d.change})`
   const next = stop
     ? [`STOP working on this room's job now and do not post there until you are resumed. Leave what you`,
@@ -1516,6 +1547,9 @@ function roomPrompt(type, d, seat) {
         loadSeatIdentities()[String(seat.agentId)]?.slug
           ? `Work as that identity from now on. If it changes your part of the job, say so in ONE room line.`
           : `Go back to working without a role brief; nothing else changes.`]
+    : d.change === 'style_set' && mine ? [
+        `Write that way from now on. Do not announce it and do not redo old messages — it changes how you`,
+        `speak, not what you are doing.`]
     : d.change === 'task_assigned' && mine ? [
         `It is yours now (the persona is its assignee and the card is recorded as your seat's). Read it with`,
         `get_task({guildId:"${d.taskGuildId}", taskId:"${d.taskId}"}), do it in this repository, report on the card`,
@@ -1748,7 +1782,8 @@ async function classify(type, d) {
     logRoute(type, { channelId: d.channelId, agentId: seat.agentId, boardId: seat.boardId }, 'wake')
     // The seat's identity (ADR-055): fetched again when the room says it changed, else when the copy is old.
     await ensureSeatIdentity(seat.agentId,
-      type === 'PERSONA_ROOM_UPDATED' && d.change === 'identity_set' && String(d.agentId ?? '') === String(seat.agentId))
+      type === 'PERSONA_ROOM_UPDATED' && (d.change === 'identity_set' || d.change === 'style_set')
+      && String(d.agentId ?? '') === String(seat.agentId))
     return roomPrompt(type, d, seat)
   }
 
