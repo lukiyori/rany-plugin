@@ -145,10 +145,45 @@ function installShims() {
       ? `rany-term: shims refreshed in ${shimDir} (already on PATH). Plain \`claude\` and \`codex\` mirror their screen wherever the directory holds a seat.\n`
       : `rany-term: shims in ${shimDir}. Put it FIRST on your PATH (e.g. \`export PATH="${shimDir}:$PATH"\` in your shell profile); from then on plain \`claude\` and \`codex\` mirror their screen wherever the directory holds a seat.\n`)
   }
+  if (process.platform === 'win32') powershellProfiles(true)
+}
+
+// Windows builds a process's PATH as MACHINE + USER, so "first on the user PATH" still loses to a
+// `claude` installed machine-wide (npm -g into C:\Program Files\nodejs is exactly that) — and PowerShell
+// would pick that directory's claude.ps1 over any .cmd regardless. The shim was on PATH and never ran;
+// the Screen tab stayed empty. A function beats every command on PATH, so the PowerShell profile (all
+// hosts: the console, VS Code's terminal, Windows Terminal) gets one, between markers so a re-install
+// replaces it and --uninstall takes it out. cmd.exe has no equivalent and still depends on PATH order.
+const PROFILE_START = '# >>> rany-term (claude screen mirror) >>>'
+const PROFILE_END = '# <<< rany-term <<<'
+
+function powershellProfiles(install) {
+  const block = [PROFILE_START,
+    `function claude { & '${join(shimDir, 'claude.cmd').replace(/'/g, "''")}' @args }`,
+    PROFILE_END].join('\r\n')
+  const strip = (s) => s.replace(new RegExp(`\\r?\\n?${PROFILE_START.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[\\s\\S]*?${PROFILE_END}\\r?\\n?`), '\r\n').replace(/^\r\n/, '')
+  for (const shell of ['powershell.exe', 'pwsh.exe']) {
+    const q = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', '$PROFILE.CurrentUserAllHosts'], { encoding: 'utf8' })
+    const file = String(q.stdout ?? '').trim()
+    if (q.status !== 0 || !file) continue // that PowerShell is not installed
+    try {
+      const was = existsSync(file) ? readFileSync(file, 'utf8') : ''
+      const kept = strip(was).trimEnd()
+      if (!install && kept === was.trimEnd()) continue
+      mkdirSync(dirname(file), { recursive: true })
+      writeFileSync(file, install ? `${kept ? kept + '\r\n\r\n' : ''}${block}\r\n` : (kept ? kept + '\r\n' : ''))
+      process.stdout.write(install
+        ? `rany-term: \`claude\` routed through the shim in ${file} (a machine-wide claude would otherwise win). Open a NEW terminal.\n`
+        : `rany-term: removed the \`claude\` function from ${file}.\n`)
+    } catch (e) {
+      process.stdout.write(`rany-term: could not update ${file} (${e?.message ?? e}) — add \`function claude { & '${join(shimDir, 'claude.cmd')}' @args }\` to it by hand.\n`)
+    }
+  }
 }
 
 function uninstallShims() {
   for (const a of [...AGENTS, 'rany-term']) for (const f of [a, `${a}.cmd`]) { try { rmSync(join(shimDir, f), { force: true }) } catch { /* gone */ } }
+  if (process.platform === 'win32') powershellProfiles(false)
   process.stdout.write(`rany-term: shims removed from ${shimDir} (the PATH entry is harmless and left alone).\n`)
 }
 

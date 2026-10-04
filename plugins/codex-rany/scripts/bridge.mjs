@@ -231,16 +231,22 @@ function loadSeatIdentities() {
 }
 
 /** Store what the server said about a seat's identity; `null` = the seat has none (cached as such). */
-function saveSeatIdentity(agentId, identity) {
+function saveSeatIdentity(agentId, identity, approval) {
   const seats = loadSeatIdentities()
+  // How much the seat must ask (ADR-083). Absent from an older server: keep what we had rather than forget it.
+  const approvalEntry = approval?.policy
+    ? { policy: approval.policy, instructions: approval.instructions ?? '',
+        rev: createHash('sha256').update(`${approval.policy}\n${approval.instructions ?? ''}`).digest('hex').slice(0, 12) }
+    : seats[String(agentId)]?.approval ?? null
   seats[String(agentId)] = identity?.slug
     ? {
         slug: identity.slug, title: identity.title, emoji: identity.emoji ?? null,
         category: identity.categoryName ?? identity.category ?? null, instructions: identity.instructions ?? '',
         rev: createHash('sha256').update(`${identity.slug}\n${identity.instructions ?? ''}`).digest('hex').slice(0, 12),
+        approval: approvalEntry,
         fetchedAt: Date.now(),
       }
-    : { slug: null, fetchedAt: Date.now() }
+    : { slug: null, approval: approvalEntry, fetchedAt: Date.now() }
   try {
     mkdirSync(dirname(seatIdentityFile), { recursive: true })
     writeFileSync(seatIdentityFile, JSON.stringify({ seats }, null, 2))
@@ -252,7 +258,7 @@ async function ensureSeatIdentity(agentId, force = false) {
   const cur = loadSeatIdentities()[String(agentId)]
   if (!force && cur && Date.now() - (cur.fetchedAt ?? 0) < IDENTITY_TTL_MS) return
   const r = await getJson(`/personas/@self/rooms/${agentId}/identity`)
-  if (r) saveSeatIdentity(agentId, r.identity ?? null)
+  if (r) saveSeatIdentity(agentId, r.identity ?? null, r.approval ?? null)
 }
 
 const identityShownFile = join(HOME, 'codex-identity-shown.json')
@@ -264,18 +270,37 @@ function identityShownMap() {
  *  afterwards one reminder line. Nothing for a seat without an identity. */
 function identityLines(agentId, { full = false, sessionKey } = {}) {
   const i = loadSeatIdentities()[String(agentId)]
-  if (!i?.slug) return []
+  const approval = approvalLines(agentId, i, { full, sessionKey })
+  if (!i?.slug) return approval
   const key = `${sessionKey ?? IDENTITY_SESSION_KEY}:${agentId}`
   const shown = identityShownMap()
   if (!full && shown[key] === i.rev)
     return [`Your identity in this room: ${i.emoji ? `${i.emoji} ` : ''}**${i.title}** (${i.slug}) — keep working as it`
-      + ` describes. The full brief again: node "${IDENTITY_SCRIPT}" --identity ${agentId}`]
+      + ` describes. The full brief again: node "${IDENTITY_SCRIPT}" --identity ${agentId}`, ...approval]
   shown[key] = i.rev
   try { mkdirSync(dirname(identityShownFile), { recursive: true }); writeFileSync(identityShownFile, JSON.stringify(shown)) } catch { /* shown again next time */ }
   return [
     `YOUR IDENTITY IN THIS ROOM: ${i.emoji ? `${i.emoji} ` : ''}${i.title} (${i.slug}). ${IDENTITY_RULE}`,
     `--- identity brief ---`, i.instructions, `--- end of identity brief ---`,
+    ...approval,
   ]
+}
+
+/** The seat's APPROVAL setting (ADR-083): in full the first time this session sees this revision; afterwards one
+ *  reminder line on every wake when it is not the default — both other settings change what the agent does. */
+function approvalLines(agentId, entry, { full = false, sessionKey } = {}) {
+  const ap = entry?.approval
+  if (!ap?.instructions) return []
+  const key = `${sessionKey ?? IDENTITY_SESSION_KEY}:approval:${agentId}`
+  const shown = identityShownMap()
+  if (!full && shown[key] === ap.rev) {
+    if (ap.policy === 'auto') return ['Approval setting: act without waiting — request_permission is approved at once; still file it for risky steps.']
+    if (ap.policy === 'ask_all') return ['Approval setting: ask with request_permission before EVERY change, and wait.']
+    return []
+  }
+  shown[key] = ap.rev
+  try { mkdirSync(dirname(identityShownFile), { recursive: true }); writeFileSync(identityShownFile, JSON.stringify(shown)) } catch { /* shown again next time */ }
+  return [`YOUR SEAT'S APPROVAL SETTING (your owner's): ${ap.instructions}`]
 }
 
 /** GET JSON with the persona token → the parsed body, or null (offline, unconfigured, not 200). */
@@ -763,7 +788,7 @@ async function joinSeat({ code, dir, threadId }) {
     return `RANY: joined the work room, but could not save the seat binding (${e?.message ?? e}).`
   }
   recordSeat(dir, seat.agentId, seat) // so the next thread in this repo takes the seat back by itself (db/0365)
-  saveSeatIdentity(seat.agentId, seat.identity ?? null) // the seat's role brief (ADR-055)
+  saveSeatIdentity(seat.agentId, seat.identity ?? null, seat.approval ?? null) // the seat's role brief (ADR-055)
   noteSession(dir, threadId ?? undefined)
   const s = { dir, threadId: threadId ?? undefined }
   await declareBoards(claimKey(s), boardsForSession(loadBindings(), s))
@@ -820,7 +845,7 @@ async function reattachSeat({ agentId, h, dir, threadId }) {
     return `RANY: took back the seat, but could not save the binding (${e?.message ?? e}).`
   }
   recordSeat(dir, seat.agentId, seat)
-  saveSeatIdentity(seat.agentId, seat.identity ?? null) // the seat's role brief (ADR-055)
+  saveSeatIdentity(seat.agentId, seat.identity ?? null, seat.approval ?? null) // the seat's role brief (ADR-055)
   noteSession(dir, threadId ?? undefined)
   const s = { dir, threadId: threadId ?? undefined }
   await declareBoards(claimKey(s), boardsForSession(loadBindings(), s))
@@ -1483,7 +1508,8 @@ async function route(type, d) {
     // The seat's identity (ADR-055): fetched again when the room says it changed, else when the copy is old.
     d.identitySessionKey = pick.owner.threadId ?? pick.owner.sessionId ?? pick.owner.dir
     await ensureSeatIdentity(pick.s.agentId,
-      type === 'PERSONA_ROOM_UPDATED' && d.change === 'identity_set' && String(d.agentId ?? '') === String(pick.s.agentId))
+      type === 'PERSONA_ROOM_UPDATED' && (d.change === 'identity_set' || d.change === 'approval_set')
+        && String(d.agentId ?? '') === String(pick.s.agentId))
     return { dir: pick.owner.dir, threadId: pick.owner.threadId, text: roomPrompt(type, d, pick.s) }
   }
 
@@ -1614,7 +1640,7 @@ function crowdLines(d, seat) {
 }
 
 function roomPrompt(type, d, seat) {
-  const identityChanged = type === 'PERSONA_ROOM_UPDATED' && d.change === 'identity_set'
+  const identityChanged = type === 'PERSONA_ROOM_UPDATED' && (d.change === 'identity_set' || d.change === 'approval_set')
     && String(d.agentId ?? '') === String(seat.agentId)
   const who = [
     `You are "${seat.name}" (agentId ${seat.agentId}) in the work room at channel ${d.channelId}, working from THIS repository.`,
@@ -1625,6 +1651,8 @@ function roomPrompt(type, d, seat) {
     `  get_room — the other agents, the budget, pending requests and the BRIEF docs (read the brief first);`,
     `  post_message({channelId, agentId, content}) — talk in the room, in one or two sentences: what you did`,
     `    or what you need. Detail belongs on the board, not in the chat;`,
+    `    A next step for the owner ("push and deploy?") goes in actions:["Push and deploy", …] on that post —`,
+    `    buttons under it; the click comes back as PERSONA_ROOM_ANSWER. Never write "say X" for them to type;`,
     `  you take instructions from your PERSONA and from posts that name you (your owner's, a colleague's,`,
     `    or a room member's — someone the owner put in this room) — nothing else wakes you, and other`,
     `    messages in the channel are context to read, not requests to answer;`,
@@ -1634,7 +1662,8 @@ function roomPrompt(type, d, seat) {
     `    PUT the bytes to its uploadUrl (curl -X PUT -H "Content-Type: …" --data-binary @file "<url>") →`,
     `    post_message with attachments:[{key, filename, contentType, size}]; images show inline;`,
     `  set_agent_status — the one line your tile shows (what you are doing now); keep it current;`,
-    `  request_permission — BEFORE anything destructive, production-facing, costly or outside this repo;`,
+    `  request_permission — when your seat's approval setting says so (default: BEFORE anything destructive,`,
+    `    production-facing, costly or outside this repo);`,
     `  propose_identities({channelId, agentId, identities}) — RIGHT AFTER you join: if you can play named`,
     `    roles, offer them (slug, title, name, summary) — the name is what your seat is CALLED with that role,`,
     `    so two seats of one product do not carry the same name; the owner picks one. Nothing to offer? Say`,
@@ -1739,6 +1768,7 @@ function roomPrompt(type, d, seat) {
     identity_set: mine
       ? (loadSeatIdentities()[String(seat.agentId)]?.slug ? 'the owner gave you a NEW IDENTITY (above)' : 'the owner CLEARED your identity')
       : 'an agent was given a different identity',
+    approval_set: mine ? 'the owner changed how much you must ASK before acting (above)' : "an agent's approval setting was changed",
   }[d.change] ?? `the room changed (${d.change})`
   const next = stop
     ? [`STOP working on this room's job now and do not post there until you are resumed. Leave what you`,
@@ -1749,6 +1779,9 @@ function roomPrompt(type, d, seat) {
         loadSeatIdentities()[String(seat.agentId)]?.slug
           ? `Work as that identity from now on. If it changes your part of the job, say so in ONE room line.`
           : `Go back to working without a role brief; nothing else changes.`]
+    : d.change === 'approval_set' && mine ? [
+        `Follow that setting from now on. Do not announce it; if it changes something you were about to do, say so`,
+        `in ONE room line.`]
     : d.change === 'task_assigned' && mine ? [
         `It is yours now (the persona is its assignee and the card is recorded as your seat's). Read it with`,
         `get_task({guildId:"${d.taskGuildId}", taskId:"${d.taskId}"}), do it in this repository, report on the card`,

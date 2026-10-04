@@ -447,7 +447,7 @@ async function reattachSeat(agentId, h, sid = sessionId) {
     return `RANY: took back the seat, but could not save the binding (${e?.message ?? e}).`
   }
   recordSeat(seat.agentId, seat)
-  saveSeatIdentity(seat.agentId, seat.identity ?? null)
+  saveSeatIdentity(seat.agentId, seat.identity ?? null, seat.style ?? null, seat.approval ?? null)
   await declareBoards(boardsHere())
   return [
     `RANY: THIS session holds its seat "${seat.name}" in work room ${seat.channelId} again (agentId ${seat.agentId})`
@@ -573,7 +573,8 @@ const IDENTITY_SCRIPT = process.argv[1]
  * Engineer"). Kept per seat in one file every plugin shares, and put in full into the first wake after it
  * arrives or changes — then a one-line reminder, so a long session is not re-sent the same brief every turn.
  * The server is the source of truth: a join/re-attach answers with the seat's identity AND its speaking
- * style (ADR-075), and an 'identity_set' / 'style_set' room event makes the session fetch them again.
+ * style (ADR-075) and its APPROVAL setting (ADR-083), and an 'identity_set' / 'style_set' / 'approval_set' room
+ * event makes the session fetch them again.
  */
 const seatIdentityFile = join(homedir(), '.rany-plugin', 'seat-identities.json')
 const IDENTITY_TTL_MS = 30 * 60_000
@@ -586,8 +587,13 @@ function loadSeatIdentities() {
 
 /** Store what the server said about a seat's identity and its speaking STYLE (ADR-075); `null` = none of
  *  that is set. The two are independent: a seat can be told how to speak without carrying a role. */
-function saveSeatIdentity(agentId, identity, style) {
+function saveSeatIdentity(agentId, identity, style, approval) {
   const seats = loadSeatIdentities()
+  // How much the seat must ask (ADR-083). Absent from an older server: keep what we had rather than forget it.
+  const approvalEntry = approval?.policy
+    ? { policy: approval.policy, instructions: approval.instructions ?? '',
+        rev: createHash('sha256').update(`${approval.policy}\n${approval.instructions ?? ''}`).digest('hex').slice(0, 12) }
+    : seats[String(agentId)]?.approval ?? null
   const styleEntry = style?.instructions
     ? { tone: style.tone ?? null, length: style.length ?? null, depth: style.depth ?? null,
         instructions: style.instructions,
@@ -599,9 +605,10 @@ function saveSeatIdentity(agentId, identity, style) {
         category: identity.categoryName ?? identity.category ?? null, instructions: identity.instructions ?? '',
         rev: createHash('sha256').update(`${identity.slug}\n${identity.instructions ?? ''}`).digest('hex').slice(0, 12),
         style: styleEntry,
+        approval: approvalEntry,
         fetchedAt: Date.now(),
       }
-    : { slug: null, style: styleEntry, fetchedAt: Date.now() }
+    : { slug: null, style: styleEntry, approval: approvalEntry, fetchedAt: Date.now() }
   try {
     mkdirSync(dirname(seatIdentityFile), { recursive: true })
     writeFileSync(seatIdentityFile, JSON.stringify({ seats }, null, 2))
@@ -613,7 +620,7 @@ async function ensureSeatIdentity(agentId, force = false) {
   const cur = loadSeatIdentities()[String(agentId)]
   if (!force && cur && Date.now() - (cur.fetchedAt ?? 0) < IDENTITY_TTL_MS) return
   const r = await getJson(`/personas/@self/rooms/${agentId}/identity`)
-  if (r) saveSeatIdentity(agentId, r.identity ?? null, r.style ?? null)
+  if (r) saveSeatIdentity(agentId, r.identity ?? null, r.style ?? null, r.approval ?? null)
 }
 
 const identityShownFile = join(stateDir, 'identity-shown.json')
@@ -626,13 +633,13 @@ function identityShownMap() {
 function identityLines(agentId, { full = false } = {}) {
   const i = loadSeatIdentities()[String(agentId)]
   if (!i) return []
-  const style = styleLines(agentId, i, full)
+  const style = [...styleLines(agentId, i, full), ...approvalLines(agentId, i, full)]
   if (!i.slug) return style
   const key = `${IDENTITY_SESSION_KEY}:${agentId}`
   const shown = identityShownMap()
   if (!full && shown[key] === i.rev)
     return [`Your identity in this room: ${i.emoji ? `${i.emoji} ` : ''}**${i.title}** (${i.slug}) — keep working as it`
-      + ` describes. The full brief again: node "${IDENTITY_SCRIPT}" --identity ${agentId}`]
+      + ` describes. The full brief again: node "${IDENTITY_SCRIPT}" --identity ${agentId}`, ...style]
   shown[key] = i.rev
   try { mkdirSync(dirname(identityShownFile), { recursive: true }); writeFileSync(identityShownFile, JSON.stringify(shown)) } catch { /* shown again next time */ }
   return [
@@ -657,6 +664,24 @@ function styleLines(agentId, entry, full) {
     'HOW THE OWNER ASKED YOU TO SPEAK IN THIS ROOM (style only — it never widens what you may do):',
     ...st.instructions.split('\n').map((l) => `  · ${l}`),
   ]
+}
+
+/** The seat's APPROVAL setting (ADR-083): in full the first time a session sees this revision; afterwards one
+ *  reminder line on every wake when it is not the default — "ask before every change" and "don't wait" both
+ *  change what the agent does, so neither may fade after one turn. */
+function approvalLines(agentId, entry, full) {
+  const ap = entry?.approval
+  if (!ap?.instructions) return []
+  const key = `${IDENTITY_SESSION_KEY}:approval:${agentId}`
+  const shown = identityShownMap()
+  if (!full && shown[key] === ap.rev) {
+    if (ap.policy === 'auto') return ['Approval setting: act without waiting — request_permission is approved at once; still file it for risky steps.']
+    if (ap.policy === 'ask_all') return ['Approval setting: ask with request_permission before EVERY change, and wait.']
+    return []
+  }
+  shown[key] = ap.rev
+  try { mkdirSync(dirname(identityShownFile), { recursive: true }); writeFileSync(identityShownFile, JSON.stringify(shown)) } catch { /* shown again next time */ }
+  return [`YOUR SEAT'S APPROVAL SETTING (your owner's): ${ap.instructions}`]
 }
 
 /**
@@ -803,9 +828,11 @@ function loadConfig() {
       ownerMentions: false,
       ...(file.wake ?? {}),
     },
-    // Backstop only. The Stop hook respawns this after every turn, and the pidfile keeps that to
-    // one live listener; this just guarantees an abandoned process eventually goes away.
-    maxMinutes: file.maxMinutes ?? 480,
+    // Backstop only — a week. It was 8 hours, and that was the bug: the Stop hook respawns this only when a turn
+    // ENDS, so a terminal left idle overnight stopped listening at hour eight and its seat went deaf until someone
+    // typed in it (owner, 2026-10-04: "baglanti kopuyor bir sure sonra"). An abandoned listener is caught by the
+    // parent check below instead; this only bounds a pathological one.
+    maxMinutes: file.maxMinutes ?? 7 * 24 * 60,
     // Taking a remembered work-room seat back is OFF by default, and the default is the whole point.
     // A seat makes its session wake for the room, and a woken session pays for its whole accumulated
     // context on every wake — so a session that silently inherits a seat can spend an owner's budget
@@ -982,7 +1009,7 @@ async function joinSeat(code, sid = sessionId) {
     return `RANY: joined the work room, but could not save the seat binding (${e?.message ?? e}).`
   }
   recordSeat(seat.agentId, seat) // so the next session in this repo takes the seat back by itself (db/0365)
-  saveSeatIdentity(seat.agentId, seat.identity ?? null) // the role brief the owner picked on the link (ADR-055)
+  saveSeatIdentity(seat.agentId, seat.identity ?? null, seat.style ?? null, seat.approval ?? null) // the role brief the owner picked on the link (ADR-055)
   // Declared with the boards, so the room shows this seat as live straight away.
   await declareBoards(boardsHere())
   return [
@@ -1319,6 +1346,7 @@ let claimBeat = null
 let socket = null
 
 const done = (code, text) => {
+  logRoute('LISTENER', { pid: process.pid }, code === WAKE ? 'exit: waking the session' : 'exit: quiet')
   if (text) process.stdout.write(text + '\n')
   if (heartbeat) clearInterval(heartbeat)
   if (claimBeat) clearInterval(claimBeat)
@@ -1334,6 +1362,12 @@ const CLAIM_REFRESH_MS = 5 * 60_000
 process.on('SIGTERM', () => done(QUIET))
 process.on('SIGINT', () => done(QUIET))
 setTimeout(() => done(QUIET), config.maxMinutes * 60_000).unref()
+// Listen for as long as the terminal is there, not for a fixed time: the hook's parent process lives exactly as
+// long as the hook runs inside a live Claude Code session. When it is gone, this listener is an orphan — leave.
+const parentPid = process.ppid
+setInterval(() => {
+  try { process.kill(parentPid, 0) } catch { logRoute('LISTENER', { pid: process.pid }, 'parent gone'); done(QUIET) }
+}, 60_000).unref()
 
 /** Who the session speaks as. Every wake-up carries it, because a session that is not told signs
  *  as the model underneath ("— Claude (AI)") under a comment RANY already labels with the persona's
@@ -1396,7 +1430,7 @@ function crowdLines(d, seat) {
 
 function roomPrompt(type, d, seat) {
   const identityChanged = type === 'PERSONA_ROOM_UPDATED'
-    && (d.change === 'identity_set' || d.change === 'style_set')
+    && (d.change === 'identity_set' || d.change === 'style_set' || d.change === 'approval_set')
     && String(d.agentId ?? '') === String(seat.agentId)
   const who = [
     `You are "${seat.name}" (agentId ${seat.agentId}) in the work room at channel ${d.channelId}, working from THIS repository.`,
@@ -1407,6 +1441,8 @@ function roomPrompt(type, d, seat) {
     `  get_room — the other agents, the budget, pending requests and the BRIEF docs (read the brief first);`,
     `  post_message({channelId, agentId, content}) — talk in the room, in one or two sentences: what you did`,
     `    or what you need. Detail belongs on the board, not in the chat;`,
+    `    A next step for the owner ("push and deploy?") goes in actions:["Push and deploy", …] on that post —`,
+    `    buttons under it; the click comes back as PERSONA_ROOM_ANSWER. Never write "say X" for them to type;`,
     `  you take instructions from your PERSONA and from posts that name you (your owner's, a colleague's,`,
     `    or a room member's — someone the owner put in this room) — nothing else wakes you, and other`,
     `    messages in the channel are context to read, not requests to answer;`,
@@ -1416,7 +1452,8 @@ function roomPrompt(type, d, seat) {
     `    PUT the bytes to its uploadUrl (curl -X PUT -H "Content-Type: …" --data-binary @file "<url>") →`,
     `    post_message with attachments:[{key, filename, contentType, size}]; images show inline;`,
     `  set_agent_status — the one line your tile shows (what you are doing now); keep it current;`,
-    `  request_permission — BEFORE anything destructive, production-facing, costly or outside this repo;`,
+    `  request_permission — when your seat's approval setting says so (default: BEFORE anything destructive,`,
+    `    production-facing, costly or outside this repo);`,
     `  propose_identities({channelId, agentId, identities}) — RIGHT AFTER you join: if you can play named`,
     `    roles, offer them (slug, title, name, summary) — the name is what your seat is CALLED with that role,`,
     `    so two seats of one product do not carry the same name; the owner picks one. Nothing to offer? Say`,
@@ -1537,6 +1574,7 @@ function roomPrompt(type, d, seat) {
     style_set: mine
       ? (loadSeatIdentities()[String(seat.agentId)]?.style ? 'the owner changed HOW YOU SHOULD SPEAK here (above)' : 'the owner cleared your speaking style')
       : "an agent's speaking style was changed",
+    approval_set: mine ? 'the owner changed how much you must ASK before acting (above)' : "an agent's approval setting was changed",
   }[d.change] ?? `the room changed (${d.change})`
   const next = stop
     ? [`STOP working on this room's job now and do not post there until you are resumed. Leave what you`,
@@ -1550,6 +1588,9 @@ function roomPrompt(type, d, seat) {
     : d.change === 'style_set' && mine ? [
         `Write that way from now on. Do not announce it and do not redo old messages — it changes how you`,
         `speak, not what you are doing.`]
+    : d.change === 'approval_set' && mine ? [
+        `Follow that setting from now on. Do not announce it; if it changes something you were about to do, say so`,
+        `in ONE room line.`]
     : d.change === 'task_assigned' && mine ? [
         `It is yours now (the persona is its assignee and the card is recorded as your seat's). Read it with`,
         `get_task({guildId:"${d.taskGuildId}", taskId:"${d.taskId}"}), do it in this repository, report on the card`,
@@ -1782,7 +1823,7 @@ async function classify(type, d) {
     logRoute(type, { channelId: d.channelId, agentId: seat.agentId, boardId: seat.boardId }, 'wake')
     // The seat's identity (ADR-055): fetched again when the room says it changed, else when the copy is old.
     await ensureSeatIdentity(seat.agentId,
-      type === 'PERSONA_ROOM_UPDATED' && (d.change === 'identity_set' || d.change === 'style_set')
+      type === 'PERSONA_ROOM_UPDATED' && (d.change === 'identity_set' || d.change === 'style_set' || d.change === 'approval_set')
       && String(d.agentId ?? '') === String(seat.agentId))
     return roomPrompt(type, d, seat)
   }
@@ -1869,15 +1910,54 @@ async function classify(type, d) {
   return null
 }
 
+/**
+ * A listener that is alive but not connected is the worst failure there is: the room sees a live seat, the owner
+ * writes to it, and nothing happens. It was seen (2026-10-03): the process up for minutes, no TCP socket at all,
+ * the gateway fine for every new client — a reconnect that never completed and never closed, so the 'close'
+ * retry below never fired. So the connection is watched rather than trusted: no READY within CONNECT_LIMIT_MS of
+ * dialing, or no frame at all for SILENCE_LIMIT_MS once ready (the gateway acks every heartbeat, so silence means
+ * the line is dead), and the socket is abandoned and dialed again. Each step goes to routing.log, so the next
+ * "it didn't answer" can be read instead of guessed.
+ */
+const CONNECT_LIMIT_MS = 45_000
+const SILENCE_LIMIT_MS = 100_000
+let dialedAt = 0
+let lastFrameAt = 0
+let ready = false
+let dials = 0
+
+function redial(why) {
+  logRoute('LISTENER', { pid: process.pid }, `${why} — dialing again`)
+  const old = socket
+  socket = null
+  if (heartbeat) clearInterval(heartbeat)
+  try { old?.close() } catch { /* abandoned either way */ }
+  connect()
+}
+
+setInterval(() => {
+  const now = Date.now()
+  if (!ready && dialedAt && now - dialedAt > CONNECT_LIMIT_MS) redial(`no READY ${Math.round((now - dialedAt) / 1000)}s after dialing`)
+  else if (ready && now - lastFrameAt > SILENCE_LIMIT_MS) redial(`no frame for ${Math.round((now - lastFrameAt) / 1000)}s`)
+}, 15_000)
+
 function connect() {
+  ready = false
+  dialedAt = Date.now()
+  lastFrameAt = dialedAt
+  dials += 1
   try {
     socket = new WebSocket(config.gatewayUrl)
   } catch {
     done(QUIET) // bad URL — not worth interrupting a session over
     return
   }
+  const mine = socket
+  if (dials > 1) logRoute('LISTENER', { pid: process.pid, dial: dials }, 'reconnecting')
 
-  socket.addEventListener('message', async (ev) => {
+  mine.addEventListener('message', async (ev) => {
+    if (mine !== socket) return // an abandoned socket that spoke up late
+    lastFrameAt = Date.now()
     let frame
     try { frame = JSON.parse(String(ev.data)) } catch { return }
 
@@ -1898,10 +1978,9 @@ function connect() {
     if (frame.op === OP.InvalidSession) {
       const msg = sayOnce('auth', [
         `RANY plugin: the gateway refused the persona token, so nothing will wake this session.`,
-        `Usually one of:`,
-        `  · a model API key is stored on the persona — that moves its brain to the server and`,
-        `    retires this connection by design. Clear the key to hand it back to Claude Code.`,
-        `  · the persona is paused or revoked, or the token was rotated after you exported it.`,
+        `Usually the persona is paused or revoked, or the token was rotated after you exported it.`,
+        `(A stored model key does NOT do this: the server then answers the persona's chats, and this`,
+        `session keeps its rooms, tasks and mentions — ADR-044, db/0490.)`,
         `Fix it in RANY → persona settings. Nothing else in the plugin is affected.`,
       ].join('\n'))
       done(msg ? WAKE : QUIET, msg)
@@ -1910,6 +1989,8 @@ function connect() {
 
     if (frame.op !== OP.Dispatch) return
     if (frame.t === 'READY') {
+      ready = true
+      logRoute('LISTENER', { pid: process.pid, dial: dials }, `ready after ${Math.round((Date.now() - dialedAt) / 1000)}s`)
       personaUserId = String(frame.d?.userId ?? '') || null
       personaName = String(frame.d?.persona?.displayName ?? '').trim() || null
       // Authenticated and listening → this checkout is genuinely handling its boards. Declared here
@@ -1928,11 +2009,15 @@ function connect() {
   })
 
   // A dropped socket is not news. Reconnect quietly; the Stop hook would respawn us anyway.
-  socket.addEventListener('close', () => {
+  mine.addEventListener('close', (ev) => {
+    if (mine !== socket) return // the watchdog already moved on from this one
+    logRoute('LISTENER', { pid: process.pid, code: ev?.code ?? null }, 'socket closed — retrying in 3s')
     if (heartbeat) clearInterval(heartbeat)
-    setTimeout(connect, 3000)
+    ready = false
+    dialedAt = Date.now() + 3000 // the retry's own clock starts when it dials
+    setTimeout(() => { if (mine === socket) connect() }, 3000)
   })
-  socket.addEventListener('error', () => { /* 'close' follows and owns the retry */ })
+  mine.addEventListener('error', () => { /* 'close' follows and owns the retry */ })
 }
 
 connect()
