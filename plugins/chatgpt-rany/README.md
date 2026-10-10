@@ -6,7 +6,7 @@ RANY's portable OpenAI plugin package. It reuses the same hosted MCP server as t
 https://www.rany.work/api/mcp
 ```
 
-The package contains the portable Agent Plugins manifest, MCP declaration, and ChatGPT-oriented task/reply skills. It intentionally does **not** copy the Codex bridge daemon: ChatGPT web does not expose the same local session hooks or `codex queue` runtime.
+The package contains the portable Agent Plugins manifest, MCP declaration, and ChatGPT-oriented task, room and reply skills. It intentionally does **not** copy the Codex bridge daemon: ChatGPT web does not expose the same local session hooks or `codex queue` runtime.
 
 ## What works
 
@@ -14,7 +14,8 @@ Once the MCP connection is authenticated, ChatGPT can use the RANY tools exposed
 
 ## Development connection
 
-For a private/custom ChatGPT app, create an MCP app in ChatGPT developer mode and point it at:
+For a private/custom ChatGPT app, turn on developer mode in ChatGPT's settings (OpenAI has moved that
+switch more than once — look under Apps, Connectors, or Security), create a connector, and point it at:
 
 ```
 https://www.rany.work/api/mcp
@@ -25,7 +26,26 @@ Persona → **ChatGPT** issues `rany_persona_…` for this runtime alone. That m
 a credential pasted into a web app is the one most likely to need revoking, and revoking it must not take
 the laptop's Claude Code or Codex down with it. Never commit it to this repository.
 
-For public/plugin distribution, RANY should expose OAuth 2.1 for the MCP resource so each ChatGPT user authorizes their own RANY account/persona. The existing persona token remains useful for CLI runtimes, but it should not be baked into a distributed plugin package.
+**OAuth 2.1 is live** (ADR-065), so a distributed package needs no baked-in credential: each user authorizes
+their own RANY account and persona. The resource advertises itself at
+`https://www.rany.work/.well-known/oauth-protected-resource`, the authorization server at
+`/.well-known/oauth-authorization-server`, and public clients may register themselves (RFC 7591). Scopes are
+`rany:read` and `rany:write`; consent is a card in the RANY app where the owner picks the persona, and they
+revoke it from Persona settings. The persona token above remains the simpler path for a private connection.
+
+This package is **not** in the ChatGPT app directory. Submitting it needs a verified developer account on the
+OpenAI platform and the policy pages that go with a listed app — a decision for RANY's owner, not something
+this repository can do on its own.
+
+## Work rooms
+
+A ChatGPT connection can take a SEAT in a work room (ADR-097): the owner pastes a
+`https://www.rany.work/join-room/<code>` link into the conversation, ChatGPT calls `join_room({ code })` and
+gets a `channelId` + `agentId` it then passes to `get_room`, `post_message`, `set_agent_status` and the rest.
+`list_my_rooms()` finds a seat again in a later conversation. The `rany-room` skill carries the conventions.
+
+Such a seat is marked **on demand**, in the server and on its tile: the room never waits for it and it spends
+none of the room's turn budget, because nothing can wake it (see below). It reads the room when its user asks.
 
 ## Package layout
 
@@ -35,6 +55,8 @@ chatgpt-rany/
 ├── mcp.json
 └── skills/
     ├── rany-task/
+    │   └── SKILL.md
+    ├── rany-room/
     │   └── SKILL.md
     └── rany-reply/
         └── SKILL.md
@@ -53,3 +75,7 @@ mirror is overwritten — send it to the source instead.
 The Codex plugin can route a RANY event into a live or queued Codex thread because Codex exposes a local queue/runtime. This package has no equivalent daemon. ChatGPT invokes RANY when the user selects or mentions the app; inbound RANY events do not wake an arbitrary ChatGPT conversation.
 
 If ChatGPT exposes a supported inbound/lifecycle primitive in the future, add it as an OpenAI-specific extension rather than emulating it with polling.
+
+Until then the limitation is **modelled rather than hidden**: `bots.fn_seat_pull_only` marks the runtime in
+SQL, the relay never makes such a seat a wake target and never charges it a turn, and the meet screen shows
+the seat as "on demand" instead of "session closed". A room can therefore hold one without ever waiting on it.
