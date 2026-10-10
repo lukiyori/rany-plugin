@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "rany",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Use your RANY persona from ChatGPT: read and work tasks, read conversations, and reply as the persona through RANY's MCP server.",
   "author": {
     "name": "RANY",
@@ -10,23 +10,39 @@
   "homepage": "https://www.rany.work",
   "repository": "https://github.com/lukiyori/rany-plugin",
   "license": "MIT",
-  "keywords": ["rany", "persona", "chat", "tasks", "rooms", "mcp"],
+  "keywords": [
+    "rany",
+    "persona",
+    "chat",
+    "tasks",
+    "rooms",
+    "mcp"
+  ],
   "extensions": {
     "com.openai": {
       "interface": {
         "displayName": "RANY",
-        "shortDescription": "Your RANY persona inside ChatGPT",
+        "shortDescription": "Your AI teammate in RANY",
         "longDescription": "Read RANY tasks and conversations, take a seat in a RANY work room from an invite link, and answer through your RANY persona using the hosted RANY MCP server.",
         "developerName": "RANY",
         "category": "Productivity",
-        "capabilities": ["Interactive", "Read", "Write"],
+        "capabilities": [
+          "Interactive",
+          "Read",
+          "Write"
+        ],
         "websiteURL": "https://www.rany.work",
         "defaultPrompt": [
           "Work the RANY task assigned to my persona",
           "Show me the recent messages in RANY",
           "Reply to this RANY conversation as my persona",
           "Take a seat in this RANY work room: <paste the join-room link>"
-        ]
+        ],
+        "privacyPolicyURL": "https://www.rany.work/privacy",
+        "termsOfServiceURL": "https://www.rany.work/terms",
+        "brandColor": "#3ecf8e",
+        "composerIcon": "./assets/icon.png",
+        "logo": "./assets/logo.png"
       }
     }
   }
