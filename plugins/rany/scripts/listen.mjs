@@ -1429,6 +1429,34 @@ function crowdLines(d, seat) {
   return out
 }
 
+/**
+ * The chain of command this seat sits in (ADR-098). A team is not decoration: a lead is woken on behalf of
+ * its people and is the one who hands the work out, and a member answers to its lead. The relay puts the
+ * team on every target (db/0512), so a seat that is in one always knows whom it can name and whom it
+ * reports to; a seat in no team gets nothing extra.
+ */
+function teamLines(seat) {
+  const team = seat?.team
+  if (!team || !team.name) return []
+  const others = (Array.isArray(team.members) ? team.members : [])
+    .filter((m) => m && String(m.agentId) !== String(seat.agentId))
+  const list = others.map((m) => `"${m.name ?? m.agentId}" (<@agent:${m.agentId}>)`).join(', ')
+  if (team.lead) {
+    return [
+      `You LEAD the team "${team.name}"${others.length ? `: ${list}` : ' — nobody else is in it yet'}.`,
+      ...(others.length ? [
+        `A message to the team reaches YOU, not them: break the job up and hand each part out by NAMING the`,
+        `colleague (<@agent:ID>) in ONE post, then report the result yourself. Do the parts nobody else can.`] : []),
+    ]
+  }
+  return [
+    `You are in the team "${team.name}"${team.leadName ? `, led by "${team.leadName}"` : ', which has no lead right now'}`
+      + `${others.length ? ` with ${list}` : ''}.`,
+    ...(team.leadId && String(team.leadId) !== String(seat.agentId)
+      ? [`Report what you finish to <@agent:${team.leadId}> — it answers for the team.`] : []),
+  ]
+}
+
 function roomPrompt(type, d, seat) {
   const identityChanged = type === 'PERSONA_ROOM_UPDATED'
     && (d.change === 'identity_set' || d.change === 'style_set' || d.change === 'approval_set')
@@ -1507,6 +1535,7 @@ function roomPrompt(type, d, seat) {
         `(and, for anything destructive/production/costly, still through request_permission).`,
         ``] : []),
       who,
+      ...teamLines(seat),
       ...roomRoutingContextLines(d, seat.agentId),
       ...(d.routing?.inferred
         ? [`The room router selected you from the conversation and responsibilities; no explicit name mention was required.`,
