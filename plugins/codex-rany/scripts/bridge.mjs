@@ -26,6 +26,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
 import { roomRoutingContextLines } from './room-routing-context.mjs'
+import { loadRepoRules, repoRulesLines } from './repo-rules.mjs'
 
 /** Shared with the Claude Code plugin ON PURPOSE: a board belongs to a repository, not to whichever
  *  agent you happen to be running. Bind once, and both bridges route it the same way. */
@@ -285,6 +286,21 @@ function identityLines(agentId, { full = false, sessionKey } = {}) {
     `--- identity brief ---`, i.instructions, `--- end of identity brief ---`,
     ...approval,
   ]
+}
+
+/** REPO RULES (ADR-099): what the checkout's `.rany/` says for this seat — in full the first time this thread
+ *  sees this revision, then one reminder line. Codex has no pre-tool hook here, so the agent keeps to them itself. */
+function repoRulesFor(agentId, dir, { full = false, sessionKey } = {}) {
+  const rules = dir ? loadRepoRules(dir, loadSeatIdentities()[String(agentId)]?.slug ?? null) : null
+  if (!rules) return []
+  const key = `${sessionKey ?? IDENTITY_SESSION_KEY}:rules:${agentId}`
+  const shown = identityShownMap()
+  const first = full || shown[key] !== rules.rev
+  if (first) {
+    shown[key] = rules.rev
+    try { mkdirSync(dirname(identityShownFile), { recursive: true }); writeFileSync(identityShownFile, JSON.stringify(shown)) } catch { /* shown again next time */ }
+  }
+  return repoRulesLines(rules, { full: first, enforced: false })
 }
 
 /** The seat's APPROVAL setting (ADR-083): in full the first time this session sees this revision; afterwards one
@@ -803,6 +819,7 @@ async function joinSeat({ code, dir, threadId }) {
     `Next: get_room({channelId:"${seat.channelId}"}) and read the brief documents it lists; then tell the room in ONE`,
     `line which part of the job you take — post_message({channelId:"${seat.channelId}", agentId:"${seat.agentId}", content:"…"}).`,
     ...identityLines(seat.agentId, { full: true, sessionKey: threadId ?? dir }),
+    ...repoRulesFor(seat.agentId, dir, { full: true, sessionKey: threadId ?? dir }),
   ].join('\n')
 }
 
@@ -856,6 +873,7 @@ async function reattachSeat({ agentId, h, dir, threadId }) {
     `Room messages for that seat are queued into this thread until it closes. Nothing to do now; when the room`,
     `speaks to you, get_room({channelId:"${seat.channelId}"}) catches you up and post_message({channelId:"${seat.channelId}", agentId:"${seat.agentId}", …}) answers.`,
     ...identityLines(seat.agentId, { full: true, sessionKey: threadId ?? dir }),
+    ...repoRulesFor(seat.agentId, dir, { full: true, sessionKey: threadId ?? dir }),
   ].join('\n')
 }
 
@@ -1508,6 +1526,7 @@ async function route(type, d) {
     }
     // The seat's identity (ADR-055): fetched again when the room says it changed, else when the copy is old.
     d.identitySessionKey = pick.owner.threadId ?? pick.owner.sessionId ?? pick.owner.dir
+    d.rulesDir = pick.owner.dir
     await ensureSeatIdentity(pick.s.agentId,
       type === 'PERSONA_ROOM_UPDATED' && (d.change === 'identity_set' || d.change === 'approval_set')
         && String(d.agentId ?? '') === String(pick.s.agentId))
@@ -1674,6 +1693,7 @@ function roomPrompt(type, d, seat) {
   const who = [
     `You are "${seat.name}" (agentId ${seat.agentId}) in the work room at channel ${d.channelId}, working from THIS repository.`,
     ...identityLines(seat.agentId, { full: identityChanged, sessionKey: d.identitySessionKey }),
+    ...repoRulesFor(seat.agentId, d.rulesDir, { sessionKey: d.identitySessionKey }),
   ].join('\n')
   const tools = [
     `Your room tools — always pass channelId:"${d.channelId}" and agentId:"${seat.agentId}":`,

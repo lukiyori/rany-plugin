@@ -99,6 +99,23 @@ is the diagnosis: **a wake that no log line explains came from a stale listener*
 that session stops it. Deleting the old version directories under
 `~/.claude/plugins/cache/rany-plugins/rany/` also stops one immediately — the spawn simply fails.
 
+## Repo rules: `.rany/` (ADR-099)
+
+A repository can carry house rules for every agent seated from it. Commit a `.rany/` folder at the checkout root:
+
+- `RANY.md` — the rules in words. Handed to a seat in full on join / re-attach and whenever it changes, then a
+  one-line reminder per wake.
+- `rany.json` — what the plugin enforces through a `PreToolUse` hook (`listen.mjs --rules-guard`):
+  `deny.paths` / `deny.commands` are refused outright; `approval.paths` / `approval.commands` are refused until
+  the room approves a `request_permission`, then open for `approval.windowMinutes` (default 15). `roles.<slug>`
+  adds rules for one identity. `applyTo: "all"` also guards sessions without a seat (ask-first becomes this
+  terminal's permission prompt).
+- `roles/<slug>.md` — extra rules for the seat carrying that identity.
+
+Rules only narrow; `.rany/**` itself is always ask-first. Schema and matching rules:
+`docs/architecture/22-work-rooms.md#repo-rules-adr-099`. The matcher lives in `scripts/repo-rules.mjs`, a
+byte-identical copy in all four plugins.
+
 ## The limit, up front
 
 **Nothing happens while no session is open.** Claude Code has no inbound webhook — every hook

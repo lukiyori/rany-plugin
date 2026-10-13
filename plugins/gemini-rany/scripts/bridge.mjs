@@ -27,6 +27,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import { spawn, spawnSync } from 'node:child_process'
 import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
+import { loadRepoRules, repoRulesLines } from './repo-rules.mjs'
 
 /** Shared with the Claude Code and Codex plugins ON PURPOSE: a board belongs to a repository, not to
  *  whichever agent you happen to be running. Each plugin reads only its own entries. */
@@ -306,6 +307,21 @@ async function ensureSeatIdentity(agentId, force = false) {
 }
 
 const identityShownFile = join(HOME, 'gemini-identity-shown.json')
+/** REPO RULES (ADR-099): what the checkout's `.rany/` says for this seat — in full the first time this session
+ *  sees this revision, then one reminder line. This runtime has no pre-tool hook, so the agent keeps to them itself. */
+function repoRulesFor(agentId, dir, { full = false, sessionKey } = {}) {
+  const rules = dir ? loadRepoRules(dir, loadSeatIdentities()[String(agentId)]?.slug ?? null) : null
+  if (!rules) return []
+  const key = `${sessionKey ?? IDENTITY_SESSION_KEY}:rules:${agentId}`
+  const shown = identityShownMap()
+  const first = full || shown[key] !== rules.rev
+  if (first) {
+    shown[key] = rules.rev
+    try { mkdirSync(dirname(identityShownFile), { recursive: true }); writeFileSync(identityShownFile, JSON.stringify(shown)) } catch { /* shown again next time */ }
+  }
+  return repoRulesLines(rules, { full: first, enforced: false })
+}
+
 function identityShownMap() {
   try { return JSON.parse(readFileSync(identityShownFile, 'utf8')) } catch { return {} }
 }
@@ -450,7 +466,7 @@ function listenerInstruction(sessionId) {
 function syncStable() {
   try {
     mkdirSync(STABLE, { recursive: true })
-    for (const f of ['bridge.mjs', 'mcp-proxy.mjs']) {
+    for (const f of ['bridge.mjs', 'mcp-proxy.mjs', 'repo-rules.mjs']) {
       const src = join(here, f)
       if (!existsSync(src) || samePath(src, join(STABLE, f))) continue
       const next = readFileSync(src)
@@ -594,6 +610,7 @@ async function joinSeat({ code, dir, sessionId }) {
       `Next: get_room({channelId:"${seat.channelId}"}) and read the brief documents it lists; then tell the room in ONE`,
       `line which part of the job you take — post_message({channelId:"${seat.channelId}", agentId:"${seat.agentId}", content:"…"}).`,
       ...identityLines(seat.agentId, { full: true, sessionKey: sessionId ?? dir }),
+      ...repoRulesFor(seat.agentId, dir, { full: true, sessionKey: sessionId ?? dir }),
     ].join('\n'),
   }
 }
@@ -631,6 +648,7 @@ async function reattachSeat({ agentId, h, dir, sessionId }) {
       + `${seat.state === 'paused' ? ' — the owner has it PAUSED, so wait to be resumed' : ''}.`,
     `When the room speaks to you, get_room({channelId:"${seat.channelId}"}) catches you up and post_message({channelId:"${seat.channelId}", agentId:"${seat.agentId}", …}) answers.`,
     ...identityLines(seat.agentId, { full: true, sessionKey: sessionId ?? dir }),
+    ...repoRulesFor(seat.agentId, dir, { full: true, sessionKey: sessionId ?? dir }),
   ].join('\n')
 }
 
@@ -1048,6 +1066,7 @@ async function route(type, d) {
         : type === 'PERSONA_ROOM_ANSWER' ? 'RANY: your question was answered' : 'RANY: work room update'
     // The seat's identity (ADR-055): fetched again when the room says it changed, else when the copy is old.
     d.identitySessionKey = pick.owner.threadId ?? pick.owner.sessionId ?? pick.owner.dir
+    d.rulesDir = pick.owner.dir
     await ensureSeatIdentity(pick.s.agentId,
       type === 'PERSONA_ROOM_UPDATED' && d.change === 'identity_set' && String(d.agentId ?? '') === String(pick.s.agentId))
     return { ...pick.owner, title, text: roomPrompt(type, d, pick.s) }
@@ -1175,6 +1194,7 @@ function roomPrompt(type, d, seat) {
   const who = [
     `You are "${seat.name}" (agentId ${seat.agentId}) in the work room at channel ${d.channelId}, working from THIS repository.`,
     ...identityLines(seat.agentId, { full: identityChanged, sessionKey: d.identitySessionKey }),
+    ...repoRulesFor(seat.agentId, d.rulesDir, { sessionKey: d.identitySessionKey }),
   ].join('\n')
   const tools = [
     `Your room tools — always pass channelId:"${d.channelId}" and agentId:"${seat.agentId}":`,

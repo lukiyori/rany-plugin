@@ -27,6 +27,7 @@ import { createHash } from 'node:crypto'
 import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
 import { roomRoutingContextLines } from './room-routing-context.mjs'
+import { loadRepoRules, repoRulesLines, checkToolCall, refusalReason } from './repo-rules.mjs'
 
 const WAKE = 2   // exit code asyncRewake watches for
 const QUIET = 0  // "nothing to say" — the session is not disturbed
@@ -457,6 +458,7 @@ async function reattachSeat(agentId, h, sid = sessionId) {
     `It is woken for that room until this session closes. Nothing to do now; when the room speaks to you,`,
     `get_room({channelId:"${seat.channelId}"}) catches you up and post_message({channelId:"${seat.channelId}", agentId:"${seat.agentId}", …}) answers.`,
     ...identityLines(seat.agentId, { full: true }),
+    ...repoRulesFor(seat.agentId, { full: true }),
     // The join line scrolls away, and the owner then cannot tell which window sits in which room.
     // /rany-status puts the room and this seat's name in the status line, where they stay.
     ...(statusLineWired() ? [] : ['Tell the owner in ONE line that /rany-status keeps this room and your seat name in the status line.']),
@@ -683,6 +685,34 @@ function approvalLines(agentId, entry, full) {
   shown[key] = ap.rev
   try { mkdirSync(dirname(identityShownFile), { recursive: true }); writeFileSync(identityShownFile, JSON.stringify(shown)) } catch { /* shown again next time */ }
   return [`YOUR SEAT'S APPROVAL SETTING (your owner's): ${ap.instructions}`]
+}
+
+/** REPO RULES (ADR-099): what the checkout's `.rany/` says for this seat — the whole text the first time this
+ *  session sees this revision, then one reminder line. The seat's identity picks its `roles/<slug>.md`. */
+function repoRulesFor(agentId, { full = false } = {}) {
+  const rules = loadRepoRules(projectDir, loadSeatIdentities()[String(agentId)]?.slug ?? null)
+  if (!rules) return []
+  const key = `${IDENTITY_SESSION_KEY}:rules:${agentId}`
+  const shown = identityShownMap()
+  const first = full || shown[key] !== rules.rev
+  if (first) {
+    shown[key] = rules.rev
+    try { mkdirSync(dirname(identityShownFile), { recursive: true }); writeFileSync(identityShownFile, JSON.stringify(shown)) } catch { /* shown again next time */ }
+  }
+  return repoRulesLines(rules, { full: first, enforced: true })
+}
+
+/** When each seat's last permission request was APPROVED in its room — an approval opens the repo rules'
+ *  ask-first entries for their window (ADR-099). Kept in a file because the guard runs in its own process. */
+const approvalsFile = join(homedir(), '.rany-plugin', 'room-approvals.json')
+function lastApproval(agentId) {
+  try { return Number(JSON.parse(readFileSync(approvalsFile, 'utf8'))[String(agentId)]) || 0 } catch { return 0 }
+}
+function noteApproval(agentId) {
+  let all = {}
+  try { all = JSON.parse(readFileSync(approvalsFile, 'utf8')) } catch { /* first one */ }
+  all[String(agentId)] = Date.now()
+  try { mkdirSync(dirname(approvalsFile), { recursive: true }); writeFileSync(approvalsFile, JSON.stringify(all)) } catch { /* the guard asks again */ }
 }
 
 /**
@@ -1024,6 +1054,7 @@ async function joinSeat(code, sid = sessionId) {
     `Next: get_room({channelId:"${seat.channelId}"}) and read the brief documents it lists; then tell the room in ONE`,
     `line which part of the job you take — post_message({channelId:"${seat.channelId}", agentId:"${seat.agentId}", content:"…"}).`,
     ...identityLines(seat.agentId, { full: true }),
+    ...repoRulesFor(seat.agentId, { full: true }),
     // The join line scrolls away, and the owner then cannot tell which window sits in which room.
     // /rany-status puts the room and this seat's name in the status line, where they stay.
     ...(statusLineWired() ? [] : ['Tell the owner in ONE line that /rany-status keeps this room and your seat name in the status line.']),
@@ -1136,6 +1167,36 @@ if (process.argv.includes('--ask-guard')) {
           + `wakes you. For a risky action use request_permission instead.`,
       },
     }) + '\n')
+  }
+  process.exit(QUIET)
+}
+
+/** `--rules-guard` (PreToolUse on edits and shell commands): the checkout's `.rany/rany.json` enforced (ADR-099).
+ *  A seated session gets a refusal that says why — a deny rule is final, an ask-first rule points at
+ *  request_permission and opens once the room approves. A session without a seat is only guarded when the
+ *  rules say `applyTo: "all"`, and then an ask-first rule is this terminal's own permission prompt. */
+if (process.argv.includes('--rules-guard')) {
+  const hook = await readHookInput()
+  const held = Object.entries(loadBindings())
+    .find(([, e]) => e && typeof e === 'object' && e.room && e.sessionId === sessionId)
+  const cwd = typeof hook.cwd === 'string' && hook.cwd ? hook.cwd : projectDir
+  const rules = loadRepoRules(cwd, held ? loadSeatIdentities()[held[0]]?.slug ?? null : null)
+  if (rules && (held || rules.policy.applyTo === 'all')) {
+    const seat = held ? { agentId: held[0], channelId: held[1].room.channelId } : null
+    const hit = checkToolCall(rules, { ...hook, cwd }, { approvedAt: seat ? lastApproval(seat.agentId) : 0 })
+    if (hit) {
+      process.stdout.write(JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: hit.kind === 'deny' || seat ? 'deny' : 'ask',
+          permissionDecisionReason: refusalReason(rules, hit, seat),
+        },
+      }) + '\n')
+      // The owner watching the room sees the refusal on the seat's terminal line, not only the agent.
+      if (seat && config.token)
+        await postJson(`/personas/@self/rooms/${seat.agentId}/activity`,
+          { lines: [{ kind: 'tool', text: `Blocked by .rany/ (${hit.kind === 'deny' ? 'never' : 'ask first'}: ${hit.rule}) — ${hit.what}`.slice(0, 260) }] }, 2500)
+    }
   }
   process.exit(QUIET)
 }
@@ -1464,6 +1525,7 @@ function roomPrompt(type, d, seat) {
   const who = [
     `You are "${seat.name}" (agentId ${seat.agentId}) in the work room at channel ${d.channelId}, working from THIS repository.`,
     ...identityLines(seat.agentId, { full: identityChanged }),
+    ...repoRulesFor(seat.agentId),
   ].join('\n')
   const tools = [
     `Your room tools — always pass channelId:"${d.channelId}" and agentId:"${seat.agentId}":`,
@@ -1855,6 +1917,7 @@ async function classify(type, d) {
       }
     }
     logRoute(type, { channelId: d.channelId, agentId: seat.agentId, boardId: seat.boardId }, 'wake')
+    if (type === 'PERSONA_ROOM_DECISION' && d.approved) noteApproval(seat.agentId)
     // The seat's identity (ADR-055): fetched again when the room says it changed, else when the copy is old.
     await ensureSeatIdentity(seat.agentId,
       type === 'PERSONA_ROOM_UPDATED' && (d.change === 'identity_set' || d.change === 'style_set' || d.change === 'approval_set')
