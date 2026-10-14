@@ -120,6 +120,26 @@ function dropThreadBindings(threadId) {
   for (const [id, e] of Object.entries(boards))
     if (typeof e === 'object' && String(e?.threadId) === String(threadId)) { delete boards[id]; changed = true }
   if (changed) try { writeFileSync(bindFile, JSON.stringify({ boards }, null, 2)) } catch { /* best effort */ }
+  closeThreadSessions(threadId)
+}
+
+/** The thread is CLOSED: mark it so in the seat history, so the launcher may resume that rollout at once
+ *  rather than waiting for its `seen` stamp to go stale (all a killed thread leaves behind). */
+function closeThreadSessions(threadId) {
+  const repos = loadSeatHistory()
+  let changed = false
+  for (const seats of Object.values(repos))
+    for (const [agentId, seat] of Object.entries(seats)) {
+      const entry = (seat?.sessions ?? []).find((s) => String(s?.id ?? '') === String(threadId))
+      if (!entry) continue
+      entry.closedAt = new Date().toISOString()
+      delete entry.seen
+      changed = true
+      // The room is told too (ADR-101), so the seat's tile offers to continue this thread rather than
+      // showing a window that is already up. Best-effort: a closing thread waits for nothing.
+      void postJson(`/personas/@self/rooms/${agentId}/session`, { session: threadId, open: false }, 2000)
+    }
+  if (changed) saveSeatHistory(repos)
 }
 
 /** A durable, per-repository record of every board ever bound here, WITH its human names. Unlike a
@@ -161,15 +181,29 @@ function saveSeatHistory(repos) {
   try { mkdirSync(HOME, { recursive: true }); writeFileSync(seatHistoryFile, JSON.stringify({ repos }, null, 2)) }
   catch { /* best effort — the binding itself still saved */ }
 }
-function recordSeat(dir, agentId, seat) {
+/** How many past local threads a seat remembers — same cap as the Claude plugin's, same file. */
+const SEAT_SESSIONS_KEPT = 5
+
+function recordSeat(dir, agentId, seat, threadId = null) {
   const repos = loadSeatHistory()
   const seats = repos[norm(dir)] ?? {}
+  const was = seats[String(agentId)]
   seats[String(agentId)] = {
     channelId: String(seat.channelId), guildId: seat.guildId ? String(seat.guildId) : null,
     name: seat.name ?? null, agent: 'codex', dir, lastJoined: new Date().toISOString(),
+    // The local THREAD this seat is being worked in, so `codex resume <thread>` finds the conversation
+    // back after the window is closed. A binding dies with the thread and takes its id with it; this
+    // file does not. Newest first, no duplicates — read by /rany-resume in either plugin.
+    sessions: rememberSession(was?.sessions, threadId),
   }
   repos[norm(dir)] = seats
   saveSeatHistory(repos)
+}
+
+function rememberSession(list, id) {
+  const kept = (Array.isArray(list) ? list : []).filter((s) => s?.id && String(s.id) !== String(id ?? ''))
+  if (!id) return kept.slice(0, SEAT_SESSIONS_KEPT)
+  return [{ id: String(id), ts: new Date().toISOString() }, ...kept].slice(0, SEAT_SESSIONS_KEPT)
 }
 function forgetSeat(dir, agentId) {
   const repos = loadSeatHistory()
@@ -701,6 +735,37 @@ function boardsForSession(bindings, s) {
   }).map(([id]) => id)
 }
 
+/**
+ * Keep the thread id of every seat a live thread holds in the seat history, so the conversation can be
+ * found again with `codex resume <thread>` after the window is gone. A seat joined before the thread had
+ * an id (Codex only reveals it once a prompt was typed) gets it on the next sweep; nothing is written
+ * when the newest remembered id is already this thread's.
+ */
+function noteSeatSessions(bindings, s) {
+  if (!s?.threadId) return
+  const repos = loadSeatHistory()
+  const seats = repos[norm(s.dir)]
+  if (!seats) return
+  let changed = false
+  for (const [id, e] of Object.entries(bindings)) {
+    if (!e || typeof e !== 'object' || !e.room) continue          // a board, or another agent's seat
+    if (String(e.threadId ?? '') !== String(s.threadId)) continue // not this thread's seat
+    const seat = seats[id]
+    if (!seat) continue
+    if (String(seat.sessions?.[0]?.id ?? '') !== String(s.threadId)) {
+      seat.sessions = rememberSession(seat.sessions, s.threadId)
+      // Codex only reveals a thread id once a prompt was typed, so a seat often learns it after the join:
+      // tell the room as well, or its tile would offer an older thread. Best-effort, once per thread.
+      void postJson(`/personas/@self/rooms/${id}/session`, { session: s.threadId, open: true }, 3000)
+    }
+    // `seen` says the thread is still OPEN: nothing may resume a rollout a live thread is writing.
+    seat.sessions[0].seen = new Date().toISOString()
+    delete seat.sessions[0].closedAt
+    changed = true
+  }
+  if (changed) saveSeatHistory(repos)
+}
+
 /** Declare each live thread's boards under a per-thread key (ADR-038), so closing one thread withdraws
  *  only its own claims; threads that went quiet declare nothing and expire server-side. */
 async function refreshClaims() {
@@ -710,6 +775,7 @@ async function refreshClaims() {
     const key = claimKey(s)
     known.add(key)
     await declareBoards(key, boardsForSession(bindings, s), 5000, { ref: s.threadId })
+    noteSeatSessions(bindings, s)
   }
   let previous = []
   try { previous = JSON.parse(readFileSync(stateFile, 'utf8')).projects ?? [] } catch { /* first run */ }
@@ -790,7 +856,7 @@ async function joinSeat({ code, dir, threadId }) {
   if (held && threadId && String(held[1].threadId) === String(threadId))
     return `RANY: this thread already sits in that work room (channel ${held[1].room.channelId}) as "${held[1].room.name}" — agentId ${held[0]}.`
   const res = await postJson('/personas/@self/rooms/join',
-    { code, name: `${basename(dir)} · Codex`.slice(0, 40), agent: 'codex' }, 6000)
+    { code, name: `${basename(dir)} · Codex`.slice(0, 40), agent: 'codex', session: threadId ?? undefined }, 6000)
   if (!res?.ok)
     return `RANY: could not join the work room — ${JOIN_REFUSALS[res?.body?.error] ?? `the server refused (${res?.status ?? 'offline'})`}.`
   const seat = res.body
@@ -804,7 +870,7 @@ async function joinSeat({ code, dir, threadId }) {
   } catch (e) {
     return `RANY: joined the work room, but could not save the seat binding (${e?.message ?? e}).`
   }
-  recordSeat(dir, seat.agentId, seat) // so the next thread in this repo takes the seat back by itself (db/0365)
+  recordSeat(dir, seat.agentId, seat, threadId ?? null) // so the next thread in this repo takes the seat back by itself (db/0365)
   saveSeatIdentity(seat.agentId, seat.identity ?? null, seat.approval ?? null) // the seat's role brief (ADR-055)
   noteSession(dir, threadId ?? undefined)
   const s = { dir, threadId: threadId ?? undefined }
@@ -844,7 +910,7 @@ function heldByAnotherLiveThread(id, threadId) {
  * server no longer has is forgotten, so the next thread is not offered it again.
  */
 async function reattachSeat({ agentId, h, dir, threadId }) {
-  const res = await postJson(`/personas/@self/rooms/${agentId}/reattach`, { agent: 'codex' }, 6000)
+  const res = await postJson(`/personas/@self/rooms/${agentId}/reattach`, { agent: 'codex', session: threadId ?? undefined }, 6000)
   if (!res?.ok) {
     if (res?.body?.error === 'no_agent' || res?.body?.error === 'no_room') forgetSeat(dir, agentId)
     return `RANY: could not take back seat "${h?.name ?? agentId}" in work room ${h?.channelId ?? '?'} — `
@@ -862,7 +928,7 @@ async function reattachSeat({ agentId, h, dir, threadId }) {
   } catch (e) {
     return `RANY: took back the seat, but could not save the binding (${e?.message ?? e}).`
   }
-  recordSeat(dir, seat.agentId, seat)
+  recordSeat(dir, seat.agentId, seat, threadId ?? null)
   saveSeatIdentity(seat.agentId, seat.identity ?? null, seat.approval ?? null) // the seat's role brief (ADR-055)
   noteSession(dir, threadId ?? undefined)
   const s = { dir, threadId: threadId ?? undefined }
@@ -924,6 +990,30 @@ if (has('--rejoin')) {
     const lines = await reattachRememberedSeats({ dir, threadId, deliberate: true })
     process.stdout.write((lines.length ? lines.join('\n') : 'RANY: this repo holds no remembered work-room seat. Paste an invite link to join a room.') + '\n')
   }
+  process.exit(0)
+}
+
+/**
+ * `--resume`: the local conversations this repository's seats were worked in, with the command that
+ * continues each one — Codex threads and Claude sessions alike, because both plugins keep them in the
+ * one seat-history file. Nothing is launched: a running thread cannot turn into another one, so the
+ * owner picks the window to come back to.
+ */
+if (has('--resume')) {
+  const dir = process.cwd()
+  const out = []
+  for (const [agentId, s] of Object.entries(loadSeatHistory()[norm(dir)] ?? {})) {
+    const agent = s?.agent === 'codex' ? 'codex' : 'claude'
+    const sessions = (Array.isArray(s?.sessions) ? s.sessions : []).filter((x) => x?.id)
+    const where = `${s?.name ?? agentId}${s?.roomName ? ` · ${s.roomName}` : ''} (${agent}, seat ${agentId})`
+    if (!sessions.length) { out.push(`- ${where}: no local session remembered yet`); continue }
+    out.push(`- ${where}:`)
+    for (const x of sessions)
+      out.push(`    ${agent === 'codex' ? `codex resume ${x.id}` : `claude --resume ${x.id}`}   # ${x.ts ?? '?'}`)
+  }
+  process.stdout.write((out.length
+    ? [`RANY: local conversations for ${dir} — run one in a NEW terminal:`, ...out].join('\n')
+    : `RANY: no seat and no local conversation remembered for ${dir}.`) + '\n')
   process.exit(0)
 }
 
@@ -1660,31 +1750,46 @@ function crowdLines(d, seat) {
 }
 
 /**
- * The chain of command this seat sits in (ADR-098). A team is not decoration: a lead is woken on behalf of
- * its people and is the one who hands the work out, and a member answers to its lead. The relay puts the
- * team on every target (db/0512), so a seat that is in one always knows whom it can name and whom it
- * reports to; a seat in no team gets nothing extra.
+ * The chain of command this seat sits in (ADR-098, as the chart of ADR-102). A team is not decoration: the
+ * team's ORG CHART is who hands work to whom. A `<@team:ID>` mention wakes the top of that chart, and each
+ * level passes the parts down by naming the people under it — so a seat is told its own level only: whom it
+ * reports to (`chiefId`) and who reports to IT (`reports`), not the whole tree. The relay puts the team on
+ * every target (db/0512, db/0517); a seat in no team gets nothing extra. An API that has not deployed db/0517
+ * yet sends neither `head` nor `reports`, and the lead/member wording below is what it falls back to.
  */
 function teamLines(seat) {
   const team = seat?.team
   if (!team || !team.name) return []
-  const others = (Array.isArray(team.members) ? team.members : [])
+  const mine = (list) => (Array.isArray(list) ? list : [])
     .filter((m) => m && String(m.agentId) !== String(seat.agentId))
-  const list = others.map((m) => `"${m.name ?? m.agentId}" (<@agent:${m.agentId}>)`).join(', ')
-  if (team.lead) {
-    return [
-      `You LEAD the team "${team.name}"${others.length ? `: ${list}` : ' — nobody else is in it yet'}.`,
-      ...(others.length ? [
-        `A message to the team reaches YOU, not them: break the job up and hand each part out by NAMING the`,
-        `colleague (<@agent:ID>) in ONE post, then report the result yourself. Do the parts nobody else can.`] : []),
-    ]
-  }
-  return [
-    `You are in the team "${team.name}"${team.leadName ? `, led by "${team.leadName}"` : ', which has no lead right now'}`
-      + `${others.length ? ` with ${list}` : ''}.`,
-    ...(team.leadId && String(team.leadId) !== String(seat.agentId)
-      ? [`Report what you finish to <@agent:${team.leadId}> — it answers for the team.`] : []),
+  const label = (m) => `"${m.name ?? m.agentId}"${m.role ? ` (${m.role})` : ''} (<@agent:${m.agentId}>)`
+  const listOf = (xs) => xs.map(label).join(', ')
+  const others = mine(team.members)
+  const reports = mine(team.reports)
+  const head = team.head ?? team.lead
+  const chiefId = team.chiefId ?? (head ? null : team.leadId)
+  const chiefName = team.chiefName ?? team.leadName
+  const chief = chiefId && String(chiefId) !== String(seat.agentId) ? String(chiefId) : null
+  const out = [
+    head
+      ? `You are at the TOP of the team "${team.name}"'s chart`
+        + `${others.length ? `, which also holds ${listOf(others)}` : ' — nobody else is in it yet'}.`
+      : `You are in the team "${team.name}"`
+        + `${chief ? `, reporting to "${chiefName ?? chiefId}"` : ''}`
+        + `${others.length ? ` with ${listOf(others)}` : ''}.`,
   ]
+  if (reports.length) {
+    out.push(
+      head
+        ? `A message to the team reaches YOU, not them. Under you sit: ${listOf(reports)}.`
+        : `Under you on the chart sit: ${listOf(reports)}.`,
+      `Break the job up and hand each part out by NAMING the colleague (<@agent:ID>) in ONE post, then`,
+      `report the result yourself. Do the parts nobody else can, and do not reach past them down the chart.`)
+  } else if (head) {
+    out.push(`A message to the team reaches YOU, and nobody sits under you: the work is yours to do.`)
+  }
+  if (chief) out.push(`Report what you finish to <@agent:${chief}> — it answers for your part of the team.`)
+  return out
 }
 
 function roomPrompt(type, d, seat) {
@@ -1718,7 +1823,8 @@ function roomPrompt(type, d, seat) {
     `    so two seats of one product do not carry the same name; the owner picks one. Nothing to offer? Say`,
     `    nothing and the owner picks from RANY's catalog;`,
     `  ask_question({channelId, agentId, question, options?}) — any other question for your owner: a card in the`,
-    `    chat with your options and a free-text answer; the answer wakes you (PERSONA_ROOM_ANSWER);`,
+    `    chat with your options and a free-text answer; the answer wakes you (PERSONA_ROOM_ANSWER). Your owner`,
+    `    can authorise other people to answer a seat's cards, so the wake says whose answer it is;`,
     `  NEVER ask your owner through request_user_input (or any question tool of your own) while you sit in a room: only this terminal`,
     `    shows it and the room never sees it — a decision goes through request_permission (a card in the`,
     `    chat), a question through ask_question;`,
@@ -1777,27 +1883,37 @@ function roomPrompt(type, d, seat) {
     ].join('\n')
   }
   if (type === 'PERSONA_ROOM_ANSWER') {
+    // Who answered (ADR-103): the owner, or someone the owner put on this seat's ask list. A delegated answer
+    // decides the question it was asked, and nothing wider — it never widens what the repo rules allow.
+    const byOwner = d.byOwner !== false
+    const answerer = byOwner ? 'your owner' : `${String(d.answeredByName || 'someone your owner trusts with this seat')} (on your owner's behalf)`
     return [
-      `RANY: your owner ANSWERED your question in work room ${d.channelId}.`,
+      `RANY: ${answerer} ANSWERED your question in work room ${d.channelId}.`,
       `  You asked: ${String(d.question ?? '')}`,
       `  Answer: ${String(d.answer ?? '')}`,
       ``,
       who,
       `Carry on with that answer. If it changes your part of the job, say so in ONE room line.`,
+      ...(byOwner ? [] : [`That answer came from someone your owner authorised to answer this seat's cards; it`,
+        `settles the question, not the repo rules — anything they still forbid stays forbidden.`]),
       ...tools,
       ``,
       asPersona(),
     ].join('\n')
   }
   if (type === 'PERSONA_ROOM_DECISION') {
+    const byOwner = d.byOwner !== false
+    const decider = byOwner ? 'your owner' : `${String(d.decidedByName || 'someone your owner trusts with this seat')} (on your owner's behalf)`
     return [
-      `RANY: your owner ${d.approved ? 'APPROVED' : 'DENIED'} your permission request in work room ${d.channelId}.`,
+      `RANY: ${decider} ${d.approved ? 'APPROVED' : 'DENIED'} your permission request in work room ${d.channelId}.`,
       `  You asked: ${String(d.question ?? '')}`,
       ...(d.note ? [`  Their note: ${d.note}`] : []),
       ``,
       who,
       d.approved ? `Go ahead with exactly what was approved — nothing broader.`
         : `Do not do it. Find another way, or ask again with a narrower request.`,
+      ...(byOwner || !d.approved ? [] : [`That approval was given by someone your owner authorised for this`,
+        `seat's cards, so it covers exactly what you asked and nothing else.`]),
       ...tools,
       ``,
       asPersona(),

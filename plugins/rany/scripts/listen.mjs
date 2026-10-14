@@ -19,7 +19,7 @@
 // Zero dependencies on purpose — a plugin that needs `npm install` before it works is a plugin
 // most people never finish installing. Node 22's global WebSocket is all this needs.
 
-import { readFileSync, writeFileSync, appendFileSync, unlinkSync, existsSync, mkdirSync, statSync } from 'node:fs'
+import { readFileSync, writeFileSync, appendFileSync, unlinkSync, existsSync, mkdirSync, readdirSync, statSync } from 'node:fs'
 import { spawn, spawnSync } from 'node:child_process'
 import { basename, dirname, join } from 'node:path'
 import { homedir, tmpdir } from 'node:os'
@@ -372,20 +372,37 @@ function saveSeatHistory(repos) {
   catch { /* best effort — the binding itself still saved */ }
 }
 
+/** How many past local sessions a seat remembers. Enough to find the right conversation again when a
+ *  couple of windows were opened for one seat in a day; not a transcript archive. */
+const SEAT_SESSIONS_KEPT = 5
+
 /** Remember (or refresh) a seat this repo joined, with what the wake-ups need to name it. */
-function recordSeat(agentId, seat) {
+function recordSeat(agentId, seat, sid = sessionId) {
   const repos = loadSeatHistory()
   const key = norm(projectDir)
   const seats = repos[key] ?? {}
+  const was = seats[String(agentId)]
   seats[String(agentId)] = {
     channelId: String(seat.channelId), guildId: seat.guildId ? String(seat.guildId) : null,
     name: seat.name ?? null, agent: 'claude', dir: projectDir, lastJoined: new Date().toISOString(),
     // What the ROOM is called. The status line reads it from here, so it never has to ask the server —
     // and a session that comes back after a restart can still say where it is sitting.
-    roomName: seat.roomName ?? seats[String(agentId)]?.roomName ?? null,
+    roomName: seat.roomName ?? was?.roomName ?? null,
+    // The LOCAL conversation this seat is being worked in. A binding dies with the window (and takes
+    // its session id with it), so without this the seat came back to a blank session and the thinking
+    // that went with it was unreachable — the owner was keeping `claude --resume <guid>` in .bat files
+    // by hand. Kept here, where the seat itself is remembered, and never dropped at SessionEnd.
+    sessions: rememberSession(was?.sessions, sid),
   }
   repos[key] = seats
   saveSeatHistory(repos)
+}
+
+/** The seat's session list with `sid` at the front: newest first, no duplicates, capped. */
+function rememberSession(list, sid) {
+  const kept = (Array.isArray(list) ? list : []).filter((s) => s?.id && String(s.id) !== String(sid ?? ''))
+  if (!sid) return kept.slice(0, SEAT_SESSIONS_KEPT)
+  return [{ id: String(sid), ts: new Date().toISOString() }, ...kept].slice(0, SEAT_SESSIONS_KEPT)
 }
 
 /** The seat is gone for good (removed by the owner, room closed): stop offering to take it back. */
@@ -400,6 +417,128 @@ function forgetSeat(agentId) {
 /** This repo's remembered Claude seats. */
 const seatsForRepo = () => Object.entries(loadSeatHistory()[norm(projectDir)] ?? {})
   .filter(([, s]) => (s?.agent ?? 'claude') === 'claude')
+
+/** Every remembered seat of this repo, whichever agent holds it — what `--resume` lists. */
+const allSeatsForRepo = () => Object.entries(loadSeatHistory()[norm(projectDir)] ?? {})
+
+/** The seats this session holds right now, by id. */
+const mySeatIds = () => Object.entries(loadBindings())
+  .filter(([, e]) => e && typeof e === 'object' && e.room && e.sessionId === sessionId).map(([id]) => id)
+
+/**
+ * Attach THIS window's session id to every seat it holds, every time the listener runs. The join and the
+ * re-attach already record it, but a seat taken before the plugin kept ids — or one whose window was
+ * seated by an older version — would otherwise stay unresumable, and the id must be on disk BEFORE
+ * SessionEnd, which drops the binding that carries it.
+ *
+ * The same stamp says the conversation is OPEN (`seen`, refreshed each turn): nothing may resume a
+ * transcript a live window is writing — two windows on one conversation is worse than a blank one.
+ */
+function noteSeatSessions() {
+  if (!sessionId) return []
+  const mine = mySeatIds()
+  if (!mine.length) return []
+  const repos = loadSeatHistory()
+  const seats = repos[norm(projectDir)]
+  if (!seats) return []
+  const fresh = []
+  let changed = false
+  for (const id of mine) {
+    const s = seats[id]
+    if (!s) continue
+    if (String(s.sessions?.[0]?.id ?? '') !== String(sessionId)) {
+      s.sessions = rememberSession(s.sessions, sessionId)
+      fresh.push(id) // the seat learned this window only now — the room has not been told either
+    }
+    // One turn is a long way apart in wall-clock terms; a stamp per listener run costs one small write.
+    s.sessions[0].seen = new Date().toISOString()
+    delete s.sessions[0].closedAt
+    changed = true
+  }
+  if (changed) saveSeatHistory(repos)
+  return fresh
+}
+
+/** SessionEnd: this window's conversation is CLOSED, so it may be resumed at once rather than after the
+ *  `seen` stamp goes stale (which is all a crashed window leaves behind). */
+function closeMySeatSessions() {
+  if (!sessionId) return
+  const mine = mySeatIds()
+  if (!mine.length) return
+  const repos = loadSeatHistory()
+  const seats = repos[norm(projectDir)]
+  if (!seats) return
+  let changed = false
+  for (const id of mine) {
+    const entry = (seats[id]?.sessions ?? []).find((s) => String(s?.id ?? '') === String(sessionId))
+    if (!entry) continue
+    entry.closedAt = new Date().toISOString()
+    delete entry.seen
+    changed = true
+  }
+  if (changed) saveSeatHistory(repos)
+}
+
+/** The newest local session remembered for a seat that is NOT `exclude` (this window), or null. */
+function lastSessionOf(agentId, exclude = sessionId) {
+  const list = loadSeatHistory()[norm(projectDir)]?.[String(agentId)]?.sessions
+  if (!Array.isArray(list)) return null
+  return list.find((s) => s?.id && String(s.id) !== String(exclude ?? '')) ?? null
+}
+
+/** The command that continues a local conversation. Codex resumes a THREAD, Claude a session. */
+const resumeCommand = (agent, id) => (agent === 'codex' ? `codex resume ${id}` : `claude --resume ${id}`)
+
+/** One line, only when there IS an earlier conversation: this window is blank, the one before it is not.
+ *  Said rather than done, because a session cannot become another session — resuming is the owner's move. */
+function resumeHint(earlier) {
+  if (!earlier?.id) return []
+  return [`This seat's previous conversation is still on disk: tell the owner, in ONE line, that`
+    + ` \`${resumeCommand('claude', earlier.id)}\` continues it (or /rany-resume lists them).`]
+}
+
+/**
+ * The local transcripts of this directory, newest first — the fallback for a seat joined before the
+ * plugin kept session ids, and for a window that was never a seat at all. Claude Code writes one JSONL
+ * per session under ~/.claude/projects/<dir with every non-alphanumeric turned into a dash>/<id>.jsonl,
+ * so the file NAME is the id `--resume` needs; no transcript is read.
+ */
+function localTranscripts(limit = 5) {
+  const dir = join(homedir(), '.claude', 'projects', projectDir.replace(/[^A-Za-z0-9]/g, '-'))
+  try {
+    return readdirSync(dir).filter((f) => f.endsWith('.jsonl'))
+      .map((f) => ({ id: f.slice(0, -6), ts: statSync(join(dir, f)).mtime.toISOString() }))
+      .sort((a, b) => (a.ts < b.ts ? 1 : -1)).slice(0, limit)
+  } catch { return [] }
+}
+
+/**
+ * `/rany-resume`: every local conversation this repository's seats were worked in, with the command that
+ * continues each one. Nothing is launched — a running session cannot turn into another one, so the owner
+ * picks the window to come back to. Seats first (named, so "which one was the push fix" is answerable),
+ * then this directory's other transcripts.
+ */
+function resumeListing() {
+  const seats = allSeatsForRepo()
+  const out = []
+  for (const [agentId, s] of seats) {
+    const agent = s?.agent === 'codex' ? 'codex' : 'claude'
+    const sessions = (Array.isArray(s?.sessions) ? s.sessions : []).filter((x) => x?.id)
+    const where = `${s?.name ?? agentId}${s?.roomName ? ` · ${s.roomName}` : ''} (${agent}, seat ${agentId})`
+    if (!sessions.length) { out.push(`- ${where}: no local session remembered yet`); continue }
+    out.push(`- ${where}:`)
+    for (const x of sessions) out.push(`    ${resumeCommand(agent, x.id)}   # ${x.ts ?? '?'}`)
+  }
+  const known = new Set(seats.flatMap(([, s]) => (Array.isArray(s?.sessions) ? s.sessions : []).map((x) => String(x?.id))))
+  const others = localTranscripts().filter((t) => !known.has(t.id))
+  if (others.length) {
+    out.push(`Other Claude conversations in ${projectDir} (newest first):`)
+    for (const t of others) out.push(`    claude --resume ${t.id}   # ${t.ts}`)
+  }
+  if (!out.length) return `RANY: no seat and no local conversation remembered for ${projectDir}.`
+  return [`RANY: local conversations for ${projectDir} — run one of these in a NEW terminal`
+    + ` (this session cannot become another one):`, ...out].join('\n')
+}
 
 /** Is a session other than this one holding that binding right now? True only when its listener is
  *  still alive — a window that crashed without SessionEnd leaves a stale entry, and a stale entry must
@@ -428,7 +567,7 @@ const REATTACH_REFUSALS = {
  * server no longer has is forgotten, so the next session is not offered it again.
  */
 async function reattachSeat(agentId, h, sid = sessionId) {
-  const res = await postJson(`/personas/@self/rooms/${agentId}/reattach`, { agent: 'claude' }, 6000)
+  const res = await postJson(`/personas/@self/rooms/${agentId}/reattach`, { agent: 'claude', session: sid ?? undefined }, 6000)
   if (!res?.ok) {
     if (res?.body?.error === 'no_agent' || res?.body?.error === 'no_room') forgetSeat(agentId)
     return `RANY: could not take back seat "${h?.name ?? agentId}" in work room ${h?.channelId ?? '?'} — `
@@ -448,13 +587,16 @@ async function reattachSeat(agentId, h, sid = sessionId) {
   } catch (e) {
     return `RANY: took back the seat, but could not save the binding (${e?.message ?? e}).`
   }
-  recordSeat(seat.agentId, seat)
+  // Read before recording: the seat's LAST local session is the one this window is not.
+  const earlier = lastSessionOf(seat.agentId, sid)
+  recordSeat(seat.agentId, seat, sid)
   saveSeatIdentity(seat.agentId, seat.identity ?? null, seat.style ?? null, seat.approval ?? null)
   await declareBoards(boardsHere())
   return [
     `RANY: THIS session holds its seat "${seat.name}" in work room ${seat.channelId} again (agentId ${seat.agentId})`
       + `${seat.state === 'paused' ? ' — the owner has it PAUSED, so wait to be resumed' : ''}.`,
     ...releasedLine(dropped),
+    ...resumeHint(earlier),
     `It is woken for that room until this session closes. Nothing to do now; when the room speaks to you,`,
     `get_room({channelId:"${seat.channelId}"}) catches you up and post_message({channelId:"${seat.channelId}", agentId:"${seat.agentId}", …}) answers.`,
     ...identityLines(seat.agentId, { full: true }),
@@ -506,7 +648,10 @@ async function reattachRememberedSeats({ deliberate = false } = {}) {
   if (offer.length > 0) {
     lines.push(
       `RANY: this repo has held these work-room seats, and no open window holds them now:`,
-      ...offer.map(([id, h]) => `  • "${h?.name ?? id}" in room ${h?.channelId ?? '?'} — /rany-rejoin ${id}`),
+      ...offer.map(([id, h]) => `  • "${h?.name ?? id}" in room ${h?.channelId ?? '?'} — /rany-rejoin ${id}`
+        // The seat comes back; the CONVERSATION it was worked in does not, and only a new terminal can
+        // have it. Name it here, where the owner is still choosing which window this is.
+        + (lastSessionOf(id) ? ` (its last conversation: ${resumeCommand(h?.agent === 'codex' ? 'codex' : 'claude', lastSessionOf(id).id)})` : '')),
       ``,
       `A terminal holds ONE seat at a time. Take one of these HERE with its command above; open the others`,
       `in their OWN terminals (that is what stops one window waking as several seats across rooms).`,
@@ -1022,7 +1167,7 @@ async function joinSeat(code, sid = sessionId) {
   if (held && sid && held[1].sessionId === sid)
     return `RANY: this session already sits in that work room (channel ${held[1].room.channelId}) as "${held[1].room.name}" — agentId ${held[0]}.`
   const res = await postJson('/personas/@self/rooms/join',
-    { code, name: `${basename(projectDir)} · Claude`.slice(0, 40), agent: 'claude' }, 6000)
+    { code, name: `${basename(projectDir)} · Claude`.slice(0, 40), agent: 'claude', session: sid ?? undefined }, 6000)
   if (!res?.ok)
     return `RANY: could not join the work room — ${JOIN_REFUSALS[res?.body?.error] ?? `the server refused (${res?.status ?? 'offline'})`}.`
   const seat = res.body
@@ -1039,7 +1184,7 @@ async function joinSeat(code, sid = sessionId) {
   } catch (e) {
     return `RANY: joined the work room, but could not save the seat binding (${e?.message ?? e}).`
   }
-  recordSeat(seat.agentId, seat) // so the next session in this repo takes the seat back by itself (db/0365)
+  recordSeat(seat.agentId, seat, sid) // so the next session in this repo takes the seat back by itself (db/0365)
   saveSeatIdentity(seat.agentId, seat.identity ?? null, seat.style ?? null, seat.approval ?? null) // the role brief the owner picked on the link (ADR-055)
   // Declared with the boards, so the room shows this seat as live straight away.
   await declareBoards(boardsHere())
@@ -1112,6 +1257,13 @@ if (rejoinAt !== -1) {
     const lines = await reattachRememberedSeats({ deliberate: true })
     process.stdout.write((lines.length ? lines.join('\n') : 'RANY: this repo holds no remembered work-room seat. Paste an invite link to join a room.') + '\n')
   }
+  process.exit(QUIET)
+}
+
+/** `--resume`: list the local conversations this repo's seats were worked in, with the command for each
+ *  (the /rany-resume command). Read-only, no network, no server call. */
+if (process.argv.includes('--resume')) {
+  process.stdout.write(resumeListing() + '\n')
   process.exit(QUIET)
 }
 
@@ -1333,7 +1485,14 @@ if (process.argv.includes('--stop')) {
   } catch { /* already gone */ }
   // Drop this session's bindings and, if it held the active mark, release it. With the window closed
   // nothing here would pick a task up, so the persona must stop being offered for its boards.
+  // Before the bindings go — they are what says which seats were this window's. The room is told the
+  // conversation is closed too (ADR-101), so the owner's tile offers to continue it rather than showing a
+  // window that is already up; best-effort, a slow server must not hold up a closing terminal.
+  const closingSeats = mySeatIds()
+  closeMySeatSessions()
   dropMyBindings()
+  for (const id of closingSeats)
+    await postJson(`/personas/@self/rooms/${id}/session`, { session: sessionId, open: false }, 2000)
   try { if (activeSessionId() === sessionId) unlinkSync(activeFile) } catch { /* fine */ }
   // Withdraw this session's board claims from RANY. They also expire on their own — this just makes
   // closing a terminal immediate instead of eventual.
@@ -1398,6 +1557,11 @@ if (sessionId && !alreadyReminded(sessionId)) {
 
 if (!claimLock()) process.exit(QUIET)
 markActive() // this window just started or finished a turn — it is the one to wake for un-routable events
+// So this conversation can be resumed later for the seats it holds (/rany-resume). A seat that learns this
+// window only now was taken by an older plugin version: tell the room as well, or its tile would offer a
+// conversation that ended long ago. Best-effort and once per session — a join or re-attach reports it itself.
+for (const id of noteSeatSessions())
+  void postJson(`/personas/@self/rooms/${id}/session`, { session: sessionId, open: true }, 3000)
 
 const OP = { Dispatch: 0, Hello: 1, Identify: 2, Heartbeat: 3, Resume: 6, InvalidSession: 9 }
 
@@ -1491,31 +1655,46 @@ function crowdLines(d, seat) {
 }
 
 /**
- * The chain of command this seat sits in (ADR-098). A team is not decoration: a lead is woken on behalf of
- * its people and is the one who hands the work out, and a member answers to its lead. The relay puts the
- * team on every target (db/0512), so a seat that is in one always knows whom it can name and whom it
- * reports to; a seat in no team gets nothing extra.
+ * The chain of command this seat sits in (ADR-098, as the chart of ADR-102). A team is not decoration: the
+ * team's ORG CHART is who hands work to whom. A `<@team:ID>` mention wakes the top of that chart, and each
+ * level passes the parts down by naming the people under it — so a seat is told its own level only: whom it
+ * reports to (`chiefId`) and who reports to IT (`reports`), not the whole tree. The relay puts the team on
+ * every target (db/0512, db/0517); a seat in no team gets nothing extra. An API that has not deployed db/0517
+ * yet sends neither `head` nor `reports`, and the lead/member wording below is what it falls back to.
  */
 function teamLines(seat) {
   const team = seat?.team
   if (!team || !team.name) return []
-  const others = (Array.isArray(team.members) ? team.members : [])
+  const mine = (list) => (Array.isArray(list) ? list : [])
     .filter((m) => m && String(m.agentId) !== String(seat.agentId))
-  const list = others.map((m) => `"${m.name ?? m.agentId}" (<@agent:${m.agentId}>)`).join(', ')
-  if (team.lead) {
-    return [
-      `You LEAD the team "${team.name}"${others.length ? `: ${list}` : ' — nobody else is in it yet'}.`,
-      ...(others.length ? [
-        `A message to the team reaches YOU, not them: break the job up and hand each part out by NAMING the`,
-        `colleague (<@agent:ID>) in ONE post, then report the result yourself. Do the parts nobody else can.`] : []),
-    ]
-  }
-  return [
-    `You are in the team "${team.name}"${team.leadName ? `, led by "${team.leadName}"` : ', which has no lead right now'}`
-      + `${others.length ? ` with ${list}` : ''}.`,
-    ...(team.leadId && String(team.leadId) !== String(seat.agentId)
-      ? [`Report what you finish to <@agent:${team.leadId}> — it answers for the team.`] : []),
+  const label = (m) => `"${m.name ?? m.agentId}"${m.role ? ` (${m.role})` : ''} (<@agent:${m.agentId}>)`
+  const listOf = (xs) => xs.map(label).join(', ')
+  const others = mine(team.members)
+  const reports = mine(team.reports)
+  const head = team.head ?? team.lead
+  const chiefId = team.chiefId ?? (head ? null : team.leadId)
+  const chiefName = team.chiefName ?? team.leadName
+  const chief = chiefId && String(chiefId) !== String(seat.agentId) ? String(chiefId) : null
+  const out = [
+    head
+      ? `You are at the TOP of the team "${team.name}"'s chart`
+        + `${others.length ? `, which also holds ${listOf(others)}` : ' — nobody else is in it yet'}.`
+      : `You are in the team "${team.name}"`
+        + `${chief ? `, reporting to "${chiefName ?? chiefId}"` : ''}`
+        + `${others.length ? ` with ${listOf(others)}` : ''}.`,
   ]
+  if (reports.length) {
+    out.push(
+      head
+        ? `A message to the team reaches YOU, not them. Under you sit: ${listOf(reports)}.`
+        : `Under you on the chart sit: ${listOf(reports)}.`,
+      `Break the job up and hand each part out by NAMING the colleague (<@agent:ID>) in ONE post, then`,
+      `report the result yourself. Do the parts nobody else can, and do not reach past them down the chart.`)
+  } else if (head) {
+    out.push(`A message to the team reaches YOU, and nobody sits under you: the work is yours to do.`)
+  }
+  if (chief) out.push(`Report what you finish to <@agent:${chief}> — it answers for your part of the team.`)
+  return out
 }
 
 function roomPrompt(type, d, seat) {
@@ -1550,7 +1729,8 @@ function roomPrompt(type, d, seat) {
     `    so two seats of one product do not carry the same name; the owner picks one. Nothing to offer? Say`,
     `    nothing and the owner picks from RANY's catalog;`,
     `  ask_question({channelId, agentId, question, options?}) — any other question for your owner: a card in the`,
-    `    chat with your options and a free-text answer; the answer wakes you (PERSONA_ROOM_ANSWER);`,
+    `    chat with your options and a free-text answer; the answer wakes you (PERSONA_ROOM_ANSWER). Your owner`,
+    `    can authorise other people to answer a seat's cards, so the wake says whose answer it is;`,
     `  NEVER ask your owner through AskUserQuestion while you sit in a room: only this terminal`,
     `    shows it and the room never sees it — a decision goes through request_permission (a card in the`,
     `    chat), a question through ask_question;`,
@@ -1620,27 +1800,37 @@ function roomPrompt(type, d, seat) {
     ].join('\n')
   }
   if (type === 'PERSONA_ROOM_ANSWER') {
+    // Who answered (ADR-103): the owner, or someone the owner put on this seat's ask list. A delegated answer
+    // decides the question it was asked, and nothing wider — it never widens what the repo rules allow.
+    const byOwner = d.byOwner !== false
+    const answerer = byOwner ? 'your owner' : `${String(d.answeredByName || 'someone your owner trusts with this seat')} (on your owner's behalf)`
     return [
-      `RANY: your owner ANSWERED your question in work room ${d.channelId}.`,
+      `RANY: ${answerer} ANSWERED your question in work room ${d.channelId}.`,
       `  You asked: ${String(d.question ?? '')}`,
       `  Answer: ${String(d.answer ?? '')}`,
       ``,
       who,
       `Carry on with that answer. If it changes your part of the job, say so in ONE room line.`,
+      ...(byOwner ? [] : [`That answer came from someone your owner authorised to answer this seat's cards; it`,
+        `settles the question, not the repo rules — anything they still forbid stays forbidden.`]),
       ...tools,
       ``,
       asPersona(),
     ].join('\n')
   }
   if (type === 'PERSONA_ROOM_DECISION') {
+    const byOwner = d.byOwner !== false
+    const decider = byOwner ? 'your owner' : `${String(d.decidedByName || 'someone your owner trusts with this seat')} (on your owner's behalf)`
     return [
-      `RANY: your owner ${d.approved ? 'APPROVED' : 'DENIED'} your permission request in work room ${d.channelId}.`,
+      `RANY: ${decider} ${d.approved ? 'APPROVED' : 'DENIED'} your permission request in work room ${d.channelId}.`,
       `  You asked: ${String(d.question ?? '')}`,
       ...(d.note ? [`  Their note: ${d.note}`] : []),
       ``,
       who,
       d.approved ? `Go ahead with exactly what was approved — nothing broader.`
         : `Do not do it. Find another way, or ask again with a narrower request.`,
+      ...(byOwner || !d.approved ? [] : [`That approval was given by someone your owner authorised for this`,
+        `seat's cards, so it covers exactly what you asked and nothing else.`]),
       ...tools,
       ``,
       asPersona(),

@@ -34,6 +34,12 @@ start refreshes `~/.rany-plugin/term` and, if the package is missing, starts its
 background — so by the time the owner types `claude`, nothing is left to install. Only a machine
 where that never ran (no session opened yet) installs it on the first launcher run, once.
 
+With the shims in place, plain `claude` or `codex` in a directory that holds a seat also **continues that
+seat's last conversation** (ADR-101) instead of starting an empty one — the launcher prints the id it is
+resuming. Any argument of the agent's own means the owner was explicit and nothing is added; `claude --new`
+asks for a blank conversation, and `{"seats":{"autoResume":false}}` in `~/.rany-plugin/rany.json`
+(`codex.json` for Codex) turns it off. A conversation another window is still writing is never reopened.
+
 **Codex is different:** it is not run in a pty (its TUI flickered inside ConPTY and the frames were
 unreadable). The `codex` shim is a plain pass-through, and the Codex bridge daemon feeds the Screen tab
 from the thread's own rollout transcript — nothing to start. Only Claude Code uses the pty mirror.

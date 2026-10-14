@@ -197,6 +197,15 @@ context — so a seat taken on the strength of a `cd` bills you for a room insid
 whatever you actually opened the window to do. Off, the seats are named at start and `/rany-rejoin`
 takes one. `RANY_AUTO_REATTACH=1` turns it on for a single shell.
 
+`seats.autoResume` (default on) is whether plain `claude` / `codex` CONTINUES the seat's last conversation
+instead of starting an empty one — taking a seat back returns the seat, never the thinking behind the work.
+It needs the `rany-term` shims (`/rany-term`), since the launcher is what starts the agent; any argument of
+the agent's own means you were explicit, `claude --new` asks for a blank one, and a conversation another
+window is still writing is never reopened. `/rany-resume` lists every remembered conversation of this
+repository's seats with the command for each. The ids are also reported to RANY so the seat's tile can show
+its OWNER the same command — nobody else is served them, because a session id means something only on the
+machine that ran it, and nothing is ever launched from the browser.
+
 `ownerMentions` is the persona overhearing a mention of *you* rather than being addressed itself.
 Off because in a busy guild it interrupts constantly, and because nothing in it is a request.
 `addressed` still matters only for a persona with **no** stored model key: a hosted one answers its

@@ -206,8 +206,65 @@ function resolveReal(name) {
 if (argv[0] === '--install') { installShims(); process.exit(0) }
 if (argv[0] === '--uninstall') { uninstallShims(); process.exit(0) }
 
+// `--new` is this launcher's own flag (a blank conversation, see below) and never reaches the agent.
+const wantsNew = argv.includes('--new')
+if (wantsNew) argv.splice(argv.indexOf('--new'), 1)
+
 const command = argv.length ? argv : ['claude']
 const agentKind = /codex/i.test(basename(command[0])) ? 'codex' : 'claude'
+
+/**
+ * Continue the seat's LAST conversation when the agent is started plainly in a directory that holds one.
+ *
+ * Taking a seat back returns the seat, never the thinking behind the work: the window came up empty and
+ * the owner was keeping `claude --resume <guid>` lines in .bat files by hand. The seat history now
+ * remembers each seat's last local sessions, so the obvious thing is to use it — typing `claude` where a
+ * seat lives means "carry on", not "start again".
+ *
+ * Only when the agent was given NO arguments of its own: any argument is the owner being explicit, and
+ * `--new` is the way to say "a blank one" (it is consumed here, never passed on). `{"seats":{"autoResume":
+ * false}}` in ~/.rany-plugin/rany.json (codex.json for Codex) turns it off for good.
+ */
+function seatSetting(kind, key, fallback) {
+  try {
+    const file = join(homedir(), '.rany-plugin', kind === 'codex' ? 'codex.json' : 'rany.json')
+    const v = JSON.parse(readFileSync(file, 'utf8'))?.seats?.[key]
+    return typeof v === 'boolean' ? v : fallback
+  } catch { return fallback }
+}
+
+/** Does Claude still have that conversation on disk? A transcript the owner cleaned away would otherwise
+ *  make every plain `claude` fail with "No conversation found" — one file test avoids that. Codex keeps
+ *  its rollouts in dated directories, so its id is taken on trust and `codex resume` says if it is gone. */
+function sessionOnDisk(kind, dir, id) {
+  if (kind !== 'claude') return true
+  const slug = dir.replace(/[\\/]+$/, '').replace(/[^A-Za-z0-9]/g, '-')
+  return existsSync(join(homedir(), '.claude', 'projects', slug, `${id}.jsonl`))
+}
+
+/** Is that conversation free to open? A window still running stamps `seen` every turn and writes
+ *  `closedAt` when it ends, so an open one is left alone (two windows on one transcript is worse than a
+ *  blank one) and a crashed one becomes free once the stamp goes stale. */
+const OPEN_STALE_MS = 10 * 60 * 1000
+function sessionFree(s) {
+  if (!s?.seen || s.closedAt) return true
+  const seen = Date.parse(s.seen)
+  return !Number.isFinite(seen) || Date.now() - seen > OPEN_STALE_MS
+}
+
+if (!wantsNew && command.length === 1 && seatSetting(agentKind, 'autoResume', true)) {
+  const seat = rememberedSeat(process.cwd(), agentKind)
+  const last = (Array.isArray(seat?.sessions) ? seat.sessions : [])
+    .filter((s) => s?.id && sessionFree(s)).map((s) => s.id)
+    .find((id) => sessionOnDisk(agentKind, process.cwd(), id)) ?? null
+  if (last) {
+    command.push(...(agentKind === 'codex' ? ['resume', last] : ['--resume', last]))
+    process.stdout.write(`rany-term: continuing seat "${seat.name ?? seat.id}"'s last conversation`
+      + ` (${agentKind === 'codex' ? `resume ${last}` : `--resume ${last}`}).`
+      + ` \`${agentKind} --new\` starts a blank one.\n`)
+  }
+}
+
 // Through a shim, `claude` must reach the real claude.cmd and not the shim again.
 command[0] = resolveReal(command[0]) ?? command[0]
 
