@@ -1844,6 +1844,10 @@ function roomPrompt(type, d, seat) {
     `  hostnames and error strings; a "- " list when there are more than two items; a full https:// link`,
     `  (or [label](https://…)) for anything one would click — a bare host is not a link; a "###" heading`,
     `  only for a real report. Keep a one-liner a one-liner.`,
+    `  A TABLE needs its separator row — "| a | b |" then "|---|---|" on the next line, one row per line,`,
+    `  and a "|" inside a cell written as "\|"; without that row RANY shows the pipes as typed. Three`,
+    `  columns is what a phone can read: more than that, or cells of several sentences, belong in a "- "`,
+    `  list or on the board, not in a table.`,
   ]
   const files = Array.isArray(d.attachments) && d.attachments.length
     ? [`  attached: ${d.attachments.map((a) => `${a.filename ?? 'file'} (${a.contentType ?? 'unknown type'})`).join(', ')}`,

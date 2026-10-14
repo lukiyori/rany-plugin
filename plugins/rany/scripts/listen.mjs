@@ -1750,6 +1750,10 @@ function roomPrompt(type, d, seat) {
     `  hostnames and error strings; a "- " list when there are more than two items; a full https:// link`,
     `  (or [label](https://…)) for anything one would click — a bare host is not a link; a "###" heading`,
     `  only for a real report. Keep a one-liner a one-liner.`,
+    `  A TABLE needs its separator row — "| a | b |" then "|---|---|" on the next line, one row per line,`,
+    `  and a "|" inside a cell written as "\|"; without that row RANY shows the pipes as typed. Three`,
+    `  columns is what a phone can read: more than that, or cells of several sentences, belong in a "- "`,
+    `  list or on the board, not in a table.`,
   ]
   if (type === 'PERSONA_ROOM_MESSAGE') {
     // ADR-072 §5.2 (P3 cross-owner guardrail): a NAMED <@agent:…> may cross owners (db/0456), so a message
