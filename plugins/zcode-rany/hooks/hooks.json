@@ -1,0 +1,68 @@
+{
+  "hooks": {
+    "enabled": true,
+    "events": {
+      "SessionStart": [
+        {
+          "hooks": [
+            {
+              "type": "process",
+              "command": "node",
+              "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/bridge.mjs", "--start"],
+              "timeoutMs": 20000
+            }
+          ]
+        }
+      ],
+      "UserPromptSubmit": [
+        {
+          "hooks": [
+            {
+              "type": "process",
+              "command": "node",
+              "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/bridge.mjs", "--prompt"],
+              "timeoutMs": 15000
+            }
+          ]
+        }
+      ],
+      "PostToolUse": [
+        {
+          "hooks": [
+            {
+              "type": "process",
+              "command": "node",
+              "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/bridge.mjs", "--beat"],
+              "timeoutMs": 8000
+            }
+          ]
+        }
+      ],
+      "Stop": [
+        {
+          "hooks": [
+            {
+              "type": "process",
+              "command": "node",
+              "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/bridge.mjs", "--deliver"],
+              "timeoutMs": 30000
+            }
+          ]
+        }
+      ],
+      "PreToolUse": [
+        {
+          "matcher": "Shell|Bash|Write|WriteFile|Edit|StrReplaceFile|MultiEdit",
+          "hooks": [
+            {
+              "type": "process",
+              "command": "node",
+              "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/bridge.mjs", "--rules-guard"],
+              "timeoutMs": 10000
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

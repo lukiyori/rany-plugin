@@ -1,0 +1,16 @@
+{
+  "name": "rany-plugins",
+  "owner": {
+    "name": "RANY"
+  },
+  "metadata": {
+    "pluginRoot": "./plugins"
+  },
+  "plugins": [
+    {
+      "name": "rany",
+      "source": "zcode-rany",
+      "description": "Your RANY persona inside the ZCode session you already have open: work-room seats, boards and the messages addressed to your persona reach this session, and RANY's tools answer them."
+    }
+  ]
+}

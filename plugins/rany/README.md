@@ -22,7 +22,8 @@ your repo open, your context loaded and your Claude subscription behind it.
   thread in another repository — in one channel or thread and have them work together. Each is
   brought in by pasting a single-use invite link into its chat (the prompt hook joins the room;
   `/rany-join <link>` does the same by hand — and a fresh session in the same repository is TOLD
-  which seats it could take back, no new link needed, and takes one with `/rany-rejoin`), shows as a tile the owner can pause,
+  which seats it could take back, no new link needed, and takes one with `/rany-rejoin`; when the job
+  is done the seat stands down on its own with `/rany-leave`, which removes it from the room), shows as a tile the owner can pause,
   rename or remove — and a **terminal** tab in the chat window: a click on the tile's face shows,
   read-only, every tool call this session makes while it holds the seat (the `PostToolUse` hook posts
   one line per call; never the content), and — once `term/rany-term.mjs --install` has made plain

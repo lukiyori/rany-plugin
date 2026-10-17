@@ -288,6 +288,16 @@ function dropMyBindings() {
   try { writeFileSync(bindFile, JSON.stringify({ boards }, null, 2)) } catch { /* best effort */ }
 }
 
+/** Let go of ONE seat's binding (rany-leave), as opposed to `dropMyBindings`' all-of-them at SessionEnd.
+ *  Best-effort — the server-side removal is what actually frees the seat; this just stops THIS window
+ *  routing to it. Board/guild bindings are never touched. */
+function dropSeatBinding(agentId) {
+  const boards = loadBindings()
+  if (!boards[String(agentId)]) return
+  delete boards[String(agentId)]
+  try { writeFileSync(bindFile, JSON.stringify({ boards }, null, 2)) } catch { /* best effort */ }
+}
+
 /** One live SEAT per session (a terminal is one pair of hands). Binding a seat here releases any OTHER
  *  work-room seat this same session held, so a terminal that joins or rejoins a second room MOVES to it
  *  rather than silently waking as several seats across rooms — the "why did it switch seats?" bug when a
@@ -604,6 +614,47 @@ async function reattachSeat(agentId, h, sid = sessionId) {
     // The join line scrolls away, and the owner then cannot tell which window sits in which room.
     // /rany-status puts the room and this seat's name in the status line, where they stay.
     ...(statusLineWired() ? [] : ['Tell the owner in ONE line that /rany-status keeps this room and your seat name in the status line.']),
+  ].join('\n')
+}
+
+/**
+ * Stand down from a work-room seat (rany-leave): the persona vacates its OWN chair. The server removes the
+ * seat (the shared 'removed' path — revokes just this seat's token, refreshes the roster, posts a "left the
+ * room" notice; the persona is untouched), then this window drops the binding and FORGETS the seat so no
+ * session takes it back on its own. A removed seat cannot be reattached — coming back needs a fresh invite.
+ *
+ * With no id, leaves the one seat this session holds; refuses rather than guess when it holds none or more
+ * than one. Say goodbye in the room BEFORE this — once the seat is removed the token can no longer post.
+ */
+async function leaveSeat(rawId, sid = sessionId) {
+  const mine = mySeatIds()
+  const agentId = rawId || (mine.length === 1 ? mine[0] : null)
+  if (!agentId) {
+    if (mine.length === 0)
+      return 'RANY: this session holds no work-room seat to leave. (Pass a seat id if you mean one this window is not bound to.)'
+    return `RANY: this session holds more than one seat (${mine.join(', ')}) — say which to leave: /rany-leave <agentId>.`
+  }
+  const h = seatsForRepo().find(([id]) => id === String(agentId))?.[1]
+  const res = await postJson(`/personas/@self/rooms/${agentId}/leave`, {}, 6000)
+  if (!res?.ok) {
+    // Gone already on the server (removed, or the room was closed): still let it go here so this window
+    // stops waking for it, and stop offering it back.
+    if (res?.body?.error === 'no_agent') {
+      dropSeatBinding(agentId); forgetSeat(agentId)
+      await declareBoards(boardsHere())
+      return `RANY: seat ${agentId} was already gone from the room; released it in this window too.`
+    }
+    return `RANY: could not leave the seat — the server refused (${res?.body?.error ?? res?.status ?? 'offline'}).`
+  }
+  dropSeatBinding(agentId)
+  forgetSeat(agentId)           // so a fresh session is not offered a seat that no longer exists
+  await declareBoards(boardsHere())
+  const name = h?.name ?? agentId
+  const room = res.body?.channelId ?? h?.channelId ?? '?'
+  return [
+    `RANY: stood down — vacated seat "${name}" (agentId ${agentId}) in work room ${room}. The room shows it left.`,
+    `This session is no longer woken for that room, and it will not come back on its own.`,
+    `The seat was REMOVED, so /rany-rejoin cannot restore it — taking it up again needs a new invite link from the owner.`,
   ].join('\n')
 }
 
@@ -1257,6 +1308,20 @@ if (rejoinAt !== -1) {
     const lines = await reattachRememberedSeats({ deliberate: true })
     process.stdout.write((lines.length ? lines.join('\n') : 'RANY: this repo holds no remembered work-room seat. Paste an invite link to join a room.') + '\n')
   }
+  process.exit(QUIET)
+}
+
+/** `--leave [agentId]`: stand down from a work-room seat (the /rany-leave command). Removes the seat on the
+ *  server (the persona vacating its own chair), drops the binding and forgets it so no session takes it back.
+ *  No argument: the one seat this session holds. */
+const leaveAt = process.argv.indexOf('--leave')
+if (leaveAt !== -1) {
+  const raw = String(process.argv[leaveAt + 1] ?? '').trim()
+  if (raw && !/^[0-9]+$/.test(raw)) {
+    process.stdout.write('RANY: --leave takes a seat id (the agentId a join printed), or no argument to leave the seat this session holds\n')
+    process.exit(QUIET)
+  }
+  process.stdout.write((await leaveSeat(raw)) + '\n')
   process.exit(QUIET)
 }
 

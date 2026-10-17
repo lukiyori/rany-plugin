@@ -1,0 +1,12 @@
+{
+  "name": "rany",
+  "displayName": "RANY",
+  "version": "0.1.0",
+  "description": "Your RANY persona inside the ZCode session you already have open: work-room seats, boards and messages reach this session, and RANY's tools answer them. ZCode cannot be woken from outside, so a seat answers while you are working in it.",
+  "license": "MIT",
+  "keywords": ["rany", "persona", "chat", "tasks", "work rooms"],
+  "commands": "./commands",
+  "skills": "./skills",
+  "hooks": "./hooks/hooks.json",
+  "mcpServers": "./.mcp.json"
+}
