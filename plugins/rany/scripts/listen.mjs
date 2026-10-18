@@ -1040,7 +1040,10 @@ function loadConfig() {
   try { if (existsSync(path)) file = JSON.parse(readFileSync(path, 'utf8')) } catch { /* malformed → env only */ }
 
   const apiUrl = (process.env.RANY_API_URL || file.apiUrl || 'https://www.rany.work/api').replace(/\/+$/, '')
-  const token = process.env.RANY_PERSONA_TOKEN || file.token || ''
+  // Trimmed, and stripped of quotes someone wrapped around it: `setx NAME '"rany_persona_…"'` stores
+  // the quotation marks, and the gateway refuses such a token exactly as it refuses a revoked one.
+  const token = String(process.env.RANY_PERSONA_TOKEN || file.token || '')
+    .trim().replace(/^['"]|['"]$/g, '').trim()
   // Same host, /gateway instead of /api — the deployment nobody configured explicitly.
   const gatewayUrl = process.env.RANY_GATEWAY_URL || file.gatewayUrl
     || apiUrl.replace(/^http/, 'ws').replace(/\/api$/, '/gateway')

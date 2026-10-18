@@ -691,7 +691,11 @@ function loadConfig() {
   let file = {}
   try { file = JSON.parse(readFileSync(join(HOME, 'codex.json'), 'utf8')) } catch { /* env only */ }
   const apiUrl = (process.env.RANY_API_URL || file.apiUrl || 'https://www.rany.work/api').replace(/\/+$/, '')
-  const token = process.env.RANY_PERSONA_TOKEN || file.token || ''
+  // Trimmed, and stripped of quotes someone wrapped around it. `setx NAME '"rany_persona_…"'` stores
+  // the quotation marks as part of the value, and a token with a quote in it is refused by the gateway
+  // exactly like a revoked one — a difference nothing on either side could see.
+  const token = String(process.env.RANY_PERSONA_TOKEN || file.token || '')
+    .trim().replace(/^['"]|['"]$/g, '').trim()
   const gatewayUrl = process.env.RANY_GATEWAY_URL || file.gatewayUrl
     || apiUrl.replace(/^http/, 'ws').replace(/\/api$/, '/gateway')
   return {

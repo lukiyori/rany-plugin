@@ -223,7 +223,10 @@ function loadConfig() {
   let file = {}
   try { file = JSON.parse(readFileSync(join(HOME, 'gemini.json'), 'utf8')) } catch { /* env only */ }
   const apiUrl = (process.env.RANY_API_URL || file.apiUrl || 'https://www.rany.work/api').replace(/\/+$/, '')
-  const token = process.env.RANY_GEMINI_TOKEN || file.token || process.env.RANY_PERSONA_TOKEN || ''
+  // Trimmed and unquoted: a shell that stored the quotation marks around the value produces a token the
+  // gateway refuses exactly as it refuses a revoked one. See the Codex bridge.
+  const token = String(process.env.RANY_GEMINI_TOKEN || file.token || process.env.RANY_PERSONA_TOKEN || '')
+    .trim().replace(/^['"]|['"]$/g, '').trim()
   const gatewayUrl = process.env.RANY_GATEWAY_URL || file.gatewayUrl
     || apiUrl.replace(/^http/, 'ws').replace(/\/api$/, '/gateway')
   return {
