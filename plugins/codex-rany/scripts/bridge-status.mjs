@@ -35,8 +35,11 @@ export function statusLines(x) {
   const when = (v) => ago(v, now)
   const out = [`RANY codex bridge — this script is v${x.version}`]
 
+  // The fingerprint is the first bytes of the token's SHA-256 — what the server stores and lists next to
+  // each key. It says WHICH token this machine is sending without ever showing the token, which is the
+  // only way to tell "the new key is not working" from "this terminal is still sending the old one".
   out.push(x.token
-    ? `  token:   set (${x.apiUrl})`
+    ? `  token:   set (${x.apiUrl})${x.fingerprint ? ` · fingerprint ${x.fingerprint}${x.tokenFrom ? ` · from ${x.tokenFrom}` : ''}` : ''}`
     : '  token:   MISSING. Set RANY_PERSONA_TOKEN (RANY → your AI tools → Codex) — nothing can reach this machine without it.')
   // The address being dialled, always: "not connected" without it leaves nothing to test by hand, and a
   // self-hosted RANY_API_URL with no matching gateway is a real way to end up dialling the wrong host.

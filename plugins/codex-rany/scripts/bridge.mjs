@@ -1241,6 +1241,10 @@ if (has('--status')) {
     token: Boolean(config.token),
     apiUrl: config.apiUrl,
     gatewayUrl: config.gatewayUrl,
+    fingerprint: config.token ? createHash('sha256').update(config.token).digest('hex').slice(0, 8) : null,
+    // WHERE it came from matters as much as what it is: an environment variable set in another terminal
+    // and a stale `token` in codex.json look identical from here, and only one of them is what you edited.
+    tokenFrom: process.env.RANY_PERSONA_TOKEN ? 'RANY_PERSONA_TOKEN' : 'codex.json',
     daemon: d,
     running: Boolean(d && alive(d.pid)),
     state: readState(),

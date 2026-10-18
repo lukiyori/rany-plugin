@@ -24,6 +24,14 @@ test('a healthy bridge says connected, and names the last event', () => {
   assert.doesNotMatch(s, /UNKNOWN|MISSING|NOT RUNNING/)
 })
 
+test('the token is identified by fingerprint and source, never printed', () => {
+  // "The new key does not work" and "this terminal is still sending the old one" are the same picture
+  // without this line; the fingerprint is what the server lists beside each key.
+  const s = text({ fingerprint: 'a1f7dc35', tokenFrom: 'RANY_PERSONA_TOKEN' })
+  assert.match(s, /fingerprint a1f7dc35 · from RANY_PERSONA_TOKEN/)
+  assert.doesNotMatch(s, /rany_persona_/)
+})
+
 test('the address being dialled is always printed, so a failure can be tested by hand', () => {
   assert.match(text({}), /url:     wss:\/\/www\.rany\.work\/gateway/)
   assert.match(text({ state: { ...base.state, ready: false } }), /url:     wss:\/\/www\.rany\.work\/gateway/)
