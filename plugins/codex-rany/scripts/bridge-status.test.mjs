@@ -36,6 +36,14 @@ test('a running process with no socket is NOT reported as working', () => {
   assert.match(s, /events:  last none since this daemon started/)
 })
 
+test('a socket that opened but never identified is its own state, not "not connected"', () => {
+  // Calling this "not connected" sends someone to their firewall for a fault on the far side of a
+  // socket that is working — which is exactly the hour that was lost before this line existed.
+  const s = text({ state: { ...base.state, ready: false, socketOpen: true, socketOpenAt: iso(4) } })
+  assert.match(s, /gateway: OPEN BUT NOT IDENTIFIED since 4m ago/)
+  assert.doesNotMatch(s, /NOT CONNECTED/)
+})
+
 test('a refused token is quoted, not summarised as "retrying"', () => {
   const s = text({ state: { ...base.state, ready: false, error: 'the gateway refused this persona token' } })
   assert.match(s, /gateway: NOT CONNECTED — the gateway refused this persona token/)

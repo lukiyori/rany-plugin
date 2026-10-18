@@ -1320,7 +1320,7 @@ try {
 // The daemon's own births and deaths go in the routing log: a dead bridge looks exactly like a quiet
 // one, and "when did it die, and how" was the question nobody could answer.
 logRoute('DAEMON', { pid: process.pid }, `started (node ${process.version})`)
-writeState({ pid: process.pid, version: VERSION, startedAt: new Date().toISOString(), ready: false, error: null })
+writeState({ pid: process.pid, version: VERSION, startedAt: new Date().toISOString(), ready: false, socketOpen: false, error: null })
 process.on('exit', (code) => logRoute('DAEMON', { pid: process.pid }, `exit ${code}`))
 
 const OP = { Dispatch: 0, Hello: 1, Identify: 2, Heartbeat: 3, InvalidSession: 9 }
@@ -2091,9 +2091,17 @@ function connect() {
   try { socket = new WebSocket(config.gatewayUrl) }
   catch (e) {
     logRoute('DAEMON', { pid: process.pid, dial: dials }, `cannot open ${config.gatewayUrl}: ${e?.message ?? e} — retrying in 15s`)
-    writeState({ ready: false, error: String(e?.message ?? e) })
+    writeState({ ready: false, socketOpen: false, error: String(e?.message ?? e) })
     return void setTimeout(connect, 15000)
   }
+
+  // Three states, not two: the socket can be OPEN and the persona still not identified (the gateway
+  // accepted the connection and never answered Identify). Both used to read as "not connected", which
+  // sends someone looking at their firewall for a fault that is on the other side of a working socket.
+  socket.addEventListener('open', () => {
+    logRoute('DAEMON', { pid: process.pid, dial: dials }, `socket open after ${Date.now() - dialedAt}ms — identifying`)
+    writeState({ socketOpen: true, socketOpenAt: new Date().toISOString() })
+  })
 
   socket.addEventListener('message', async (ev) => {
     let frame
@@ -2125,7 +2133,7 @@ function connect() {
       personaUserId = String(frame.d?.userId ?? '') || null
       personaName = String(frame.d?.persona?.displayName ?? '').trim() || null
       logRoute('DAEMON', { pid: process.pid, dial: dials }, `ready as ${personaName ?? personaUserId ?? '?'} after ${Math.round((Date.now() - dialedAt) / 1000)}s`)
-      writeState({ ready: true, readyAt: new Date().toISOString(), persona: personaName, error: null })
+      writeState({ ready: true, socketOpen: true, readyAt: new Date().toISOString(), persona: personaName, error: null })
       return
     }
     if (!personaUserId) return
@@ -2142,7 +2150,7 @@ function connect() {
     if (heartbeat) clearInterval(heartbeat)
     logRoute('DAEMON', { pid: process.pid, code: ev?.code ?? null },
       `socket closed${ev?.reason ? ` (${ev.reason})` : ''} — ${config.gatewayUrl} — retrying in 3s`)
-    writeState({ ready: false })
+    writeState({ ready: false, socketOpen: false })
     setTimeout(connect, 3000)
   })
   socket.addEventListener('error', () => { /* 'close' follows and owns the retry and the log line */ })

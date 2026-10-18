@@ -55,9 +55,14 @@ export function statusLines(x) {
         + ' node scripts/bridge.mjs --stop, then start any Codex session.')
     } else {
       const s = x.state
+      // Three states. "Open but not identified" is its own fault — the gateway took the connection and
+      // never answered Identify — and calling it "not connected" sends someone to their firewall for
+      // something on the far side of a socket that is working.
       out.push(`  gateway: ${s.ready
         ? `CONNECTED since ${when(s.readyAt)}${s.persona ? ` as ${s.persona}` : ''}`
-        : `NOT CONNECTED${s.error ? ` — ${s.error}` : ' — retrying; routing.log has the close reason'}`}`)
+        : s.socketOpen
+          ? `OPEN BUT NOT IDENTIFIED since ${when(s.socketOpenAt)} — the gateway took the connection and has not answered Identify. The network is fine; this is the token or the persona.`
+          : `NOT CONNECTED${s.error ? ` — ${s.error}` : ' — retrying; routing.log has the close reason'}`}`)
       out.push(`  events:  last ${s.lastEvent ? `${s.lastEvent} ${when(s.lastEventAt)}` : 'none since this daemon started'}`
         + ` (started ${when(s.startedAt)})`)
     }

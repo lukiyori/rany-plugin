@@ -39,6 +39,9 @@ same from outside. This separates them:
   proxy, a TLS inspector or a firewall between this machine and the host; plain HTTPS to the same host
   can work while this does not, which is why the tools can still read a channel by hand. The same close
   reason is written to `~/.rany-plugin/routing.log` on a `DAEMON` line every time the daemon retries.
+- **gateway** OPEN BUT NOT IDENTIFIED → the socket works and the gateway never answered Identify. Not a
+  network fault: the token is wrong for this persona, or the persona is paused or hosted. `routing.log`
+  carries the last frames; a token the gateway refuses outright says so there in full.
 - **events** none since the daemon started, while the gateway is connected → RANY is not sending
   anything here: usually no seat is bound to this folder (see the `seats` line) or the room is paused.
 - **seats** none → paste the room's invite link, or `$rany-rejoin` to take a remembered seat back.
