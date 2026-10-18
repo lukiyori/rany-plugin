@@ -1351,7 +1351,19 @@ function connect() {
     const target = await route(frame.t, d)
     if (target) deliver(frame.t, { boardId: d.boardId, guildId: d.guildId, channelId: d.channelId }, target)
   })
-  socket.addEventListener('close', () => { if (heartbeat) clearInterval(heartbeat); setTimeout(connect, 3000) })
+  socket.addEventListener('close', (ev) => {
+    if (heartbeat) clearInterval(heartbeat)
+    // The gateway refuses a token by CLOSING with 1008, not by sending InvalidSession — so the branch
+    // above never saw it and this retried the refusal every 3 seconds forever. See the Codex bridge.
+    if (ev?.code === 1008 || /auth/i.test(String(ev?.reason ?? ''))) {
+      logRoute('AUTH', { code: ev?.code ?? null },
+        `gateway refused the persona token (${String(ev?.reason ?? '') || 'close 1008'}) — daemon exiting, retrying cannot fix it`)
+      shutdown()
+      return
+    }
+    logRoute('DAEMON', { pid: process.pid, code: ev?.code ?? null }, 'socket closed — retrying in 3s')
+    setTimeout(connect, 3000)
+  })
   socket.addEventListener('error', () => { /* 'close' follows and owns the retry */ })
 }
 

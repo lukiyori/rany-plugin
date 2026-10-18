@@ -40,8 +40,13 @@ same from outside. This separates them:
   can work while this does not, which is why the tools can still read a channel by hand. The same close
   reason is written to `~/.rany-plugin/routing.log` on a `DAEMON` line every time the daemon retries.
 - **gateway** OPEN BUT NOT IDENTIFIED → the socket works and the gateway never answered Identify. Not a
-  network fault: the token is wrong for this persona, or the persona is paused or hosted. `routing.log`
-  carries the last frames; a token the gateway refuses outright says so there in full.
+  network fault: the token is wrong for this persona, or the persona is paused or hosted.
+- **why: the gateway refused this persona token** (the daemon stops rather than retry) → the token is
+  rejected. The gateway says this by closing with `1008 authentication_failed`, and `--join` answers
+  `401` with the same token. Issue a new key in RANY → User Settings → your AI tools → Codex, set
+  `RANY_PERSONA_TOKEN`, and open a **new** terminal — a running Codex never sees a variable set after
+  it started. If the key is already fresh, check the persona is not paused and that the terminal is
+  not carrying an older token from `~/.rany-plugin/codex.json`, which is read when the variable is unset.
 - **events** none since the daemon started, while the gateway is connected → RANY is not sending
   anything here: usually no seat is bound to this folder (see the `seats` line) or the room is paused.
 - **seats** none → paste the room's invite link, or `$rany-rejoin` to take a remembered seat back.

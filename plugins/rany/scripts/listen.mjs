@@ -2369,6 +2369,21 @@ function connect() {
   // A dropped socket is not news. Reconnect quietly; the Stop hook would respawn us anyway.
   mine.addEventListener('close', (ev) => {
     if (mine !== socket) return // the watchdog already moved on from this one
+    // A refused token is NOT a dropped socket: the gateway says so by closing with 1008, not by sending
+    // InvalidSession, so the branch above never ran and this one retried the refusal every 3 seconds
+    // for as long as the window stayed open (found on a Codex bridge doing exactly that, 2026-10-18).
+    if (ev?.code === 1008 || /auth/i.test(String(ev?.reason ?? ''))) {
+      logRoute('LISTENER', { pid: process.pid, code: ev?.code ?? null },
+        `gateway refused the persona token (${String(ev?.reason ?? '') || 'close 1008'}) — not retrying`)
+      if (heartbeat) clearInterval(heartbeat)
+      const msg = sayOnce('auth', [
+        'RANY plugin: the gateway refused the persona token, so nothing will wake this session.',
+        'Usually the persona is paused or revoked, or the token was rotated after you exported it.',
+        'Issue a new key in RANY → User Settings → your AI tools, set RANY_PERSONA_TOKEN, and open a NEW terminal.',
+      ].join('\n'))
+      done(msg ? WAKE : QUIET, msg)
+      return
+    }
     logRoute('LISTENER', { pid: process.pid, code: ev?.code ?? null }, 'socket closed — retrying in 3s')
     if (heartbeat) clearInterval(heartbeat)
     ready = false

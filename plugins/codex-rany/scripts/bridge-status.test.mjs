@@ -70,9 +70,15 @@ test('no token is the first thing said, because nothing else can work without it
 })
 
 test('no daemon says how to get one back, and claims nothing about the gateway', () => {
-  const s = text({ running: false })
+  const s = text({ running: false, state: { ...base.state, error: null } })
   assert.match(s, /daemon:  NOT RUNNING\./)
   assert.doesNotMatch(s, /gateway:/)
+})
+
+test('a daemon that STOPPED because it was refused says why, after it is gone', () => {
+  // The refusal is the only fact that explains everything, and it used to die with the process.
+  const s = text({ running: false, state: { ...base.state, error: 'the gateway refused this persona token (authentication_failed). Issue a new key…' } })
+  assert.match(s, /why:     the gateway refused this persona token \(authentication_failed\)/)
 })
 
 test('a folder with no seat says so, with the way to get one', () => {

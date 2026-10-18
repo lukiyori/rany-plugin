@@ -44,6 +44,9 @@ export function statusLines(x) {
 
   if (!x.running || !x.daemon) {
     out.push('  daemon:  NOT RUNNING. Any Codex session start brings it back, or: node scripts/bridge.mjs --daemon')
+    // A daemon that STOPPED because it was refused must say so here: otherwise the one fact that
+    // explains everything dies with the process, and the next start fails the same way in silence.
+    if (x.state?.error) out.push(`  why:     ${x.state.error}`)
   } else {
     const d = x.daemon
     out.push(`  daemon:  pid ${d.pid}, ${d.version ? `v${d.version}` : 'version unknown (started by a build before 0.38.0)'}`

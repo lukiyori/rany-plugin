@@ -2148,8 +2148,24 @@ function connect() {
 
   socket.addEventListener('close', (ev) => {
     if (heartbeat) clearInterval(heartbeat)
-    logRoute('DAEMON', { pid: process.pid, code: ev?.code ?? null },
-      `socket closed${ev?.reason ? ` (${ev.reason})` : ''} — ${config.gatewayUrl} — retrying in 3s`)
+    const code = ev?.code ?? null
+    const reason = String(ev?.reason ?? '')
+    // The gateway refuses a token by CLOSING with 1008, not by sending InvalidSession — so the refusal
+    // was invisible here and the daemon retried it every 3 seconds, for days, against production. Found
+    // on a machine where the socket opened in 40ms and closed with `1008 authentication_failed` each
+    // time, while `--status` reported it as "not connected" and sent everyone looking at the network.
+    if (code === 1008 || /auth/i.test(reason)) {
+      const why = `the gateway refused this persona token (${reason || `close ${code}`})`
+      logRoute('AUTH', { pid: process.pid, code }, `${why} — daemon exiting, retrying cannot fix it`)
+      writeState({
+        ready: false, socketOpen: false,
+        error: `${why}. Issue a new key in RANY → User Settings → your AI tools → Codex, set RANY_PERSONA_TOKEN, and open a NEW terminal.`,
+      })
+      shutdown()
+      return
+    }
+    logRoute('DAEMON', { pid: process.pid, code },
+      `socket closed${reason ? ` (${reason})` : ''} — ${config.gatewayUrl} — retrying in 3s`)
     writeState({ ready: false, socketOpen: false })
     setTimeout(connect, 3000)
   })
