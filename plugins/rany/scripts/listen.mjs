@@ -27,6 +27,7 @@ import { createHash } from 'node:crypto'
 import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
 import { roomRoutingContextLines } from './room-routing-context.mjs'
+import { sessionAnnouncement } from './seat-session.mjs'
 import { loadRepoRules, repoRulesLines, checkToolCall, refusalReason } from './repo-rules.mjs'
 
 const WAKE = 2   // exit code asyncRewake watches for
@@ -456,10 +457,11 @@ function noteSeatSessions() {
   for (const id of mine) {
     const s = seats[id]
     if (!s) continue
-    if (String(s.sessions?.[0]?.id ?? '') !== String(sessionId)) {
-      s.sessions = rememberSession(s.sessions, sessionId)
-      fresh.push(id) // the seat learned this window only now — the room has not been told either
-    }
+    const say = sessionAnnouncement(s.sessions, sessionId)
+    // 'new': the seat learned this window only now, and the history must record it. 'reopened': a
+    // RESUMED conversation, whose close we reported and never took back — see seat-session.mjs.
+    if (say === 'new') s.sessions = rememberSession(s.sessions, sessionId)
+    if (say !== 'none') fresh.push(id)
     // One turn is a long way apart in wall-clock terms; a stamp per listener run costs one small write.
     s.sessions[0].seen = new Date().toISOString()
     delete s.sessions[0].closedAt

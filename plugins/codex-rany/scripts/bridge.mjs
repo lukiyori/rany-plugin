@@ -27,6 +27,7 @@ import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
 import { roomRoutingContextLines } from './room-routing-context.mjs'
 import { loadRepoRules, repoRulesLines } from './repo-rules.mjs'
+import { sessionAnnouncement } from './seat-session.mjs'
 
 /** Shared with the Claude Code plugin ON PURPOSE: a board belongs to a repository, not to whichever
  *  agent you happen to be running. Bind once, and both bridges route it the same way. */
@@ -759,29 +760,33 @@ function boardsForSession(bindings, s) {
  * an id (Codex only reveals it once a prompt was typed) gets it on the next sweep; nothing is written
  * when the newest remembered id is already this thread's.
  */
-function noteSeatSessions(bindings, s) {
+async function noteSeatSessions(bindings, s) {
   if (!s?.threadId) return
   const repos = loadSeatHistory()
   const seats = repos[norm(s.dir)]
   if (!seats) return
   let changed = false
+  const told = []
   for (const [id, e] of Object.entries(bindings)) {
     if (!e || typeof e !== 'object' || !e.room) continue          // a board, or another agent's seat
     if (String(e.threadId ?? '') !== String(s.threadId)) continue // not this thread's seat
     const seat = seats[id]
     if (!seat) continue
-    if (String(seat.sessions?.[0]?.id ?? '') !== String(s.threadId)) {
-      seat.sessions = rememberSession(seat.sessions, s.threadId)
+    const say = sessionAnnouncement(seat.sessions, s.threadId)
+    if (say === 'new') {
       // Codex only reveals a thread id once a prompt was typed, so a seat often learns it after the join:
-      // tell the room as well, or its tile would offer an older thread. Best-effort, once per thread.
-      void postJson(`/personas/@self/rooms/${id}/session`, { session: s.threadId, open: true }, 3000)
+      // tell the room as well, or its tile would offer an older thread.
+      seat.sessions = rememberSession(seat.sessions, s.threadId)
     }
+    // 'reopened' is a RESUMED thread whose close we reported and never took back — see seat-session.mjs.
+    if (say !== 'none') told.push(postJson(`/personas/@self/rooms/${id}/session`, { session: s.threadId, open: true }, 3000))
     // `seen` says the thread is still OPEN: nothing may resume a rollout a live thread is writing.
     seat.sessions[0].seen = new Date().toISOString()
     delete seat.sessions[0].closedAt
     changed = true
   }
   if (changed) saveSeatHistory(repos)
+  await Promise.all(told)   // awaited: a hook process exits the moment it is done, dropping anything in flight
 }
 
 /** Declare each live thread's boards under a per-thread key (ADR-038), so closing one thread withdraws
@@ -793,7 +798,7 @@ async function refreshClaims() {
     const key = claimKey(s)
     known.add(key)
     await declareBoards(key, boardsForSession(bindings, s), 5000, { ref: s.threadId })
-    noteSeatSessions(bindings, s)
+    await noteSeatSessions(bindings, s)
   }
   let previous = []
   try { previous = JSON.parse(readFileSync(stateFile, 'utf8')).projects ?? [] } catch { /* first run */ }
@@ -1103,8 +1108,13 @@ function spawnDaemon() {
  *  daemon that died stayed dead until someone typed again. */
 if (has('--ensure') || has('--ping') || has('--beat')) {
   const hook = await hookInput()
-  noteSession(typeof hook.cwd === 'string' && hook.cwd ? hook.cwd : process.cwd(),
-    typeof hook.session_id === 'string' && hook.session_id ? hook.session_id : undefined)
+  const hookDir = typeof hook.cwd === 'string' && hook.cwd ? hook.cwd : process.cwd()
+  const hookThread = typeof hook.session_id === 'string' && hook.session_id ? hook.session_id : undefined
+  noteSession(hookDir, hookThread)
+  // A resumed thread must say it is back NOW, not at the daemon's next sweep five minutes later: the
+  // owner is looking at the tile while they wait for an answer. Posts nothing when the room already
+  // knows (the seat's remembered session carries no `closedAt`), so this costs an ordinary turn nothing.
+  if (config.token && hookThread) await noteSeatSessions(loadBindings(), { dir: hookDir, threadId: hookThread })
   // The seat's TERMINAL (db/0366, task #86): every tool call this thread makes while it holds a work-room
   // seat is one line on the meet screen. Best-effort — a failed push never costs the agent its turn.
   if (has('--beat') && config.token && typeof hook.tool_name === 'string') {
