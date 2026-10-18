@@ -28,6 +28,7 @@ import { request as httpsRequest } from 'node:https'
 import { roomRoutingContextLines } from './room-routing-context.mjs'
 import { loadRepoRules, repoRulesLines } from './repo-rules.mjs'
 import { sessionAnnouncement } from './seat-session.mjs'
+import { statusLines } from './bridge-status.mjs'
 
 /** Shared with the Claude Code plugin ON PURPOSE: a board belongs to a repository, not to whichever
  *  agent you happen to be running. Bind once, and both bridges route it the same way. */
@@ -56,6 +57,18 @@ function readDaemon() {
   } catch { return null }
 }
 const stateFile = join(HOME, 'codex-bridge.json')
+
+/** What the daemon is doing, written so anything else can READ it without a socket of its own:
+ *  the boards it declares, and — since 0.38.0 — whether it is actually connected to the gateway.
+ *  A running process proved nothing: the socket is retried silently forever, so "the bridge is up"
+ *  and "the bridge has been failing to connect since Tuesday" looked exactly alike from outside
+ *  (2026-10-18: "bridge süreci çalışıyor … ancak bridge'in açık ağ bağlantısı görünmüyor"). */
+function readState() {
+  try { return JSON.parse(readFileSync(stateFile, 'utf8')) } catch { return {} }
+}
+function writeState(patch) {
+  try { writeFileSync(stateFile, JSON.stringify({ ...readState(), ...patch })) } catch { /* best effort */ }
+}
 /** Cards handed to a work-room seat (MCP assign_task, ADR-046): taskId → seat id — the same file the
  *  Claude listener keeps. Every agent is the same persona, so the assignment event alone would wake the
  *  thread that bound the card's BOARD; the handoff names the seat and always arrives first. */
@@ -800,10 +813,9 @@ async function refreshClaims() {
     await declareBoards(key, boardsForSession(bindings, s), 5000, { ref: s.threadId })
     await noteSeatSessions(bindings, s)
   }
-  let previous = []
-  try { previous = JSON.parse(readFileSync(stateFile, 'utf8')).projects ?? [] } catch { /* first run */ }
+  const previous = readState().projects ?? []
   for (const key of previous) if (!known.has(key)) await declareBoards(key, [])
-  try { writeFileSync(stateFile, JSON.stringify({ projects: [...known] })) } catch { /* best effort */ }
+  writeState({ projects: [...known] })
 }
 
 // ---- commands --------------------------------------------------------------------------------
@@ -1214,6 +1226,27 @@ if (has('--bye')) {
   process.exit(0)
 }
 
+/** `--status`: one answer to "is RANY actually going to reach this session?", for a person who has a
+ *  running process and no way to tell what it is doing. Every line is a fact read off disk — nothing
+ *  here contacts the gateway, so it works while the bridge is the thing that is broken. */
+if (has('--status')) {
+  const dir = process.cwd()
+  const d = readDaemon()
+  process.stdout.write(statusLines({
+    version: VERSION,
+    token: Boolean(config.token),
+    apiUrl: config.apiUrl,
+    daemon: d,
+    running: Boolean(d && alive(d.pid)),
+    state: readState(),
+    seats: Object.entries(loadBindings())
+      .filter(([, e]) => e && typeof e === 'object' && e.room && (e.agent ?? 'codex') === 'codex' && samePath(e.dir, dir))
+      .map(([id, e]) => ({ id, name: e.room?.name ?? id, threadId: e.threadId ?? null })),
+    sessions: liveSessions().filter((s) => samePath(s.dir, dir)).map((s) => ({ threadId: s.threadId ?? null, ts: s.ts })),
+  }).join('\n') + '\n')
+  process.exit(0)
+}
+
 if (has('--stop')) {
   try {
     const d = readDaemon()
@@ -1224,7 +1257,7 @@ if (has('--stop')) {
 }
 
 if (!has('--daemon')) {
-  process.stdout.write('RANY codex bridge. Usage: --bind [boardId] | --ensure | --ping | --bye | --daemon | --stop\n')
+  process.stdout.write('RANY codex bridge. Usage: --status | --bind [boardId] | --ensure | --ping | --bye | --daemon | --stop\n')
   process.exit(0)
 }
 
@@ -1250,6 +1283,7 @@ try {
 // The daemon's own births and deaths go in the routing log: a dead bridge looks exactly like a quiet
 // one, and "when did it die, and how" was the question nobody could answer.
 logRoute('DAEMON', { pid: process.pid }, `started (node ${process.version})`)
+writeState({ pid: process.pid, version: VERSION, startedAt: new Date().toISOString(), ready: false, error: null })
 process.on('exit', (code) => logRoute('DAEMON', { pid: process.pid }, `exit ${code}`))
 
 const OP = { Dispatch: 0, Hello: 1, Identify: 2, Heartbeat: 3, InvalidSession: 9 }
@@ -2007,8 +2041,22 @@ async function deliver(type, ids, { dir, threadId, text }) {
   logRoute(type, ids, ok ? `queued -> ${thread.id} (${thread.why}) @ ${dir}` : `queue FAILED -> ${thread.id} @ ${dir}`)
 }
 
+// The socket's life, in the routing log and in the state file. It used to be entirely silent: a
+// construction error retried every 15s, a close every 3s, and neither said so — so a daemon that had
+// never connected looked identical to an idle one that was connected and simply had nothing to do.
+// That is the state the owner could not get an answer about with the process plainly running.
+let dials = 0
+let dialedAt = 0
+
 function connect() {
-  try { socket = new WebSocket(config.gatewayUrl) } catch { return void setTimeout(connect, 15000) }
+  dials += 1
+  dialedAt = Date.now()
+  try { socket = new WebSocket(config.gatewayUrl) }
+  catch (e) {
+    logRoute('DAEMON', { pid: process.pid, dial: dials }, `cannot open ${config.gatewayUrl}: ${e?.message ?? e} — retrying in 15s`)
+    writeState({ ready: false, error: String(e?.message ?? e) })
+    return void setTimeout(connect, 15000)
+  }
 
   socket.addEventListener('message', async (ev) => {
     let frame
@@ -2030,6 +2078,7 @@ function connect() {
     // rotated token. Retrying cannot fix any of them, so stop rather than reconnect forever.
     if (frame.op === OP.InvalidSession) {
       logRoute('AUTH', {}, 'gateway refused the persona token — daemon exiting')
+      writeState({ ready: false, error: 'the gateway refused this persona token' })
       shutdown()
       return
     }
@@ -2038,20 +2087,27 @@ function connect() {
     if (frame.t === 'READY') {
       personaUserId = String(frame.d?.userId ?? '') || null
       personaName = String(frame.d?.persona?.displayName ?? '').trim() || null
+      logRoute('DAEMON', { pid: process.pid, dial: dials }, `ready as ${personaName ?? personaUserId ?? '?'} after ${Math.round((Date.now() - dialedAt) / 1000)}s`)
+      writeState({ ready: true, readyAt: new Date().toISOString(), persona: personaName, error: null })
       return
     }
     if (!personaUserId) return
 
     const d = frame.d ?? {}
+    // Every event the gateway hands this bridge, stamped: "the bridge is connected but no event has
+    // arrived" and "events arrive and are dropped" are different faults with the same symptom.
+    writeState({ lastEventAt: new Date().toISOString(), lastEvent: String(frame.t ?? '') })
     const target = await route(frame.t, d)
     if (target) void deliver(frame.t, { boardId: d.boardId, guildId: d.guildId, channelId: d.channelId }, target)
   })
 
-  socket.addEventListener('close', () => {
+  socket.addEventListener('close', (ev) => {
     if (heartbeat) clearInterval(heartbeat)
+    logRoute('DAEMON', { pid: process.pid, code: ev?.code ?? null }, 'socket closed — retrying in 3s')
+    writeState({ ready: false })
     setTimeout(connect, 3000)
   })
-  socket.addEventListener('error', () => { /* 'close' follows and owns the retry */ })
+  socket.addEventListener('error', () => { /* 'close' follows and owns the retry and the log line */ })
 }
 
 connect()

@@ -120,6 +120,18 @@ unclaimed for up to five minutes until the Claude side's next heartbeat.
 
 ## Diagnosing
 
+Start here:
+
+```
+node scripts/bridge.mjs --status      # or the `rany-check` skill inside Codex
+```
+
+One screen, read off disk, no network call: the token, the daemon's pid and version, whether its
+gateway socket is connected and since when, the last event that arrived, and the seats and sessions
+this folder has. It exists because "the bridge is running" answers nothing — the socket is retried
+forever, and before 0.38.0 that happened in silence, so a bridge that had never connected and an idle
+healthy one looked the same from outside.
+
 `~/.rany-plugin/routing.log` has one line per routed event — what it was, which board, and where it
 went (or why it went nowhere). Both plugins write to it. The daemon also logs its own life there —
 `DAEMON {"pid":…} -> started …`, `-> SIGTERM`, `-> exit 0` — so "nothing happened" can be told apart
