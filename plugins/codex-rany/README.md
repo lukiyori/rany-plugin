@@ -53,8 +53,13 @@ machine** holds the RANY socket and writes into the session that owns the board.
 
 What that buys:
 
-- Updating the plugin reaches every session; the daemon is not spawned per session from a versioned
-  path, so an already-open session is never stuck on an old build.
+- Updating the plugin reaches every session: one daemon serves them all, so no open session is stuck
+  on an old build. The daemon itself is started from the versioned plugin directory, though, and it
+  outlives that directory — an update deletes the folder while node keeps running the code it has
+  already loaded. So the pid file records `{ pid, version }`, a hook treats a daemon of another
+  version as not running, and the daemon it starts takes the socket over from it. Before that
+  (2026-10-18) a daemon from 0.33.0 held the socket for four days across two releases, and the
+  symptom was a work-room Screen that stayed empty with nothing in any log to explain it.
 - A task that arrives mid-turn is queued, not dropped.
 - A task for a repository whose session is closed **waits** in that thread's queue and arrives when
   the thread is resumed. The Claude side simply misses it.
@@ -119,7 +124,15 @@ unclaimed for up to five minutes until the Claude side's next heartbeat.
 went (or why it went nowhere). Both plugins write to it. The daemon also logs its own life there —
 `DAEMON {"pid":…} -> started …`, `-> SIGTERM`, `-> exit 0` — so "nothing happened" can be told apart
 from "the bridge was dead": no `codex-v…` line for an event that reached the Claude listener means the
-daemon was not running (`~/.rany-plugin/codex-bridge.pid` names the pid to check).
+daemon was not running (`~/.rany-plugin/codex-bridge.pid` names the pid — and the version it is
+running, which is the other thing worth checking: `Get-CimInstance Win32_Process` shows the path it
+was started from, and that path may no longer exist).
+
+A seat's **Screen** that stays empty is usually not the bridge at all: the tail follows the thread the
+seat is bound to, and a seat does not re-attach to a new thread by itself unless
+`~/.rany-plugin/codex.json` holds `{"seats": {"autoReattach": true}}`. `bindings.json` names the
+thread; if its rollout under `~/.codex/sessions/` is weeks old, the seat is bound to a closed thread
+and `$rany-rejoin` in the open one fixes it.
 
 ```
 node scripts/bridge.mjs --stop      # stop the daemon

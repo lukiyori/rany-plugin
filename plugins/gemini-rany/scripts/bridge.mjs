@@ -37,6 +37,19 @@ const unroutedFile = join(HOME, 'unrouted.json')
 /** One file per open Gemini session, refreshed by every hook it fires. */
 const sessionsDir = join(HOME, 'gemini-sessions')
 const pidFile = join(HOME, 'gemini-bridge.pid')
+
+/** The daemon that is running, as its own pid file records it: `{ pid, version }` — see the Codex
+ *  bridge, where a daemon from a deleted plugin folder held the socket across two releases because
+ *  "is that pid alive?" was the only question anyone asked. A bare number is an older build's file. */
+function readDaemon() {
+  try {
+    const raw = readFileSync(pidFile, 'utf8').trim()
+    if (!raw) return null
+    if (/^\d+$/.test(raw)) return { pid: Number(raw), version: null }
+    const rec = JSON.parse(raw)
+    return rec && rec.pid ? { pid: Number(rec.pid), version: rec.version ?? null } : null
+  } catch { return null }
+}
 const stateFile = join(HOME, 'gemini-bridge.json')
 const taskSeatsFile = join(HOME, 'task-seats.json')
 /** Per-session inbox the daemon writes and the listener / hooks read. */
@@ -752,10 +765,10 @@ if (has('--home')) {
 
 function alive(pid) { try { process.kill(pid, 0); return true } catch { return false } }
 function daemonRunning() {
-  try {
-    const pid = Number(readFileSync(pidFile, 'utf8').trim())
-    return Boolean(pid) && alive(pid)
-  } catch { return false }
+  // A daemon of another version does not count: the one we start takes over from it, or an update
+  // reaches the machine and changes nothing until the next reboot.
+  const d = readDaemon()
+  return Boolean(d && alive(d.pid) && d.version === VERSION)
 }
 
 /** Start the machine's daemon from a hook, detached from the hook's pipes (Gemini waits for a hook's output
@@ -902,8 +915,8 @@ if (has('--bye')) {
 
 if (has('--stop')) {
   try {
-    const pid = Number(readFileSync(pidFile, 'utf8').trim())
-    if (pid && alive(pid)) process.kill(pid)
+    const d = readDaemon()
+    if (d && alive(d.pid)) process.kill(d.pid)
     unlinkSync(pidFile)
   } catch { /* already gone */ }
   process.exit(0)
@@ -921,11 +934,13 @@ if (!config.token) process.exit(0)
 
 try {
   mkdirSync(HOME, { recursive: true })
-  if (existsSync(pidFile)) {
-    const pid = Number(readFileSync(pidFile, 'utf8').trim())
-    if (pid && pid !== process.pid && alive(pid)) process.exit(0)
+  const was = readDaemon()
+  if (was && was.pid !== process.pid && alive(was.pid)) {
+    if (was.version === VERSION) process.exit(0)   // one daemon per machine
+    logRoute('DAEMON', { pid: process.pid }, `taking over from pid ${was.pid} (v${was.version ?? '?'})`)
+    try { process.kill(was.pid) } catch { /* already gone */ }
   }
-  writeFileSync(pidFile, String(process.pid))
+  writeFileSync(pidFile, JSON.stringify({ pid: process.pid, version: VERSION }))
 } catch { /* better a possible duplicate than a bridge that never runs */ }
 
 logRoute('DAEMON', { pid: process.pid }, `started (node ${process.version})`)
@@ -940,7 +955,7 @@ let socket = null
 const shutdown = () => {
   if (heartbeat) clearInterval(heartbeat)
   try { socket?.close() } catch { /* closing anyway */ }
-  try { if (Number(readFileSync(pidFile, 'utf8').trim()) === process.pid) unlinkSync(pidFile) } catch { /* nothing to do */ }
+  try { if (readDaemon()?.pid === process.pid) unlinkSync(pidFile) } catch { /* nothing to do */ }
   process.exit(0)
 }
 process.on('SIGTERM', () => { logRoute('DAEMON', { pid: process.pid }, 'SIGTERM'); shutdown() })

@@ -36,6 +36,24 @@ const unroutedFile = join(HOME, 'unrouted.json')
 /** One file per open Codex session, refreshed every turn — see `--ping`. */
 const sessionsDir = join(HOME, 'codex-sessions')
 const pidFile = join(HOME, 'codex-bridge.pid')
+
+/** The daemon that is running, as its own pid file records it: `{ pid, version }`.
+ *  The version matters because the daemon outlives the plugin FOLDER it was started from. An update
+ *  writes a new versioned cache directory and deletes the old one, but node keeps running the code it
+ *  already loaded — and `--ensure` only ever asked "is that pid alive?", so the answer stayed yes and
+ *  the new build never started. Found 2026-10-18 on the owner's machine: a daemon from 0.33.0, whose
+ *  directory had been gone for two days, still holding the socket while two releases sat unused.
+ *  A bare number is an older build's file (it wrote only the pid), so its version is unknown — and
+ *  unknown counts as "not this build", which is what makes the first update after this one take. */
+function readDaemon() {
+  try {
+    const raw = readFileSync(pidFile, 'utf8').trim()
+    if (!raw) return null
+    if (/^\d+$/.test(raw)) return { pid: Number(raw), version: null }
+    const rec = JSON.parse(raw)
+    return rec && rec.pid ? { pid: Number(rec.pid), version: rec.version ?? null } : null
+  } catch { return null }
+}
 const stateFile = join(HOME, 'codex-bridge.json')
 /** Cards handed to a work-room seat (MCP assign_task, ADR-046): taskId → seat id — the same file the
  *  Claude listener keeps. Every agent is the same persona, so the assignment event alone would wake the
@@ -1121,13 +1139,10 @@ if (has('--ensure') || has('--ping') || has('--beat')) {
       },
     }) + '\n')
   }
-  let running = false
-  try {
-    if (existsSync(pidFile)) {
-      const pid = Number(readFileSync(pidFile, 'utf8').trim())
-      running = Boolean(pid) && alive(pid)
-    }
-  } catch { /* treat as not running */ }
+  // A daemon of ANOTHER version is not "running" for our purposes: the one we start takes over from it
+  // (see the daemon's own handover below). Otherwise an update reaches the machine and changes nothing.
+  const d = readDaemon()
+  const running = Boolean(d && alive(d.pid) && d.version === VERSION)
   if (!running && config.token) spawnDaemon()
   if (!config.token && has('--ensure')) {
     // Say it once per session rather than never: a plugin that is installed and silent reads as broken.
@@ -1191,11 +1206,9 @@ if (has('--bye')) {
 
 if (has('--stop')) {
   try {
-    if (existsSync(pidFile)) {
-      const pid = Number(readFileSync(pidFile, 'utf8').trim())
-      if (pid && alive(pid)) process.kill(pid)
-      unlinkSync(pidFile)
-    }
+    const d = readDaemon()
+    if (d && alive(d.pid)) process.kill(d.pid)
+    if (existsSync(pidFile)) unlinkSync(pidFile)
   } catch { /* already gone */ }
   process.exit(0)
 }
@@ -1212,11 +1225,16 @@ if (!config.token) process.exit(0)
 
 try {
   mkdirSync(HOME, { recursive: true })
-  if (existsSync(pidFile)) {
-    const pid = Number(readFileSync(pidFile, 'utf8').trim())
-    if (pid && pid !== process.pid && alive(pid)) process.exit(0) // one daemon per machine
+  const was = readDaemon()
+  if (was && was.pid !== process.pid && alive(was.pid)) {
+    // One daemon per machine — but the one holding the socket may be an OLDER build (see readDaemon).
+    // Same version: nothing to do, let it keep the socket. Different: take over, or the update that
+    // installed this file never reaches the machine that installed it.
+    if (was.version === VERSION) process.exit(0)
+    logRoute('DAEMON', { pid: process.pid }, `taking over from pid ${was.pid} (v${was.version ?? '?'})`)
+    try { process.kill(was.pid) } catch { /* already gone */ }
   }
-  writeFileSync(pidFile, String(process.pid))
+  writeFileSync(pidFile, JSON.stringify({ pid: process.pid, version: VERSION }))
 } catch { /* unwritable: better a possible duplicate than a bridge that never runs */ }
 
 // The daemon's own births and deaths go in the routing log: a dead bridge looks exactly like a quiet
@@ -1235,7 +1253,7 @@ const shutdown = () => {
   if (heartbeat) clearInterval(heartbeat)
   try { socket?.close() } catch { /* closing anyway */ }
   try {
-    if (existsSync(pidFile) && Number(readFileSync(pidFile, 'utf8').trim()) === process.pid) unlinkSync(pidFile)
+    if (readDaemon()?.pid === process.pid) unlinkSync(pidFile)
   } catch { /* nothing to do */ }
   process.exit(0)
 }
