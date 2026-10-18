@@ -27,8 +27,18 @@ same from outside. This separates them:
 - **daemon** on another version → an update landed but the old process still holds the socket; the next
   session start now replaces it (before 0.38.0 it did not, and a daemon from a deleted plugin folder
   kept running for days).
-- **gateway** NOT CONNECTED → the socket is the fault, not the plugin. `~/.rany-plugin/routing.log` has
-  the close reason on a `DAEMON` line. A refused token says so in full.
+- **gateway** NOT CONNECTED → the socket is the fault, not the plugin. Dial it once in the foreground
+  and read the answer directly:
+
+  ```
+  node "${PLUGIN_ROOT}/scripts/bridge.mjs" --probe
+  ```
+
+  `OPEN` means the transport is fine and the daemon is what is stuck (restart it with `--stop`, then
+  start any Codex session). `CLOSED code 1006` means nothing completed the WebSocket upgrade — a
+  proxy, a TLS inspector or a firewall between this machine and the host; plain HTTPS to the same host
+  can work while this does not, which is why the tools can still read a channel by hand. The same close
+  reason is written to `~/.rany-plugin/routing.log` on a `DAEMON` line every time the daemon retries.
 - **events** none since the daemon started, while the gateway is connected → RANY is not sending
   anything here: usually no seat is bound to this folder (see the `seats` line) or the room is paused.
 - **seats** none → paste the room's invite link, or `$rany-rejoin` to take a remembered seat back.

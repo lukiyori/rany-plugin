@@ -124,6 +124,7 @@ Start here:
 
 ```
 node scripts/bridge.mjs --status      # or the `rany-check` skill inside Codex
+node scripts/bridge.mjs --probe       # dial the gateway once, in the foreground, and say what happened
 ```
 
 One screen, read off disk, no network call: the token, the daemon's pid and version, whether its

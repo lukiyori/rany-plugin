@@ -8,7 +8,7 @@ import { statusLines, ago } from './bridge-status.mjs'
 const NOW = Date.parse('2026-10-18T21:00:00Z')
 const iso = (minutes) => new Date(NOW - minutes * 60_000).toISOString()
 const base = {
-  version: '0.38.0', token: true, apiUrl: 'https://www.rany.work/api',
+  version: '0.38.0', token: true, apiUrl: 'https://www.rany.work/api', gatewayUrl: 'wss://www.rany.work/gateway',
   daemon: { pid: 42, version: '0.38.0' }, running: true,
   state: { pid: 42, ready: true, readyAt: iso(30), persona: 'Rainman', startedAt: iso(31), lastEvent: 'PERSONA_ROOM_MESSAGE', lastEventAt: iso(2) },
   seats: [{ id: '9', name: 'Olivia', threadId: 'abc' }],
@@ -22,6 +22,11 @@ test('a healthy bridge says connected, and names the last event', () => {
   assert.match(s, /gateway: CONNECTED since 30m ago as Rainman/)
   assert.match(s, /events:  last PERSONA_ROOM_MESSAGE 2m ago/)
   assert.doesNotMatch(s, /UNKNOWN|MISSING|NOT RUNNING/)
+})
+
+test('the address being dialled is always printed, so a failure can be tested by hand', () => {
+  assert.match(text({}), /url:     wss:\/\/www\.rany\.work\/gateway/)
+  assert.match(text({ state: { ...base.state, ready: false } }), /url:     wss:\/\/www\.rany\.work\/gateway/)
 })
 
 test('a running process with no socket is NOT reported as working', () => {

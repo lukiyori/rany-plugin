@@ -23,7 +23,7 @@ export function ago(at, now = Date.now()) {
 
 /**
  * @param {{
- *   version: string, token: boolean, apiUrl: string,
+ *   version: string, token: boolean, apiUrl: string, gatewayUrl?: string,
  *   daemon: {pid: number, version: string|null}|null, running: boolean,
  *   state: object, seats: Array<{id: string, name: string, threadId: string|null}>,
  *   sessions: Array<{threadId: string|null, ts: number}>, now?: number,
@@ -38,6 +38,9 @@ export function statusLines(x) {
   out.push(x.token
     ? `  token:   set (${x.apiUrl})`
     : '  token:   MISSING. Set RANY_PERSONA_TOKEN (RANY → your AI tools → Codex) — nothing can reach this machine without it.')
+  // The address being dialled, always: "not connected" without it leaves nothing to test by hand, and a
+  // self-hosted RANY_API_URL with no matching gateway is a real way to end up dialling the wrong host.
+  if (x.gatewayUrl) out.push(`  url:     ${x.gatewayUrl}`)
 
   if (!x.running || !x.daemon) {
     out.push('  daemon:  NOT RUNNING. Any Codex session start brings it back, or: node scripts/bridge.mjs --daemon')

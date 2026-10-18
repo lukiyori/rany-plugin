@@ -1236,6 +1236,7 @@ if (has('--status')) {
     version: VERSION,
     token: Boolean(config.token),
     apiUrl: config.apiUrl,
+    gatewayUrl: config.gatewayUrl,
     daemon: d,
     running: Boolean(d && alive(d.pid)),
     state: readState(),
@@ -1244,6 +1245,42 @@ if (has('--status')) {
       .map(([id, e]) => ({ id, name: e.room?.name ?? id, threadId: e.threadId ?? null })),
     sessions: liveSessions().filter((s) => samePath(s.dir, dir)).map((s) => ({ threadId: s.threadId ?? null, ts: s.ts })),
   }).join('\n') + '\n')
+  process.exit(0)
+}
+
+/** `--probe`: dial the gateway ONCE, in the foreground, and say what happened. `--status` can say the
+ *  daemon is not connected; this says why, without reading a log or trusting a background process —
+ *  the close code and reason are what separate "blocked by this network" from "refused by RANY". */
+if (has('--probe')) {
+  const url = config.gatewayUrl
+  process.stdout.write(`RANY: dialling ${url} …\n`)
+  if (typeof WebSocket === 'undefined') {
+    process.stdout.write(`  FAILED: this Node has no WebSocket (${process.version}); the bridge needs Node 22 or newer.\n`)
+    process.exit(0)
+  }
+  const t0 = Date.now()
+  // Awaited, so nothing below runs: the first answer wins, whichever event brings it.
+  await new Promise((resolve) => {
+    const done = (line) => { process.stdout.write(`  ${line}\n`); resolve() }
+    let ws
+    try { ws = new WebSocket(url) } catch (e) { return done(`FAILED to open: ${e?.message ?? e}`) }
+    const timer = setTimeout(() => done('NO ANSWER after 15s — the connection is being held open or dropped silently, which is what a proxy or firewall in the way looks like.'), 15000)
+    ws.addEventListener('open', () => {
+      clearTimeout(timer)
+      // Connected, not identified: this probe never sends the token, so it proves the transport only.
+      done(`OPEN after ${Date.now() - t0}ms — the gateway is reachable from this machine. If the daemon still says NOT CONNECTED, restart it: --stop, then start any Codex session.`)
+    })
+    ws.addEventListener('error', (e) => { clearTimeout(timer); done(`ERROR: ${e?.message ?? 'the connection failed'}`) })
+    ws.addEventListener('close', (e) => {
+      clearTimeout(timer)
+      const why = e?.code === 1006
+        ? 'closed abnormally — nothing completed the WebSocket upgrade: a proxy, a TLS inspector or a firewall between this machine and the host'
+        : e?.code === 1002 || e?.code === 1003
+          ? 'the server rejected the protocol — check that RANY_GATEWAY_URL points at a RANY gateway'
+          : 'closed'
+      done(`CLOSED code ${e?.code ?? '?'}${e?.reason ? ` (${e.reason})` : ''} after ${Date.now() - t0}ms — ${why}.`)
+    })
+  })
   process.exit(0)
 }
 
@@ -1257,7 +1294,7 @@ if (has('--stop')) {
 }
 
 if (!has('--daemon')) {
-  process.stdout.write('RANY codex bridge. Usage: --status | --bind [boardId] | --ensure | --ping | --bye | --daemon | --stop\n')
+  process.stdout.write('RANY codex bridge. Usage: --status | --probe | --bind [boardId] | --ensure | --ping | --bye | --daemon | --stop\n')
   process.exit(0)
 }
 
@@ -2103,7 +2140,8 @@ function connect() {
 
   socket.addEventListener('close', (ev) => {
     if (heartbeat) clearInterval(heartbeat)
-    logRoute('DAEMON', { pid: process.pid, code: ev?.code ?? null }, 'socket closed — retrying in 3s')
+    logRoute('DAEMON', { pid: process.pid, code: ev?.code ?? null },
+      `socket closed${ev?.reason ? ` (${ev.reason})` : ''} — ${config.gatewayUrl} — retrying in 3s`)
     writeState({ ready: false })
     setTimeout(connect, 3000)
   })
