@@ -74,7 +74,7 @@
           {
             "type": "command",
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/listen.mjs\" --rules-guard",
-            "timeout": 10
+            "timeout": 300
           }
         ]
       }

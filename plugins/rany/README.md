@@ -117,6 +117,23 @@ Rules only narrow; `.rany/**` itself is always ask-first. Schema and matching ru
 `docs/architecture/22-work-rooms.md#repo-rules-adr-099`. The matcher lives in `scripts/repo-rules.mjs`, a
 byte-identical copy in all four plugins.
 
+## Permission prompts go to the room, not to this terminal
+
+While this session holds a work-room seat, a call it would not run unattended becomes an **approve / deny
+card in the room's chat**, and the hook waits for the answer: approved, the call runs; denied, it does not;
+unanswered for four minutes, this terminal asks as well and the card stays open. Your owner decides where
+they are already reading — not on the machine the session happens to run on.
+
+Two sources feed it: the checkout's own `approval.*` rules above, and a floor list that applies in **every**
+checkout, `.rany/` or not — `git reset`, `git clean`, `git checkout --` / `git restore`, `git rebase`,
+`rm -r` / `rm -f`, `Remove-Item -Recurse|-Force`, the DB migrator, `drop`/`truncate`, `npm publish`
+(`scripts/room-permission.mjs`). Ordinary work is never asked about: editing, building, testing, committing,
+pushing, moving a file. One approval is one command, remembered for the rules' window (default 15 min), so a
+retry does not file a second card and approving one call never opens another.
+
+Change the wait with `RANY_PERMISSION_WAIT_MS` (default `240000`, clamped to 5 s … 30 min); the hook's own
+timeout in `hooks/hooks.json` is the ceiling above it.
+
 ## The limit, up front
 
 **Nothing happens while no session is open.** Claude Code has no inbound webhook — every hook

@@ -29,6 +29,7 @@ import { request as httpsRequest } from 'node:https'
 import { roomRoutingContextLines } from './room-routing-context.mjs'
 import { sessionAnnouncement } from './seat-session.mjs'
 import { loadRepoRules, repoRulesLines, checkToolCall, refusalReason } from './repo-rules.mjs'
+import { riskyCall, permissionCard, decisionOf, stillWaiting, callKey } from './room-permission.mjs'
 
 const WAKE = 2   // exit code asyncRewake watches for
 const QUIET = 0  // "nothing to say" — the session is not disturbed
@@ -914,6 +915,74 @@ function noteApproval(agentId) {
 }
 
 /**
+ * A decision this seat already has for THIS exact command (room-permission.mjs). Two jobs: an agent that
+ * retries a call must not file a second card for it — the room would fill with duplicates of one question —
+ * and an approval must stay what the owner approved, so it is remembered per command and never per seat.
+ * Kept in a file because the guard runs in its own short-lived process.
+ */
+const guardFile = join(homedir(), '.rany-plugin', 'guard-decisions.json')
+function rememberedDecision(key, windowMs) {
+  try {
+    const rec = JSON.parse(readFileSync(guardFile, 'utf8'))[key]
+    return rec && Number(rec.at) > 0 && Date.now() - Number(rec.at) < windowMs ? rec : null
+  } catch { return null }
+}
+function rememberDecision(key, state, note) {
+  let all = {}
+  try { all = JSON.parse(readFileSync(guardFile, 'utf8')) } catch { /* first one */ }
+  // Only what is still inside any plausible window is worth keeping; the file is a cache, not a record.
+  const cutoff = Date.now() - 4 * 3600_000
+  all = Object.fromEntries(Object.entries(all).filter(([, r]) => Number(r?.at) > cutoff))
+  all[key] = { state, note: note ?? null, at: Date.now() }
+  try { mkdirSync(dirname(guardFile), { recursive: true }); writeFileSync(guardFile, JSON.stringify(all)) } catch { /* ask again */ }
+}
+
+/** How long the guard waits at a filed card before it lets the terminal ask as well. Long enough for an
+ *  owner reading the room to answer, short enough that a session is never frozen for an afternoon. */
+const PERMISSION_WAIT_MS = Math.min(Math.max(Number(process.env.RANY_PERMISSION_WAIT_MS) || 240_000, 5_000), 1_800_000)
+const PERMISSION_POLL_MS = 3_000
+
+/**
+ * Ask the ROOM for a call this session will not run unattended, and wait for the answer (ADR-099 follow-up).
+ *
+ * The card is the one the MCP tool files — same chat card, same approve / deny buttons, same audit — so the
+ * owner answers where they are already reading instead of being sent to the terminal of the machine the
+ * agent happens to work on. Returns the runtime's permission decision, or null when the card could not be
+ * filed at all (offline, no seat, refused): then the caller falls back to what it did before.
+ */
+async function decideInRoom(seat, { what, why, source, cwd, windowMinutes = 15 }) {
+  const key = callKey(seat.agentId, what)
+  const was = rememberedDecision(key, windowMinutes * 60_000)
+  if (was) return decisionOf({ state: was.state, decisionNote: was.note }, { what })
+
+  const filed = await postJson(`/personas/@self/rooms/${seat.agentId}/permission`,
+    { question: permissionCard({ what, cwd, why, source }) }, 8000)
+  if (!filed?.ok || !filed.body?.requestId) return null
+  const requestId = String(filed.body.requestId)
+  // The seat's own tile says what it is waiting for: a seat that goes quiet at a prompt nobody can see is
+  // the whole fault being fixed here, so the waiting itself is on screen.
+  await postJson(`/personas/@self/rooms/${seat.agentId}/activity`,
+    { lines: [{ kind: 'tool', text: `Waiting for your approval: ${what}`.slice(0, 260) }] }, 2500)
+
+  const started = Date.now()
+  let card = filed.body
+  for (;;) {
+    const decided = decisionOf(card, { what })
+    if (decided) {
+      rememberDecision(key, String(card.state), card.decisionNote)
+      // The rules promise a window after an approval (ADR-099) — the listener normally opens it on the
+      // room's decision event, but it is not running while this session is mid-turn.
+      if (card.state === 'approved') noteApproval(seat.agentId)
+      return decided
+    }
+    const waitedMs = Date.now() - started
+    if (waitedMs >= PERMISSION_WAIT_MS) return stillWaiting({ what, channelId: seat.channelId, requestId, waitedMs })
+    await new Promise((r) => setTimeout(r, PERMISSION_POLL_MS))
+    card = (await getJson(`/personas/@self/rooms/${seat.agentId}/permission/${requestId}`)) ?? card
+  }
+}
+
+/**
  * The persona's HOME (ADR-047): the one session its owner chose to BE the persona. Conversations —
  * being addressed in a channel, forwards, workflow steps and questions no board claims — wake the home
  * and nothing else; while it is closed RANY's hosted brain answers them (when a model key is stored),
@@ -1393,31 +1462,60 @@ if (process.argv.includes('--ask-guard')) {
   process.exit(QUIET)
 }
 
-/** `--rules-guard` (PreToolUse on edits and shell commands): the checkout's `.rany/rany.json` enforced (ADR-099).
- *  A seated session gets a refusal that says why — a deny rule is final, an ask-first rule points at
- *  request_permission and opens once the room approves. A session without a seat is only guarded when the
- *  rules say `applyTo: "all"`, and then an ask-first rule is this terminal's own permission prompt. */
+/**
+ * `--rules-guard` (PreToolUse on edits and shell commands): the checkout's `.rany/rany.json` enforced
+ * (ADR-099), and every decision a seated session needs asked for IN THE ROOM.
+ *
+ * Three answers. A `deny` rule is final. An ask-first rule and a call no runtime runs unattended both
+ * become an approval card in the room, and the guard WAITS for it: approved, the call runs; denied, it
+ * does not; unanswered, the terminal asks as it always did and the card stays open. A session without a
+ * seat is only guarded by the rules, and only when they say `applyTo: "all"`.
+ *
+ * The waiting is the point. Before it, such a call stopped at a prompt in the terminal of whichever
+ * machine the agent worked on — which its owner, reading the room, never saw: a seat sat at one from one
+ * evening to the next afternoon ("bu terminal promptları neden ranye taşınmıyor? Aşırı vakit kaybı",
+ * 2026-10-19). A question only one screen can show is a question nobody answers.
+ */
 if (process.argv.includes('--rules-guard')) {
   const hook = await readHookInput()
   const held = Object.entries(loadBindings())
     .find(([, e]) => e && typeof e === 'object' && e.room && e.sessionId === sessionId)
   const cwd = typeof hook.cwd === 'string' && hook.cwd ? hook.cwd : projectDir
   const rules = loadRepoRules(cwd, held ? loadSeatIdentities()[held[0]]?.slug ?? null : null)
-  if (rules && (held || rules.policy.applyTo === 'all')) {
-    const seat = held ? { agentId: held[0], channelId: held[1].room.channelId } : null
-    const hit = checkToolCall(rules, { ...hook, cwd }, { approvedAt: seat ? lastApproval(seat.agentId) : 0 })
-    if (hit) {
-      process.stdout.write(JSON.stringify({
-        hookSpecificOutput: {
-          hookEventName: 'PreToolUse',
-          permissionDecision: hit.kind === 'deny' || seat ? 'deny' : 'ask',
-          permissionDecisionReason: refusalReason(rules, hit, seat),
-        },
-      }) + '\n')
-      // The owner watching the room sees the refusal on the seat's terminal line, not only the agent.
-      if (seat && config.token)
-        await postJson(`/personas/@self/rooms/${seat.agentId}/activity`,
-          { lines: [{ kind: 'tool', text: `Blocked by .rany/ (${hit.kind === 'deny' ? 'never' : 'ask first'}: ${hit.rule}) — ${hit.what}`.slice(0, 260) }] }, 2500)
+  const seat = held ? { agentId: held[0], channelId: held[1].room.channelId } : null
+  const windowMinutes = rules?.policy.approval.windowMinutes ?? 15
+  const say = (out) => process.stdout.write(JSON.stringify({
+    hookSpecificOutput: { hookEventName: 'PreToolUse', ...out },
+  }) + '\n')
+
+  const hit = rules && (seat || rules.policy.applyTo === 'all')
+    ? checkToolCall(rules, { ...hook, cwd }, { approvedAt: seat ? lastApproval(seat.agentId) : 0 })
+    : null
+  if (hit) {
+    // An ask-first rule is the owner's question, so it goes to the owner's screen and waits there. Only
+    // when the card cannot be filed at all does the agent get the old "file request_permission yourself".
+    const decided = hit.kind !== 'deny' && seat && config.token
+      ? await decideInRoom(seat, { what: hit.what, why: hit.rule, source: 'rules', cwd, windowMinutes })
+      : null
+    const out = decided ?? {
+      permissionDecision: hit.kind === 'deny' || seat ? 'deny' : 'ask',
+      permissionDecisionReason: refusalReason(rules, hit, seat),
+    }
+    say(out)
+    // The owner watching the room sees a refusal on the seat's terminal line, not only the agent.
+    if (seat && config.token && out.permissionDecision === 'deny')
+      await postJson(`/personas/@self/rooms/${seat.agentId}/activity`,
+        { lines: [{ kind: 'tool', text: `Blocked by .rany/ (${hit.kind === 'deny' ? 'never' : 'ask first'}: ${hit.rule}) — ${hit.what}`.slice(0, 260) }] }, 2500)
+    process.exit(QUIET)
+  }
+
+  // The floor, for a seated session in ANY checkout — including one with no `.rany/` at all, which is where
+  // this was lost: the runtime would have stopped and asked, and the room is where that question belongs.
+  if (seat && config.token) {
+    const risky = riskyCall(hook)
+    if (risky) {
+      const out = await decideInRoom(seat, { ...risky, source: 'runtime', cwd, windowMinutes })
+      if (out) say(out)
     }
   }
   process.exit(QUIET)
