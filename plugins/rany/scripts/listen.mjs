@@ -96,6 +96,48 @@ function loadBindings() {
 }
 
 /**
+ * Tell the `rany-term` launcher around this session WHICH SEAT it is mirroring (ADR-050).
+ *
+ * The launcher starts before the session exists, so it cannot know: a directory holding several seats
+ * used to get the one that joined last, and one agent's screen appeared under another agent's name while
+ * the working one showed nothing ("Mike'in yaptığı işin terminali Jane'de çıkıyor", 2026-10-21). This is
+ * the only moment the answer exists — so every path that binds a seat, and every hook of a session that
+ * already holds one, writes it into the file the launcher named in `RANY_TERM_HANDOFF`.
+ *
+ * Best effort by design: no launcher (a plain `claude`) means no variable and nothing to write.
+ */
+function writeTermHandoff(agentId, channelId = null, name = null) {
+  const file = process.env.RANY_TERM_HANDOFF
+  if (!file || !agentId) return
+  try {
+    const body = JSON.stringify({
+      agentId: String(agentId), channelId: channelId ? String(channelId) : null,
+      name: name ?? null, sessionId: sessionId ?? null, at: new Date().toISOString(),
+    })
+    // Unchanged content is not rewritten: the launcher polls the file and a fresh mtime every hook would
+    // have it re-reading for nothing.
+    try { if (readFileSync(file, 'utf8').replace(/"at":"[^"]*"/, '') === body.replace(/"at":"[^"]*"/, '')) return } catch { /* first write */ }
+    mkdirSync(dirname(file), { recursive: true })
+    writeFileSync(file, body)
+  } catch { /* the mirror is a nicety; never cost the session a turn over it */ }
+}
+
+/** The one work-room seat this session holds, if any (see `releaseOtherSeats`), as `[agentId, entry]`. */
+function heldSeat(sid = sessionId) {
+  if (!sid) return null
+  return Object.entries(loadBindings())
+    .find(([, e]) => e && typeof e === 'object' && e.room && e.sessionId === sid) ?? null
+}
+
+/** Hand the launcher the seat this session already holds — called from the hooks, so a window whose seat
+ *  was bound before the launcher was watching (or in an earlier session) still gets its own screen. */
+function handoffHeldSeat(sid = sessionId) {
+  if (!process.env.RANY_TERM_HANDOFF) return
+  const held = heldSeat(sid)
+  if (held) writeTermHandoff(held[0], held[1]?.room?.channelId ?? null, held[1]?.room?.name ?? null)
+}
+
+/**
  * Which binding claims this id, if any. One map holds both kinds, because RANY makes them the same
  * number: a guild's DEFAULT board carries the guild's own id. What the id MEANS is decided by the
  * caller — tasks look up the board and only the board; guild conversations, which carry no board id at
@@ -600,6 +642,8 @@ async function reattachSeat(agentId, h, sid = sessionId) {
   } catch (e) {
     return `RANY: took back the seat, but could not save the binding (${e?.message ?? e}).`
   }
+  // Same window, same screen: the launcher learns the seat here too, not only on a fresh join.
+  writeTermHandoff(seat.agentId, seat.channelId, seat.name)
   // Read before recording: the seat's LAST local session is the one this window is not.
   const earlier = lastSessionOf(seat.agentId, sid)
   recordSeat(seat.agentId, seat, sid)
@@ -1309,6 +1353,8 @@ async function joinSeat(code, sid = sessionId) {
   } catch (e) {
     return `RANY: joined the work room, but could not save the seat binding (${e?.message ?? e}).`
   }
+  // The launcher around this window has been holding its screen until it knew whose it was (ADR-050).
+  writeTermHandoff(seat.agentId, seat.channelId, seat.name)
   recordSeat(seat.agentId, seat, sid) // so the next session in this repo takes the seat back by itself (db/0365)
   saveSeatIdentity(seat.agentId, seat.identity ?? null, seat.style ?? null, seat.approval ?? null) // the role brief the owner picked on the link (ADR-055)
   // Declared with the boards, so the room shows this seat as live straight away.
@@ -1415,6 +1461,9 @@ if (process.argv.includes('--resume')) {
  */
 if (process.argv.includes('--prompt')) {
   const hook = await readHookInput()
+  // A seat bound in an earlier session, or before the launcher started watching, still has to reach the
+  // screen mirror — so the seat is handed over on the ordinary hooks too, not only at the join itself.
+  handoffHeldSeat(sessionId ?? (typeof hook.session_id === 'string' ? hook.session_id : null))
   // `/rany-home` makes THIS session the persona's home (ADR-047). Done here rather than by the command
   // alone because the hook knows the session for certain; the command's own run is the fallback.
   if (/^\s*\/rany(?::rany)?-home\b/i.test(String(hook.prompt ?? '')) && config.token) {
@@ -1528,6 +1577,7 @@ if (process.argv.includes('--beat')) {
   // never cost the agent its turn (async hook, short timeout, no retry).
   const seats = Object.entries(loadBindings())
     .filter(([, e]) => e && typeof e === 'object' && e.room && e.sessionId === sessionId).map(([id]) => id)
+  handoffHeldSeat()
   if (config.token && seats.length > 0) {
     const hook = await readHookInput()
     const line = toolLine(hook)
@@ -1560,7 +1610,9 @@ function prepareTerm() {
     const stable = join(homedir(), '.rany-plugin', 'term')
     if (!existsSync(join(src, 'rany-term.mjs'))) return
     mkdirSync(stable, { recursive: true })
-    for (const f of ['rany-term.mjs', 'package.json']) {
+    // `seat-choice.mjs` FIRST: rany-term.mjs imports it, so the copy must never leave a launcher newer
+    // than its own module (that would be a crash on `claude`, not a missing mirror).
+    for (const f of ['seat-choice.mjs', 'rany-term.mjs', 'package.json']) {
       const next = readFileSync(join(src, f))
       let cur = null
       try { cur = readFileSync(join(stable, f)) } catch { /* first time */ }
@@ -1695,6 +1747,10 @@ if (!config.token) {
 // forget about it. Silent on every failure — this is a convenience, never a reason to disturb a session.
 // Before the reminder below, which may end this process with a wake.
 prepareTerm()
+
+// The launcher that wrapped this window is holding its screen until it hears which seat this is (ADR-050).
+// The listener runs at the end of every turn, so this is the latest a re-attached seat can be told about.
+handoffHeldSeat()
 
 // Re-bind reminder (once per session): this repo has handled boards before, but a session-scoped
 // binding dies with its window, so a fresh session owns nothing until you say so. Rather than leave

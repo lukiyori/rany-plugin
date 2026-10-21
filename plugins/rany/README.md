@@ -224,6 +224,15 @@ repository's seats with the command for each. The ids are also reported to RANY 
 its OWNER the same command — nobody else is served them, because a session id means something only on the
 machine that ran it, and nothing is ever launched from the browser.
 
+Both of those answer "which seat is this window?", and in a directory holding SEVERAL seats the launcher
+does not answer it at all: it starts before the session exists, so anything it picked would be a guess, and
+a wrong one puts one agent's screen under another agent's name. It holds the screen instead (up to 512 KB,
+oldest dropped) and says so on the terminal; the plugin writes the seat into the file named by
+`RANY_TERM_HANDOFF` as soon as the session binds one — a join, a re-attach, or the first hook of a session
+that already holds a seat — and the launcher binds then and sends what it held. `claude --seat <agentId>`
+says it up front and is never moved afterwards. Auto-resume follows the same rule: with several seats in one
+directory it continues none of them.
+
 `ownerMentions` is the persona overhearing a mention of *you* rather than being addressed itself.
 Off because in a busy guild it interrupts constantly, and because nothing in it is a request.
 `addressed` still matters only for a persona with **no** stored model key: a hosted one answers its

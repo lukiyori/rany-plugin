@@ -25,6 +25,9 @@ import { homedir, tmpdir } from 'node:os'
 import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
 import { createRequire } from 'node:module'
+// Beside this file, and copied beside it into ~/.rany-plugin/term by the plugin's prepareTerm — which
+// writes it BEFORE rany-term.mjs, so a launcher is never newer than the module it imports.
+import { chooseSeat, handoffSeat } from './seat-choice.mjs'
 
 const here = dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'))
 const require = createRequire(import.meta.url)
@@ -77,18 +80,21 @@ if (!config.token) {
 
 const norm = (p) => p.replace(/[\\/]+/g, '/').replace(/\/$/, '').toLowerCase()
 
-/** The seat this directory holds for this KIND of agent (claude / codex — both plugins write the same
- *  seat history), newest first. Nothing for the kind ⇒ any seat of the directory. */
-function rememberedSeat(dir, kind) {
+/** Every seat this directory remembers for this KIND of agent (claude / codex — both plugins write the
+ *  same seat history), newest first. Nothing for the kind ⇒ any seat of the directory. */
+function rememberedSeats(dir, kind) {
   try {
     const repos = JSON.parse(readFileSync(join(homedir(), '.rany-plugin', 'seat-history.json'), 'utf8')).repos ?? {}
     const all = Object.entries(repos[norm(dir)] ?? {})
     const mine = all.filter(([, s]) => (s?.agent ?? 'claude') === kind)
-    const seats = (mine.length ? mine : all)
+    return (mine.length ? mine : all)
       .sort((a, b) => String(b[1]?.lastJoined ?? '').localeCompare(String(a[1]?.lastJoined ?? '')))
-    return seats[0] ? { id: seats[0][0], ...seats[0][1] } : null
-  } catch { return null }
+      .map(([id, s]) => ({ id, ...s }))
+  } catch { return [] }
 }
+
+// Which of those seats this terminal is — `chooseSeat` in ./seat-choice.mjs, where the rule and its reason
+// live so a test can hold them without a pty.
 
 // ---- args -------------------------------------------------------------------------------------------
 const argv = process.argv.slice(2)
@@ -253,7 +259,10 @@ function sessionFree(s) {
 }
 
 if (!wantsNew && command.length === 1 && seatSetting(agentKind, 'autoResume', true)) {
-  const seat = rememberedSeat(process.cwd(), agentKind)
+  // Only a directory with ONE seat, or an explicit `--seat`, says whose conversation to continue: with
+  // several seats, resuming "the newest" opens another agent's thinking in this window — the same guess
+  // that crossed the screens, and a worse mistake, because the window then IS the other seat.
+  const seat = chooseSeat(rememberedSeats(process.cwd(), agentKind), seatArg).seat
   const last = (Array.isArray(seat?.sessions) ? seat.sessions : [])
     .filter((s) => s?.id && sessionFree(s)).map((s) => s.id)
     .find((id) => sessionOnDisk(agentKind, process.cwd(), id)) ?? null
@@ -299,6 +308,11 @@ const FLUSH_MS = 120           // a frame or two of TUI redraw per request
 const MAX_BATCH_BYTES = 64 * 1024
 const KEEPALIVE_MS = 5000      // an idle screen still says "I am here" (the meet screen's live dot)
 
+// While no seat is known yet, the screen is kept rather than thrown away — a session takes a second or two
+// to bind, and the first frames are the ones that say what this window is. Oldest output goes first once
+// the hold is full; the size marks (`s`, `r`) are small and always kept.
+const UNBOUND_MAX_BYTES = 512 * 1024
+
 class Mirror {
   constructor(seatId) {
     this.seatId = seatId
@@ -310,8 +324,18 @@ class Mirror {
     this.failures = 0
     this.warned = false
   }
+  /** The session told us which seat this window is (RANY_TERM_HANDOFF). Everything held so far belongs to
+   *  it, so it goes out as the first frames of that seat's screen. */
+  bind(seatId, name) {
+    if (!seatId || this.seatId === seatId) return false
+    const held = this.seatId === null
+    this.seatId = String(seatId)
+    process.stderr.write(`\x1b[2mrany-term: this terminal is work-room seat ${name ? `"${name}" ` : ''}(${this.seatId})`
+      + `${held && this.queue.length ? ' — sending what it has shown so far' : ''}.\x1b[0m\r\n`)
+    if (this.queue.length) void this.flush()
+    return true
+  }
   push(t, d) {
-    if (!this.seatId) return
     // Coalesce consecutive output chunks so a busy redraw is one entry, not fifty.
     const last = this.queue[this.queue.length - 1]
     if (t === 'o' && last && last.t === 'o' && last.buf.length + d.length <= MAX_BATCH_BYTES) {
@@ -320,11 +344,22 @@ class Mirror {
       this.queue.push(t === 'o' ? { t, buf: d } : { t, d })
     }
     this.bytes += t === 'o' ? d.length : 0
+    if (!this.seatId) { this.trim(); return }
     if (this.bytes >= MAX_BATCH_BYTES) void this.flush()
     else if (!this.timer) this.timer = setTimeout(() => void this.flush(), FLUSH_MS)
   }
+  /** Nothing can be sent before a seat is known, so the hold is bounded: drop from the FRONT, which is
+   *  the oldest screen, and keep what the owner will actually want to see. */
+  trim() {
+    while (this.bytes > UNBOUND_MAX_BYTES && this.queue.length > 1) {
+      const gone = this.queue.shift()
+      this.bytes -= gone.t === 'o' ? gone.buf.length : 0
+    }
+  }
   async flush() {
     if (this.timer) { clearTimeout(this.timer); this.timer = null }
+    if (!this.seatId) return
+
     if (this.inflight) { await this.inflight; if (this.queue.length === 0) return }
     if (this.queue.length === 0) return
     const chunks = this.queue.splice(0, 200).map((c) => c.t === 'o' ? { t: 'o', d: c.buf.toString('base64') } : { t: c.t, d: c.d })
@@ -346,6 +381,7 @@ class Mirror {
   keepalive() {
     // The keepalive carries the SIZE rather than a bare mark: the viewer opens on the tail of the stream,
     // and a tail without an `r` in it would render at the wrong width and scramble a full-screen TUI.
+    if (!this.seatId) return
     if (Date.now() - this.lastFlush >= KEEPALIVE_MS && this.queue.length === 0)
       this.push('r', `${process.stdout.columns || cols},${process.stdout.rows || rows}`)
   }
@@ -354,8 +390,52 @@ class Mirror {
 // ---- run --------------------------------------------------------------------------------------------
 const pty = loadPty()
 const cwd = process.cwd()
-const seat = seatArg ? { id: seatArg } : rememberedSeat(cwd, agentKind)
+const seatsHere = rememberedSeats(cwd, agentKind)
+const choice = chooseSeat(seatsHere, seatArg)
+const seat = choice.seat
 const mirror = new Mirror(seat?.id ?? null)
+
+/**
+ * The handoff: a file this launcher owns, whose path the plugin reads out of the environment and whose
+ * contents name THIS session's seat (`{agentId, channelId, sessionId}`). The plugin writes it the moment
+ * the session binds — a join, a re-attach, or any hook of a session that already holds a seat — and the
+ * mirror switches to that seat, sending the screen it held while waiting.
+ *
+ * It is how a terminal stops guessing: the launcher starts first and cannot know which seat of a
+ * directory this window will be, and a wrong guess puts one agent's screen under another's name.
+ */
+const handoffFile = join(homedir(), '.rany-plugin', 'term', 'handoff', `${process.pid}.json`)
+function readHandoff() {
+  try { return handoffSeat(readFileSync(handoffFile, 'utf8')) } catch { return null }
+}
+let handoffTimer = null
+function watchHandoff() {
+  try { mkdirSync(dirname(handoffFile), { recursive: true }) } catch { /* best effort */ }
+  try { rmSync(handoffFile, { force: true }) } catch { /* nothing there */ }
+  // A window killed hard leaves its file behind, and pids come round again: sweep anything stale so a new
+  // launcher never reads yesterday's seat out of a file it thinks is its own.
+  try {
+    const dir = dirname(handoffFile)
+    for (const name of readdirSync(dir)) {
+      const f = join(dir, name)
+      if (Date.now() - statSync(f).mtimeMs > 24 * 60 * 60 * 1000) rmSync(f, { force: true })
+    }
+  } catch { /* nothing to sweep */ }
+  // Polled, not watched: fs.watch on a file a foreign process creates is unreliable on Windows, and half a
+  // second is invisible next to how long a session takes to come up. Kept running for the window's life, so
+  // a room joined an hour in starts mirroring then — and a session that MOVES seat moves the screen with it.
+  handoffTimer = setInterval(() => {
+    const h = readHandoff()
+    if (h) mirror.bind(h.id, h.name)
+  }, 500)
+  handoffTimer.unref?.()
+}
+function stopWatchingHandoff() {
+  if (handoffTimer) { clearInterval(handoffTimer); handoffTimer = null }
+  try { rmSync(handoffFile, { force: true }) } catch { /* gone already */ }
+}
+// `--seat` is the owner being explicit, and nothing a session says may move the screen off it.
+if (!choice.pinned) watchHandoff()
 
 const cols = process.stdout.columns || 120
 const rows = process.stdout.rows || 30
@@ -370,7 +450,8 @@ if (process.env.RANY_TERM_DEBUG) process.stderr.write(`rany-term: spawn ${file} 
 // many times a second (Codex). node-pty ships Windows Terminal's current conpty.dll; prefer it, and fall
 // back to the in-box one only if that build refuses to load. `conptyInheritCursor` keeps the first frame
 // from jumping to the top-left of the outer terminal.
-const ptyOpts = { name: 'xterm-256color', cols, rows, cwd, env: { ...process.env, RANY_TERM: '1' } }
+const ptyOpts = { name: 'xterm-256color', cols, rows, cwd,
+  env: { ...process.env, RANY_TERM: '1', ...(choice.pinned ? {} : { RANY_TERM_HANDOFF: handoffFile }) } }
 let child
 if (process.platform === 'win32') {
   try { child = pty.spawn(file, args, { ...ptyOpts, useConptyDll: true, conptyInheritCursor: true }) }
@@ -394,6 +475,12 @@ if (process.platform === 'win32') {
 // those must look exactly like the plain program, so the no-seat case says nothing unless asked.
 if (seat?.id)
   process.stderr.write(`\x1b[2mrany-term: mirroring this terminal to work-room seat ${seat.name ? `"${seat.name}" ` : ''}(${seat.id}) — owner-only view in RANY.\x1b[0m\r\n`)
+else if (choice.waiting)
+  // Several seats live here, so which one this window is, is the session's to say — not this launcher's to
+  // guess. Until it does, the screen is held rather than sent to the wrong seat.
+  process.stderr.write(`\x1b[2mrany-term: ${seatsHere.length} work-room seats live in ${cwd}`
+    + ` (${seatsHere.slice(0, 3).map((s) => s.name ?? s.id).join(', ')}${seatsHere.length > 3 ? ', …' : ''});`
+    + ` waiting for this session to say which one it holds. \`--seat <agentId>\` says it now.\x1b[0m\r\n`)
 else if (process.env.RANY_TERM_DEBUG || seatArg === null && argv.length === 0)
   process.stderr.write(`\x1b[33mrany-term: no work-room seat remembered for ${cwd}; running without a mirror (join a room first, or pass --seat <agentId>).\x1b[0m\r\n`)
 
@@ -419,6 +506,7 @@ const beat = setInterval(() => mirror.keepalive(), KEEPALIVE_MS)
 
 child.onExit(async ({ exitCode }) => {
   clearInterval(beat)
+  stopWatchingHandoff()
   mirror.push('e', String(exitCode ?? 0))
   await mirror.flush()
   if (mirror.inflight) await mirror.inflight
