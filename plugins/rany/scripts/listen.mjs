@@ -28,6 +28,7 @@ import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
 import { roomRoutingContextLines } from './room-routing-context.mjs'
 import { sessionAnnouncement } from './seat-session.mjs'
+import { seatTitleOf, titleSequence } from './seat-title.mjs'
 import { loadRepoRules, repoRulesLines, checkToolCall, refusalReason } from './repo-rules.mjs'
 import { riskyCall, permissionCard, decisionOf, stillWaiting, callKey } from './room-permission.mjs'
 
@@ -135,6 +136,11 @@ function handoffHeldSeat(sid = sessionId) {
   if (!process.env.RANY_TERM_HANDOFF) return
   const held = heldSeat(sid)
   if (held) writeTermHandoff(held[0], held[1]?.room?.channelId ?? null, held[1]?.room?.name ?? null)
+}
+
+/** What the session holding a seat is called, "<seat> @ <room>" (seat-title.mjs); null without a seat. */
+function seatTitle(sid = sessionId) {
+  return seatTitleOf(heldSeat(sid)?.[1]?.room)
 }
 
 /**
@@ -1445,6 +1451,26 @@ if (leaveAt !== -1) {
   process.exit(QUIET)
 }
 
+/**
+ * `--title` (SessionStart, synchronous): a session that already sits in a work room — a resumed or forked
+ * one whose seat is bound to it — is NAMED after its seat, "<seat> @ <room>", the way /rename would. The
+ * name is what the terminal tab, /resume and the prompt bar show, and unlike the tab title Claude Code
+ * keeps it. A title the person set themselves (`session_title`) is never overwritten. A seat taken
+ * mid-session (a pasted link, /rany-rejoin) gets the tab title from the prompt hook instead: no hook but
+ * this one can name a session.
+ */
+if (process.argv.includes('--title')) {
+  const hook = await readHookInput()
+  const sid = typeof hook.session_id === 'string' && hook.session_id ? hook.session_id : sessionId
+  const title = ['startup', 'resume', 'fork'].includes(hook.source) && !hook.session_title ? seatTitle(sid) : null
+  if (title)
+    process.stdout.write(JSON.stringify({
+      hookSpecificOutput: { hookEventName: 'SessionStart', sessionTitle: title },
+      terminalSequence: titleSequence(title),
+    }) + '\n')
+  process.exit(QUIET)
+}
+
 /** `--resume`: list the local conversations this repo's seats were worked in, with the command for each
  *  (the /rany-resume command). Read-only, no network, no server call. */
 if (process.argv.includes('--resume')) {
@@ -1463,23 +1489,27 @@ if (process.argv.includes('--prompt')) {
   const hook = await readHookInput()
   // A seat bound in an earlier session, or before the launcher started watching, still has to reach the
   // screen mirror — so the seat is handed over on the ordinary hooks too, not only at the join itself.
-  handoffHeldSeat(sessionId ?? (typeof hook.session_id === 'string' ? hook.session_id : null))
+  const promptSid = sessionId ?? (typeof hook.session_id === 'string' && hook.session_id ? hook.session_id : null)
+  handoffHeldSeat(promptSid)
+  // The tab keeps the seat's name (see seatTitle): put back on every prompt, because Claude Code retitles
+  // the terminal from the conversation as it goes. Computed after a join below, so a pasted link names the
+  // tab at once.
+  const withTitle = (out) => {
+    const seq = titleSequence(seatTitle(promptSid))
+    return seq ? { ...out, terminalSequence: seq } : out
+  }
   // `/rany-home` makes THIS session the persona's home (ADR-047). Done here rather than by the command
   // alone because the hook knows the session for certain; the command's own run is the fallback.
   if (/^\s*\/rany(?::rany)?-home\b/i.test(String(hook.prompt ?? '')) && config.token) {
-    const homeSid = sessionId ?? (typeof hook.session_id === 'string' && hook.session_id ? hook.session_id : null)
-    process.stdout.write(JSON.stringify({
-      hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: await setHome(homeSid) },
-    }) + '\n')
+    process.stdout.write(JSON.stringify(withTitle({
+      hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: await setHome(promptSid) },
+    })) + '\n')
     process.exit(QUIET)
   }
   const code = inviteCodeIn(hook.prompt)
-  if (code && config.token) {
-    const sid = sessionId ?? (typeof hook.session_id === 'string' && hook.session_id ? hook.session_id : null)
-    process.stdout.write(JSON.stringify({
-      hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: await joinSeat(code, sid) },
-    }) + '\n')
-  }
+  const joined = code && config.token ? await joinSeat(code, promptSid) : null
+  const out = withTitle(joined ? { hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: joined } } : {})
+  if (Object.keys(out).length) process.stdout.write(JSON.stringify(out) + '\n')
   process.exit(QUIET)
 }
 

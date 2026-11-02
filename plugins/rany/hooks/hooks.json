@@ -8,6 +8,11 @@
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/listen.mjs\"",
             "asyncRewake": true,
             "timeout": 86400
+          },
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/listen.mjs\" --title",
+            "timeout": 10
           }
         ]
       }
