@@ -1183,6 +1183,9 @@ function loadConfig() {
     // ENDS, so a terminal left idle overnight stopped listening at hour eight and its seat went deaf until someone
     // typed in it (owner, 2026-10-04: "baglanti kopuyor bir sure sonra"). An abandoned listener is caught by the
     // parent check below instead; this only bounds a pathological one.
+    // It must not outlive the hook's own `timeout` in hooks.json either: that was 86400 s, so Claude Code killed the
+    // listener 24 h after a terminal's last turn and the seat went deaf the same way (2026-11-07, a "wake up" in the
+    // room skipped with "no seat bound here"). Both are now a week.
     maxMinutes: file.maxMinutes ?? 7 * 24 * 60,
     // Taking a remembered work-room seat back is OFF by default, and the default is the whole point.
     // A seat makes its session wake for the room, and a woken session pays for its whole accumulated

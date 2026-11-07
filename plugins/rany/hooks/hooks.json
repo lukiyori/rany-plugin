@@ -7,7 +7,7 @@
             "type": "command",
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/listen.mjs\"",
             "asyncRewake": true,
-            "timeout": 86400
+            "timeout": 604800
           },
           {
             "type": "command",
@@ -47,7 +47,7 @@
             "type": "command",
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/listen.mjs\"",
             "asyncRewake": true,
-            "timeout": 86400
+            "timeout": 604800
           }
         ]
       }
