@@ -1828,6 +1828,53 @@ let heartbeat = null
 let claimBeat = null
 let socket = null
 
+// ── Message receipts (ADR-110) ───────────────────────────────────────────────────────────────────────────
+// The room shows, under each message, whether the seats it went to have taken it. This listener is the only
+// thing that knows: the wake is the moment a session takes a message. And because nothing listens while the
+// session is mid-turn, what reached a seat meanwhile is kept by the server and pulled back here when the
+// listener starts again (the turn ended) — the same prompt it would have had live.
+const takenNow = []   // { agentId, messageId } the wake about to happen carries
+function sendReceipts(agentId, messageIds, state, timeoutMs = 2500) {
+  const ids = messageIds.filter(Boolean).map(String)
+  if (!ids.length) return Promise.resolve(null)
+  return postJson(`/personas/@self/rooms/${agentId}/receipts`, { messageIds: ids, state }, timeoutMs)
+}
+async function flushTaken() {
+  const bySeat = new Map()
+  for (const t of takenNow.splice(0)) bySeat.set(t.agentId, [...(bySeat.get(t.agentId) ?? []), t.messageId])
+  await Promise.all([...bySeat].map(([agentId, ids]) => sendReceipts(agentId, ids, 'taken')))
+}
+/** At most this many held messages wake a session at once; the rest come with the next turn's end. */
+const INBOX_WAKE_MAX = 6
+let inboxDrained = false
+async function drainInbox() {
+  if (inboxDrained || config.wake.rooms === false) return
+  inboxDrained = true
+  const seats = mySeatIds()
+  const prompts = []
+  for (const agentId of seats) {
+    const res = await postJson(`/personas/@self/rooms/${agentId}/inbox`, {}, 4000)
+    const held = Array.isArray(res?.body?.messages) ? res.body.messages : []
+    for (const m of held) {
+      if (prompts.length >= INBOX_WAKE_MAX) break
+      const d = { ...(m.payload ?? {}), forSeat: agentId }
+      if (!d.messageId) d.messageId = m.messageId
+      const text = await classify('PERSONA_ROOM_MESSAGE', d)
+      if (text) prompts.push(text)
+      else void sendReceipts(agentId, [m.messageId], 'passed') // nothing here will ever take it
+    }
+  }
+  if (!prompts.length) return
+  logRoute('LISTENER', { pid: process.pid, held: prompts.length }, 'inbox: waking with messages held while busy')
+  await flushTaken()
+  done(WAKE, [
+    `RANY: ${prompts.length === 1 ? 'this room message' : `these ${prompts.length} room messages`} reached you while you`,
+    `were busy (the room kept ${prompts.length === 1 ? 'it' : 'them'} for you; oldest first):`,
+    ``,
+    prompts.join('\n\n────────\n\n'),
+  ].join('\n'))
+}
+
 const done = (code, text) => {
   logRoute('LISTENER', { pid: process.pid }, code === WAKE ? 'exit: waking the session' : 'exit: quiet')
   if (text) process.stdout.write(text + '\n')
@@ -2343,7 +2390,10 @@ async function classify(type, d) {
     // A seat joined by invite link is bound under its OWN id; a board-seated one under its board.
     const bound = seats.filter((s) => s && (ownedHere(claimedBy(String(s.agentId)))
       || (s.boardId && ownedHere(claimedBy(String(s.boardId))))))
-    const seat = bound.find((s) => String(s.agentId) === String(d.agentId ?? '')) ?? bound[0]
+    // A message pulled from the seat's inbox (ADR-110) names the seat it was kept for; prefer that one, or a
+    // second seat held by this session would take it and the first would be offered it again forever.
+    const seat = bound.find((s) => String(s.agentId) === String(d.forSeat ?? ''))
+      ?? bound.find((s) => String(s.agentId) === String(d.agentId ?? '')) ?? bound[0]
     if (!seat) {
       logRoute(type, { channelId: d.channelId }, 'skip (no seat bound here)')
       return null
@@ -2361,6 +2411,8 @@ async function classify(type, d) {
         if (!d.named && String(lead.agentId) !== String(seat.agentId)) {
           logRoute(type, { channelId: d.channelId, agentId: seat.agentId },
             `skip (same checkout: ${lead.name ?? lead.agentId} takes it)`)
+          // Not "queued" on this seat's tile in the chat: the lead takes it (ADR-110).
+          void sendReceipts(seat.agentId, [d.messageId], 'passed')
           return null
         }
         d.checkoutMates = mates
@@ -2368,6 +2420,8 @@ async function classify(type, d) {
       }
     }
     logRoute(type, { channelId: d.channelId, agentId: seat.agentId, boardId: seat.boardId }, 'wake')
+    // The chat shows the message as being worked on once the session is woken with it (ADR-110).
+    if (type === 'PERSONA_ROOM_MESSAGE' && d.messageId) takenNow.push({ agentId: String(seat.agentId), messageId: String(d.messageId) })
     if (type === 'PERSONA_ROOM_DECISION' && d.approved) noteApproval(seat.agentId)
     // The seat's identity (ADR-055): fetched again when the room says it changed, else when the copy is old.
     await ensureSeatIdentity(seat.agentId,
@@ -2548,12 +2602,16 @@ function connect() {
       if (claimBeat) clearInterval(claimBeat)
       claimBeat = setInterval(() => void declareBoards(boardsHere()), CLAIM_REFRESH_MS)
       claimBeat.unref?.()
+      void drainInbox()
       return
     }
     if (!personaUserId) return
 
     const summary = await classify(frame.t, frame.d ?? {})
-    if (summary) done(WAKE, summary)
+    if (summary) {
+      await flushTaken()
+      done(WAKE, summary)
+    }
   })
 
   // A dropped socket is not news. Reconnect quietly; the Stop hook would respawn us anyway.
