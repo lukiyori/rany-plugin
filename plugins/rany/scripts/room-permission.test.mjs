@@ -93,9 +93,10 @@ test('a pending card is no decision at all', () => {
   assert.equal(decisionOf(null, { what: 'x' }), null)
 })
 
-test('when the wait runs out the terminal may still ask, and the room keeps the card', () => {
+test('when the wait runs out the call is held back (never a terminal prompt the room cannot reach), and the room keeps the card', () => {
   const s = stillWaiting({ what: 'git clean -fd', channelId: '94778527731154944', requestId: '105', waitedMs: 240_000 })
-  assert.equal(s.permissionDecision, 'ask')
+  assert.equal(s.permissionDecision, 'deny')
+  assert.match(s.permissionDecisionReason, /wakes you/)
   assert.match(s.permissionDecisionReason, /105/)
   assert.match(s.permissionDecisionReason, /240s/)
   assert.match(s.permissionDecisionReason, /not file a second card/)

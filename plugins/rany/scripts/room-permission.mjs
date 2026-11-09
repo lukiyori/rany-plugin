@@ -108,14 +108,19 @@ export function decisionOf(request, { what, channelId = null } = {}) {
   return null
 }
 
-/** What to tell the runtime when the card is filed but no answer came while we could wait: the terminal
- *  asks as it always did, and the card stays in the room for whoever gets there first. */
+/** What to tell the runtime when the card is filed but no answer came while we could wait. NOT "ask": a
+ *  terminal prompt is something the room's Approve can never reach — the owner approved the card and the
+ *  terminal sat there anyway (owner, 2026-11-09: "izin veriyoruz ama terminal geçmiyor"). So the call is
+ *  held back, the card stays open, and the owner's answer WAKES the session (PERSONA_ROOM_DECISION); the
+ *  retry of the same command then reads that same card and runs — or not — by what it says. */
 export function stillWaiting({ what, channelId, requestId, waitedMs }) {
   return {
-    permissionDecision: 'ask',
-    permissionDecisionReason: `An approval card for \`${what}\` is open in the work room `
+    permissionDecision: 'deny',
+    permissionDecisionReason: `NOT RUN YET — an approval card for \`${what}\` is open in the work room `
       + `(request ${requestId}, channel ${channelId}) and nobody answered it in ${Math.round(waitedMs / 1000)}s. `
-      + 'It can be answered there or here; do not file a second card for the same command.',
+      + 'Say in ONE room line that you are waiting on it, then end your turn: the answer wakes you, and running '
+      + 'the exact same command again then follows it. Do not file a second card for the same command and do '
+      + 'not work around it.',
   }
 }
 

@@ -121,7 +121,9 @@ byte-identical copy in all four plugins.
 
 While this session holds a work-room seat, a call it would not run unattended becomes an **approve / deny
 card in the room's chat**, and the hook waits for the answer: approved, the call runs; denied, it does not;
-unanswered for four minutes, this terminal asks as well and the card stays open. Your owner decides where
+unanswered for 25 minutes, the call is held back, the card stays open, and the answer wakes the session — the
+retry of the same command reads that card and follows it. It never falls back to a terminal prompt: an
+approval in the room could not reach one. Your owner decides where
 they are already reading — not on the machine the session happens to run on.
 
 Two sources feed it: the checkout's own `approval.*` rules above, and a floor list that applies in **every**
@@ -131,7 +133,7 @@ checkout, `.rany/` or not — `git reset`, `git clean`, `git checkout --` / `git
 pushing, moving a file. One approval is one command, remembered for the rules' window (default 15 min), so a
 retry does not file a second card and approving one call never opens another.
 
-Change the wait with `RANY_PERMISSION_WAIT_MS` (default `240000`, clamped to 5 s … 30 min); the hook's own
+Change the wait with `RANY_PERMISSION_WAIT_MS` (default `1500000` = 25 min, clamped to 5 s … 29 min); the hook's own
 timeout in `hooks/hooks.json` is the ceiling above it.
 
 ## The limit, up front

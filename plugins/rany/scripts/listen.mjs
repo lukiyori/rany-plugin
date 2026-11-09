@@ -977,19 +977,23 @@ function rememberedDecision(key, windowMs) {
     return rec && Number(rec.at) > 0 && Date.now() - Number(rec.at) < windowMs ? rec : null
   } catch { return null }
 }
-function rememberDecision(key, state, note) {
+function rememberDecision(key, state, note, requestId = null) {
   let all = {}
   try { all = JSON.parse(readFileSync(guardFile, 'utf8')) } catch { /* first one */ }
   // Only what is still inside any plausible window is worth keeping; the file is a cache, not a record.
   const cutoff = Date.now() - 4 * 3600_000
   all = Object.fromEntries(Object.entries(all).filter(([, r]) => Number(r?.at) > cutoff))
-  all[key] = { state, note: note ?? null, at: Date.now() }
+  all[key] = { state, note: note ?? null, at: Date.now(), ...(requestId ? { requestId } : {}) }
   try { mkdirSync(dirname(guardFile), { recursive: true }); writeFileSync(guardFile, JSON.stringify(all)) } catch { /* ask again */ }
 }
 
-/** How long the guard waits at a filed card before it lets the terminal ask as well. Long enough for an
- *  owner reading the room to answer, short enough that a session is never frozen for an afternoon. */
-const PERMISSION_WAIT_MS = Math.min(Math.max(Number(process.env.RANY_PERMISSION_WAIT_MS) || 240_000, 5_000), 1_800_000)
+/** How long the guard waits at a filed card before it holds the call back (stillWaiting) and lets the session end its turn. 25 minutes, not 4: the
+ *  owner answers in the ROOM, often from a phone, and a card answered after the guard gave up changed nothing —
+ *  the terminal was already asking, and the room's "Approve" landed on a prompt nobody was looking at (owner,
+ *  2026-11-08: "terminaldeki sorular neden card olmuyor?" — card filed, answered at 8 minutes, guard gone at 4).
+ *  Waiting costs nothing the terminal prompt would not: the session is stopped either way. The card itself
+ *  lives an hour; the hook's own timeout in hooks.json is 30 minutes and must stay above this. */
+const PERMISSION_WAIT_MS = Math.min(Math.max(Number(process.env.RANY_PERMISSION_WAIT_MS) || 1_500_000, 5_000), 1_740_000)
 const PERMISSION_POLL_MS = 3_000
 
 /**
@@ -1002,13 +1006,30 @@ const PERMISSION_POLL_MS = 3_000
  */
 async function decideInRoom(seat, { what, why, source, cwd, windowMinutes = 15 }) {
   const key = callKey(seat.agentId, what)
-  const was = rememberedDecision(key, windowMinutes * 60_000)
-  if (was) return decisionOf({ state: was.state, decisionNote: was.note }, { what })
+  // A decision counts for the rules' window; a parked card for as long as the card itself lives (an hour).
+  const rec = rememberedDecision(key, 60 * 60_000)
+  const was = rec && (rec.state === 'pending' || Date.now() - Number(rec.at) < windowMinutes * 60_000) ? rec : null
+  if (was && was.state !== 'pending') return decisionOf({ state: was.state, decisionNote: was.note }, { what })
 
-  const filed = await postJson(`/personas/@self/rooms/${seat.agentId}/permission`,
-    { question: permissionCard({ what, cwd, why, source }) }, 8000)
+  // A card this guard already filed for the same command and gave up waiting on (see stillWaiting): the retry
+  // after the owner's answer reads THAT card instead of filing a second one — the approval was for it.
+  const parked = was?.state === 'pending' && was.requestId
+    ? await getJson(`/personas/@self/rooms/${seat.agentId}/permission/${was.requestId}`) : null
+  if (parked && (parked.state === 'pending' || decisionOf(parked, { what }))) {
+    const decided = decisionOf(parked, { what })
+    if (decided) {
+      rememberDecision(key, String(parked.state), parked.decisionNote)
+      if (parked.state === 'approved') noteApproval(seat.agentId)
+      return decided
+    }
+  }
+  const filed = parked?.state === 'pending'
+    ? { ok: true, body: { ...parked, requestId: was.requestId } }
+    : await postJson(`/personas/@self/rooms/${seat.agentId}/permission`,
+      { question: permissionCard({ what, cwd, why, source }) }, 8000)
   if (!filed?.ok || !filed.body?.requestId) return null
   const requestId = String(filed.body.requestId)
+  rememberDecision(key, 'pending', null, requestId)
   // The seat's own tile says what it is waiting for: a seat that goes quiet at a prompt nobody can see is
   // the whole fault being fixed here, so the waiting itself is on screen.
   await postJson(`/personas/@self/rooms/${seat.agentId}/activity`,
@@ -1550,7 +1571,7 @@ if (process.argv.includes('--ask-guard')) {
  *
  * Three answers. A `deny` rule is final. An ask-first rule and a call no runtime runs unattended both
  * become an approval card in the room, and the guard WAITS for it: approved, the call runs; denied, it
- * does not; unanswered, the terminal asks as it always did and the card stays open. A session without a
+ * does not; unanswered, the call is held back, the card stays open and the answer wakes the session to retry it. A session without a
  * seat is only guarded by the rules, and only when they say `applyTo: "all"`.
  *
  * The waiting is the point. Before it, such a call stopped at a prompt in the terminal of whichever
