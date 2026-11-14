@@ -136,6 +136,17 @@ retry does not file a second card and approving one call never opens another.
 Change the wait with `RANY_PERMISSION_WAIT_MS` (default `1500000` = 25 min, clamped to 5 s … 29 min); the hook's own
 timeout in `hooks/hooks.json` is the ceiling above it.
 
+## Seated sessions are archived (ADR-111)
+
+Claude Code deletes its own transcripts after `cleanupPeriodDays`. When a session that holds a work-room seat
+ends, the plugin queues its transcript (`~/.rany-plugin/archive-queue.json`) and a detached
+`listen.mjs --archive-drain` uploads it: secret-looking values are masked **on this machine first** (RANY tokens,
+API keys, `Authorization` headers, connection-string passwords, the values of `*_TOKEN` / `*_SECRET` / `*_KEY`
+environment variables), then it is gzipped and PUT straight to RANY's object storage. Only its owner sees it,
+under Settings → Session archive, for 180 days. A failed upload is retried at the next session start (up to 12
+times); a session that held no seat is never uploaded. Uploads are logged in `~/.rany-plugin/routing.log`
+(`ARCHIVE`). Codex sessions are not archived yet.
+
 ## The limit, up front
 
 **Nothing happens while no session is open.** Claude Code has no inbound webhook — every hook

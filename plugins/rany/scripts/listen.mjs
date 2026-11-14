@@ -31,6 +31,8 @@ import { sessionAnnouncement } from './seat-session.mjs'
 import { seatTitleOf, titleSequence } from './seat-title.mjs'
 import { loadRepoRules, repoRulesLines, checkToolCall, refusalReason } from './repo-rules.mjs'
 import { riskyCall, permissionCard, decisionOf, stillWaiting, callKey } from './room-permission.mjs'
+import { redact, describeTranscript } from './session-archive.mjs'
+import { gzipSync } from 'node:zlib'
 
 const WAKE = 2   // exit code asyncRewake watches for
 const QUIET = 0  // "nothing to say" — the session is not disturbed
@@ -1292,6 +1294,116 @@ function markReminded(sid) {
  *  (they declare and withdraw this checkout's board claims). */
 const config = loadConfig()
 
+/**
+ * Session archive (ADR-111 phase 1). Claude Code deletes its transcripts after `cleanupPeriodDays`, so a seated
+ * session's transcript is kept in RANY: SessionEnd QUEUES it (fast — the terminal is closing) and a detached
+ * `--archive-drain` redacts, gzips and uploads it. The queue survives a crash, a machine that was offline, or a
+ * drain killed half way: the next drain (spawned again at the next listener start) picks it up, and the server
+ * keeps one row per session, so a retry or a resumed-and-closed-again session replaces rather than duplicates.
+ * Only sessions that held a SEAT are queued — the owner's choice (2026-11-13).
+ */
+const archiveQueueFile = join(homedir(), '.rany-plugin', 'archive-queue.json')
+const archiveLockFile = join(homedir(), '.rany-plugin', 'archive-drain.lock')
+const ARCHIVE_MAX_ATTEMPTS = 12
+const ARCHIVE_MAX_RAW = 400 * 1024 * 1024
+
+function loadArchiveQueue() {
+  try { const q = JSON.parse(readFileSync(archiveQueueFile, 'utf8')); return Array.isArray(q) ? q : [] } catch { return [] }
+}
+function saveArchiveQueue(q) {
+  try { mkdirSync(dirname(archiveQueueFile), { recursive: true }); writeFileSync(archiveQueueFile, JSON.stringify(q, null, 1)) }
+  catch { /* the transcript is still on disk; the next SessionEnd queues it again */ }
+}
+function queueArchive(item) {
+  const q = loadArchiveQueue().filter((e) => !(e.runtime === item.runtime && e.sessionId === item.sessionId))
+  q.push({ ...item, queuedAt: new Date().toISOString(), attempts: 0 })
+  saveArchiveQueue(q)
+}
+
+/** Start the uploader in the background — detached, so it outlives the closing terminal. */
+function spawnArchiveDrain() {
+  if (!loadArchiveQueue().length) return
+  try {
+    const child = spawn(process.execPath, [process.argv[1], '--archive-drain'],
+      { detached: true, stdio: 'ignore', windowsHide: true, env: process.env })
+    child.unref()
+  } catch { /* the next listener start tries again */ }
+}
+
+/** PUT bytes to a presigned URL (straight to object storage — not through RANY's edge). */
+function putBytes(url, body, contentType, timeoutMs = 120_000) {
+  return new Promise((resolve) => {
+    let u
+    try { u = new URL(url) } catch { return resolve(false) }
+    const send = u.protocol === 'http:' ? httpRequest : httpsRequest
+    const req = send(u, {
+      method: 'PUT', agent: false, timeout: timeoutMs,
+      headers: { 'content-type': contentType, 'content-length': body.length },
+    }, (res) => { res.resume(); res.on('end', () => resolve(res.statusCode >= 200 && res.statusCode < 300)) })
+    req.on('timeout', () => req.destroy())
+    req.on('error', () => resolve(false))
+    req.end(body)
+  })
+}
+
+/** Upload one queued transcript. true = done (or never will be: gone, refused); false = try again later. */
+async function archiveOne(item) {
+  let raw
+  try {
+    if (statSync(item.path).size > ARCHIVE_MAX_RAW) { logRoute('ARCHIVE', item, 'too large — skipped'); return true }
+    raw = readFileSync(item.path, 'utf8')
+  } catch { logRoute('ARCHIVE', item, 'transcript gone — dropped'); return true }
+  const { title, startedAt, endedAt } = describeTranscript(raw)
+  const { text, count } = redact(raw, { env: process.env })
+  const gz = gzipSync(Buffer.from(text, 'utf8'), { level: 6 })
+  const rawBytes = Buffer.byteLength(text, 'utf8')
+
+  const slot = await postJson('/personas/@self/archives', {
+    runtime: item.runtime, sessionId: item.sessionId, agentId: item.agentId, repo: item.cwd,
+    title: title ? redact(title, { env: process.env }).text : null, startedAt, endedAt,
+  }, 15_000)
+  if (!slot) return false
+  if (!slot.ok) {
+    // A seat that is not ours (removed, another persona) never will be; anything else is worth a retry.
+    const final = slot.status === 404 || slot.status === 400 || slot.status === 403
+    logRoute('ARCHIVE', item, `slot refused ${slot.status}${final ? ' — dropped' : ''}`)
+    return final
+  }
+  if (gz.length > Number(slot.body?.maxBytes ?? Infinity)) { logRoute('ARCHIVE', item, 'over the size cap — dropped'); return true }
+  if (!(await putBytes(slot.body.uploadUrl, gz, slot.body.contentType ?? 'application/gzip'))) return false
+  const done = await postJson(`/personas/@self/archives/${slot.body.id}/complete`,
+    { bytes: gz.length, rawBytes, redactions: count }, 15_000)
+  if (!done?.ok) return false
+  logRoute('ARCHIVE', { ...item, id: slot.body.id }, `stored ${gz.length} bytes, ${count} value(s) masked`)
+  return true
+}
+
+/** `--archive-drain`: upload everything queued, one drain at a time per machine. */
+if (process.argv.includes('--archive-drain')) {
+  try {
+    const held = Number(readFileSync(archiveLockFile, 'utf8').trim())
+    if (held && held !== process.pid && alive(held)) process.exit(QUIET)
+  } catch { /* no lock */ }
+  try { mkdirSync(dirname(archiveLockFile), { recursive: true }); writeFileSync(archiveLockFile, String(process.pid)) } catch { /* fine */ }
+  try {
+    if (config.token) {
+      for (const item of loadArchiveQueue()) {
+        const ok = await archiveOne(item).catch(() => false)
+        // Re-read: a SessionEnd may have queued something while this one uploaded.
+        const q = loadArchiveQueue()
+        const i = q.findIndex((e) => e.runtime === item.runtime && e.sessionId === item.sessionId)
+        if (i === -1) continue
+        if (ok || (q[i].attempts ?? 0) + 1 >= ARCHIVE_MAX_ATTEMPTS) q.splice(i, 1)
+        else q[i] = { ...q[i], attempts: (q[i].attempts ?? 0) + 1 }
+        saveArchiveQueue(q)
+      }
+    }
+  } finally {
+    try { unlinkSync(archiveLockFile) } catch { /* fine */ }
+  }
+  process.exit(QUIET)
+}
+
 /** `--bind <boardId>`: claim that board's tasks for THIS repository. */
 const bindAt = process.argv.indexOf('--bind')
 if (bindAt !== -1) {
@@ -1763,6 +1875,17 @@ if (process.argv.includes('--stop')) {
   // conversation is closed too (ADR-101), so the owner's tile offers to continue it rather than showing a
   // window that is already up; best-effort, a slow server must not hold up a closing terminal.
   const closingSeats = mySeatIds()
+  // ADR-111: a session that held a seat is archived — queued now, uploaded by a detached drain.
+  if (closingSeats.length > 0) {
+    const hook = await readHookInput()
+    const transcript = typeof hook.transcript_path === 'string' ? hook.transcript_path : null
+    const sid = typeof hook.session_id === 'string' && hook.session_id ? hook.session_id : sessionId
+    if (transcript && sid && existsSync(transcript)) {
+      queueArchive({ runtime: 'claude', sessionId: sid, agentId: closingSeats[0], path: transcript,
+        cwd: typeof hook.cwd === 'string' && hook.cwd ? hook.cwd : projectDir })
+      spawnArchiveDrain()
+    }
+  }
   closeMySeatSessions()
   dropMyBindings()
   for (const id of closingSeats)
@@ -2624,6 +2747,8 @@ function connect() {
       claimBeat = setInterval(() => void declareBoards(boardsHere()), CLAIM_REFRESH_MS)
       claimBeat.unref?.()
       void drainInbox()
+      // An archive a closing terminal queued but could not finish uploading (ADR-111) goes now.
+      spawnArchiveDrain()
       return
     }
     if (!personaUserId) return
