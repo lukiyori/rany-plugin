@@ -11,6 +11,17 @@
             "description": "RANY: record this session, start the bridge, take back work-room seats, deliver waiting work"
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "name": "rany-rules-brief",
+            "command": "node \"${extensionPath}${/}scripts${/}bridge.mjs\" --rules-brief",
+            "timeout": 10000,
+            "description": "RANY: this checkout's .rany/ rules and a check of them"
+          }
+        ]
       }
     ],
     "BeforeAgent": [
@@ -49,6 +60,20 @@
             "command": "node \"${extensionPath}${/}scripts${/}bridge.mjs\" --bye",
             "timeout": 5000,
             "description": "RANY: this session stops being a wake target"
+          }
+        ]
+      }
+    ],
+    "BeforeTool": [
+      {
+        "matcher": "run_shell_command|write_file|replace",
+        "hooks": [
+          {
+            "type": "command",
+            "name": "rany-rules-guard",
+            "command": "node \"${extensionPath}${/}scripts${/}bridge.mjs\" --rules-guard",
+            "timeout": 10000,
+            "description": "RANY: refuse a call that breaks this checkout's .rany/ never/instead rules"
           }
         ]
       }

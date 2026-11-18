@@ -26,7 +26,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
 import { roomRoutingContextLines } from './room-routing-context.mjs'
-import { loadRepoRules, repoRulesLines } from './repo-rules.mjs'
+import { loadRepoRules, repoRulesLines, checkToolCall, refusalReason, sessionBrief } from './repo-rules.mjs'
 import { sessionAnnouncement } from './seat-session.mjs'
 import { statusLines } from './bridge-status.mjs'
 
@@ -829,6 +829,35 @@ const arg = (name) => {
   return i === -1 ? undefined : (process.argv[i + 1] ?? '')
 }
 const has = (name) => process.argv.includes(name)
+
+/** REPO RULES in Codex (ADR-099, owner 2026-11-15: "bu kimi, claude, openai hepsi icin gerekiyor"). Codex now runs
+ *  PreToolUse hooks, so the never/instead rules are ENFORCED here as in Claude: `--rules-guard` refuses a `Bash` or
+ *  `apply_patch` call that breaks one and says what to do instead. Ask-first rules stay told, not enforced — Codex
+ *  keeps no record of the room's approvals, so a refusal could never be lifted. `--rules-brief` (SessionStart)
+ *  hands every thread the rules and the check of them. */
+if (has('--rules-brief') || has('--rules-guard')) {
+  const hook = await hookInput()
+  const cwd = typeof hook.cwd === 'string' && hook.cwd ? hook.cwd : process.cwd()
+  const threadId = typeof hook.session_id === 'string' ? hook.session_id : null
+  const seat = threadId ? Object.entries(loadBindings())
+    .find(([, e]) => e && typeof e === 'object' && e.room && String(e.threadId) === threadId) : null
+  const rules = loadRepoRules(cwd, seat ? loadSeatIdentities()[seat[0]]?.slug ?? null : null)
+  if (has('--rules-brief')) {
+    const lines = sessionBrief(rules, { enforced: 'partial' })
+    if (lines.length) process.stdout.write(JSON.stringify({
+      hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: lines.join('\n') },
+    }) + '\n')
+  } else if (rules && (seat || rules.policy.applyTo === 'all')) {
+    const hit = checkToolCall(rules, { ...hook, cwd })
+    if (hit?.kind === 'deny') process.stdout.write(JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse', permissionDecision: 'deny',
+        permissionDecisionReason: refusalReason(rules, hit, seat ? { agentId: seat[0], channelId: seat[1].room?.channelId } : null),
+      },
+    }) + '\n')
+  }
+  process.exit(0)
+}
 
 /** `--bind <id>`: claim that board's work for THIS repository (the same file the Claude plugin uses). */
 if (has('--bind')) {

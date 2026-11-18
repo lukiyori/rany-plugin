@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { loadRepoRules, repoRulesLines, checkToolCall, commandMatches, globToRegExp, findRulesRoot } from './repo-rules.mjs'
+import { loadRepoRules, repoRulesLines, checkToolCall, commandMatches, globToRegExp, findRulesRoot, refusalReason, sessionBrief } from './repo-rules.mjs'
 
 function repo(files) {
   const root = mkdtempSync(join(tmpdir(), 'rany-rules-'))
@@ -107,4 +107,52 @@ test('globs follow gitignore shape', () => {
   assert.ok(globToRegExp('/db/**', false).test('db/0001.sql'))
   assert.ok(!globToRegExp('/db/**', false).test('tools/db/x.sql'))
   assert.ok(globToRegExp('db/', false).test('tools/db/x.sql'))
+})
+
+test('an "instead" rule blocks the wrong road and names the right one', () => {
+  const root = repo({ '.rany/rany.json': { instead: [
+    { match: ['ssh *', 'scp *'], use: 'deploy with the CI deploy job', why: 'prod is only changed by CI' },
+    { paths: ['/db/applied/**'], use: 'write a NEW numbered script in db/' },
+  ] } })
+  const r = loadRepoRules(root)
+  const hit = checkToolCall(r, bash('cd x && ssh deploy@203.0.113.10 docker ps', root))
+  assert.equal(hit.kind, 'deny')
+  assert.equal(hit.rule, 'ssh *')
+  const why = refusalReason(r, hit, null)
+  assert.match(why, /INSTEAD: deploy with the CI deploy job/)
+  assert.match(why, /prod is only changed by CI/)
+  assert.equal(checkToolCall(r, edit(join(root, 'db', 'applied', '0001.sql'))).use, 'write a NEW numbered script in db/')
+  assert.equal(checkToolCall(r, bash('git status', root)), null)
+  assert.match(repoRulesLines(r, { full: true }).join('\n'), /never ssh \* \/ scp \* — instead: deploy with the CI deploy job/)
+  // An approval opens ask-first rules only, never an instead rule.
+  assert.equal(checkToolCall(r, bash('ssh host', root), { approvedAt: Date.now() }).kind, 'deny')
+})
+
+test('rules apply to every session unless they say "seats"', () => {
+  assert.equal(loadRepoRules(repo({ '.rany/RANY.md': 'x' })).policy.applyTo, 'all')
+  assert.equal(loadRepoRules(repo({ '.rany/rany.json': { applyTo: 'seats' } })).policy.applyTo, 'seats')
+})
+
+test('Codex and Gemini tool calls are checked like Claude ones', () => {
+  const root = repo({ '.rany/rany.json': { deny: { paths: ['/db/**'], commands: ['git push --force*'] } } })
+  const r = loadRepoRules(root)
+  const patch = '*** Begin Patch\n*** Update File: db/0001.sql\n@@\n-a\n+b\n*** End Patch'
+  assert.equal(checkToolCall(r, { tool_name: 'apply_patch', tool_input: { command: patch }, cwd: root }).kind, 'deny')
+  assert.equal(checkToolCall(r, { tool_name: 'apply_patch', tool_input: { command: patch.replace('db/', 'src/') }, cwd: root }), null)
+  assert.equal(checkToolCall(r, { tool_name: 'run_shell_command', tool_input: { command: 'git push --force origin' }, cwd: root }).kind, 'deny')
+  assert.equal(checkToolCall(r, { tool_name: 'write_file', tool_input: { file_path: join(root, 'db', 'x.sql') }, cwd: root }).kind, 'deny')
+  assert.equal(checkToolCall(r, { tool_name: 'Bash', tool_input: { command: ['bash', '-lc', 'git push --force'] }, cwd: root }).kind, 'deny')
+})
+
+test('the session-start check reports mistakes in the rules', () => {
+  const root = repo({ '.rany/rany.json': { deny: { commands: ['re:(unclosed'] }, instead: [{ match: 'ssh *' }], aplyTo: 'all' } })
+  const text = sessionBrief(loadRepoRules(root), { enforced: true }).join('\n')
+  assert.match(text, /RULES CHECK found problems/)
+  assert.match(text, /re:\(unclosed does not compile/)
+  assert.match(text, /needs "match" \(or "paths"\) and "use"/)
+  assert.match(text, /unknown key "aplyTo"/)
+  const clean = sessionBrief(loadRepoRules(repo({ '.rany/RANY.md': 'Be kind.' })), { enforced: true }).join('\n')
+  assert.doesNotMatch(clean, /RULES CHECK/)
+  assert.match(sessionBrief(loadRepoRules(root), { guardInstalled: false }).join('\n'), /not active in this runtime/)
+  assert.deepEqual(sessionBrief(null), [])
 })

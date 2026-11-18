@@ -27,7 +27,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import { spawn, spawnSync } from 'node:child_process'
 import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
-import { loadRepoRules, repoRulesLines } from './repo-rules.mjs'
+import { loadRepoRules, repoRulesLines, checkToolCall, refusalReason, sessionBrief } from './repo-rules.mjs'
 
 /** Shared with the Claude Code and Codex plugins ON PURPOSE: a board belongs to a repository, not to
  *  whichever agent you happen to be running. Each plugin reads only its own entries. */
@@ -699,6 +699,31 @@ async function reattachRememberedSeats({ dir, sessionId, deliberate = false }) {
 
 const arg = (name) => { const i = process.argv.indexOf(name); return i === -1 ? undefined : (process.argv[i + 1] ?? '') }
 const has = (name) => process.argv.includes(name)
+
+/** REPO RULES in Gemini CLI (ADR-099, owner 2026-11-15: "bu kimi, claude, openai hepsi icin gerekiyor"). A
+ *  BeforeTool hook: the never/instead rules are ENFORCED — a breaking `run_shell_command` / `write_file` / `replace`
+ *  is refused with exit 2 (Gemini's blocking answer; the reason on stderr reaches the model) and says what to do
+ *  instead. Ask-first rules stay told: nothing here records the room's approvals. `--rules-brief` (SessionStart)
+ *  hands every session the rules and the check of them. */
+if (has('--rules-brief') || has('--rules-guard')) {
+  const hook = await hookInput()
+  const cwd = typeof hook.cwd === 'string' && hook.cwd ? hook.cwd : process.cwd()
+  const sid = typeof hook.session_id === 'string' ? hook.session_id : null
+  const seat = sid ? Object.entries(loadBindings()).find(([, e]) => e?.room && ownerOf(e)?.sessionId === sid) : null
+  const rules = loadRepoRules(cwd, seat ? loadSeatIdentities()[seat[0]]?.slug ?? null : null)
+  if (has('--rules-brief')) {
+    const lines = sessionBrief(rules, { enforced: 'partial' })
+    hookReply('SessionStart', lines.length ? lines.join('\n') : null)
+    process.exit(0)
+  }
+  const hit = rules && (seat || rules.policy.applyTo === 'all') ? checkToolCall(rules, { ...hook, cwd }) : null
+  if (hit?.kind === 'deny') {
+    process.stderr.write(refusalReason(rules, hit, seat ? { agentId: seat[0], channelId: seat[1].room?.channelId } : null) + '\n')
+    process.exit(2)
+  }
+  hookReply('BeforeTool', null)
+  process.exit(0)
+}
 const out = (s) => process.stdout.write(s.endsWith('\n') ? s : s + '\n')
 
 if (has('--bind')) {

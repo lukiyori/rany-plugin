@@ -29,7 +29,7 @@ import { request as httpsRequest } from 'node:https'
 import { roomRoutingContextLines } from './room-routing-context.mjs'
 import { sessionAnnouncement } from './seat-session.mjs'
 import { seatTitleOf, titleSequence } from './seat-title.mjs'
-import { loadRepoRules, repoRulesLines, checkToolCall, refusalReason } from './repo-rules.mjs'
+import { loadRepoRules, repoRulesLines, checkToolCall, refusalReason, sessionBrief } from './repo-rules.mjs'
 import { riskyCall, permissionCard, decisionOf, stillWaiting, callKey } from './room-permission.mjs'
 import { redact, describeTranscript } from './session-archive.mjs'
 import { gzipSync } from 'node:zlib'
@@ -1691,6 +1691,19 @@ if (process.argv.includes('--ask-guard')) {
  * evening to the next afternoon ("bu terminal promptları neden ranye taşınmıyor? Aşırı vakit kaybı",
  * 2026-10-19). A question only one screen can show is a question nobody answers.
  */
+/** `--rules-brief` (SessionStart): every session in a checkout with `.rany/` — seated or not — starts knowing the
+ *  rules, with a check of the rules themselves (owner, 2026-11-15: "rany plugin calisiyorsa bir pre check ile
+ *  bunlara bakip"). Silent where there is no `.rany/`. */
+if (process.argv.includes('--rules-brief')) {
+  const hook = await readHookInput()
+  const cwd = typeof hook.cwd === 'string' && hook.cwd ? hook.cwd : projectDir
+  const lines = sessionBrief(loadRepoRules(cwd), { enforced: true })
+  if (lines.length) process.stdout.write(JSON.stringify({
+    hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: lines.join('\n') },
+  }) + '\n')
+  process.exit(QUIET)
+}
+
 if (process.argv.includes('--rules-guard')) {
   const hook = await readHookInput()
   const held = Object.entries(loadBindings())
@@ -2182,6 +2195,9 @@ function roomPrompt(type, d, seat) {
     `  NEVER ask your owner through AskUserQuestion while you sit in a room: only this terminal`,
     `    shows it and the room never sees it — a decision goes through request_permission (a card in the`,
     `    chat), a question through ask_question;`,
+    `  a NEW card that makes one of your earlier open cards moot names it: supersedes:[requestId] on`,
+    `    request_permission / ask_question / post_message closes the old card, so the owner never sees two`,
+    `    cards for one decision; withdraw_request({channelId, agentId, requestIds}) closes one that no longer applies;`,
     `  list_board_tasks / get_task / create_task / set_task_status / comment_task — the room's work queue`,
     `    (no board yet? create_board with roomChannelId, then put the job on it);`,
     `  assign_task({guildId, taskId, agentId}) — hand a card to ONE seat (a colleague's, from get_room): the`,

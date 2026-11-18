@@ -9,6 +9,15 @@
             "timeout": 20
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${PLUGIN_ROOT}/scripts/bridge.mjs\" --rules-brief",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "UserPromptSubmit": [
@@ -39,6 +48,18 @@
           {
             "type": "command",
             "command": "node \"${PLUGIN_ROOT}/scripts/bridge.mjs\" --bye",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|apply_patch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${PLUGIN_ROOT}/scripts/bridge.mjs\" --rules-guard",
             "timeout": 10
           }
         ]
