@@ -3,7 +3,8 @@
 // ROOM-14: a decision a seated session needs is asked for in the ROOM, never only in its terminal.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { riskyCall, permissionCard, decisionOf, stillWaiting, callKey, RISKY } from './room-permission.mjs'
+import { riskyCall, permissionCard, decisionOf, stillWaiting, callKey, RISKY,
+  forgetTokens, isForgiven, mergeForgiven, forgetNote, parseForgetNote, FORGET_MARKER } from './room-permission.mjs'
 
 const bash = (command) => ({ tool_name: 'Bash', tool_input: { command } })
 const pwsh = (command) => ({ tool_name: 'PowerShell', tool_input: { command } })
@@ -113,4 +114,53 @@ test('every entry in the floor list carries the words for WHY it is being asked'
     assert.ok(r.rule && typeof r.rule === 'string')
     assert.ok(r.why && /[a-z]/.test(r.why), `no reason for ${r.rule}`)
   }
+})
+
+// ── ADR-115: "approve & never ask again" ───────────────────────────────────────────────────────────────
+
+test('forgetTokens: the delete target basename, for the delete family only', () => {
+  const tok = (cmd) => forgetTokens(riskyCall(bash(cmd)))
+  assert.deepEqual(tok('rm -rf bin'), ['bin'])
+  assert.deepEqual(tok('rm -rf ./src/Foo/bin'), ['bin'])            // basename, any depth
+  assert.deepEqual(tok('rm -rf bin obj'), ['bin', 'obj'])           // multiple targets
+  assert.deepEqual(tok('rm -rf Bin'), ['bin'])                      // lower-cased
+  assert.deepEqual(tok('rmdir obj'), ['obj'])
+  assert.deepEqual(forgetTokens(riskyCall(pwsh('Remove-Item -Recurse -Force bin'))), ['bin'])
+  assert.deepEqual(forgetTokens(riskyCall(pwsh('Remove-Item -Recurse -Force .\\src\\obj'))), ['obj'])
+  assert.deepEqual(forgetTokens(riskyCall(pwsh('Remove-Item -Recurse -Force -Path C:\\w\\bin'))), ['bin'])
+  assert.deepEqual(forgetTokens(riskyCall(bash('del /s /q bin'))), ['bin'])
+})
+
+test('forgetTokens: no token for a risky rule that names no clear target', () => {
+  assert.deepEqual(forgetTokens(riskyCall(bash('git reset --hard origin/master'))), [])
+  assert.deepEqual(forgetTokens(riskyCall(bash('git clean -fd'))), [])
+  assert.deepEqual(forgetTokens(riskyCall(bash('npm publish'))), [])
+  assert.deepEqual(forgetTokens(riskyCall(bash('rm -rf *'))), [])   // a glob is not a nameable target
+  assert.deepEqual(forgetTokens(riskyCall(bash('rm -rf .'))), [])
+  assert.deepEqual(forgetTokens(null), [])
+})
+
+test('isForgiven: only when EVERY target is already allow-listed', () => {
+  assert.equal(isForgiven(['bin', 'obj'], ['bin']), true)
+  assert.equal(isForgiven(['bin', 'obj'], ['bin', 'obj']), true)
+  assert.equal(isForgiven(['bin'], ['bin', 'obj']), false)         // obj not forgiven → still ask
+  assert.equal(isForgiven(['Bin'], ['bin']), true)                 // case-insensitive
+  assert.equal(isForgiven(['bin'], []), false)                     // no clear target → never auto-allow
+  assert.equal(isForgiven([], ['bin']), false)
+})
+
+test('mergeForgiven: additive, deduped, lower-cased', () => {
+  assert.deepEqual(mergeForgiven(['bin'], ['obj']).sort(), ['bin', 'obj'])
+  assert.deepEqual(mergeForgiven(['bin'], ['BIN']), ['bin'])
+  assert.deepEqual(mergeForgiven(null, ['bin']), ['bin'])
+  assert.deepEqual(mergeForgiven(['bin'], null), ['bin'])
+})
+
+test('forget note marker round-trips, and a plain note carries no tokens', () => {
+  assert.equal(forgetNote(['bin', 'obj']), `${FORGET_MARKER}bin,obj`)
+  assert.equal(forgetNote([]), '')
+  assert.deepEqual(parseForgetNote(`${FORGET_MARKER}bin,obj`), ['bin', 'obj'])
+  assert.deepEqual(parseForgetNote('looks fine to me'), [])
+  assert.deepEqual(parseForgetNote(''), [])
+  assert.deepEqual(parseForgetNote(forgetNote(['bin'])), ['bin'])
 })

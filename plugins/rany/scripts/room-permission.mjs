@@ -130,3 +130,101 @@ export function stillWaiting({ what, channelId, requestId, waitedMs }) {
 export function callKey(agentId, what) {
   return `${agentId}:${createHash('sha256').update(String(what)).digest('hex').slice(0, 16)}`
 }
+
+// ---------------------------------------------------------------------------------------------------------
+// "Approve & never ask again" (ADR-115)
+//
+// A risky call the owner keeps approving — deleting a build directory (bin/obj) gitignore already throws away —
+// should be something a developer can switch off for good, on their OWN machine, without the agent editing their
+// Claude Code settings or a committed `.rany/` rule. The card offers a per-TARGET "never ask again for `bin`"
+// action; the token it remembers is the delete target's basename, kept in a user-level allow-store the plugin
+// consults BEFORE it files a card. Only the delete family carries a token — "git reset" or "npm publish" have no
+// safe "forever yes". Token derivation lives here (next to the repo-rules path logic) so the web, which only
+// needs it to LABEL the button, re-derives nothing it must keep in step; the plugin is the authority and
+// validates any remembered token against the real command before storing it.
+
+/** The RISKY rules whose approval may be remembered: each deletes a NAMED target, so "never ask again for that
+ *  name" is meaningful and bounded. `rmdir`/`del` included; `git clean` is NOT (it names no target). */
+const DELETE_RULES = new Set([
+  'rm -r*', 'rm -f*', 'rmdir',
+  're:Remove-Item\\b[^|;]*-(?:Recurse|Force)\\b',
+  're:\\bdel\\s+/[sq]\\b',
+])
+
+/** Split a shell segment into words, honouring single/double quotes (so `"Program Files"` stays one word). */
+function shellWords(s) {
+  const out = []
+  const re = /"([^"]*)"|'([^']*)'|(\S+)/g
+  let m
+  while ((m = re.exec(String(s ?? '')))) out.push(m[1] ?? m[2] ?? m[3])
+  return out
+}
+
+/** The last path component of a path, with any trailing slashes and quotes dropped: `./src/Foo/bin/` → `bin`,
+ *  `C:\tmp\obj` → `obj`. Returns '' for a path that is only slashes. */
+function baseName(p) {
+  const s = String(p ?? '').replace(/^["']|["']$/g, '').replace(/[\\/]+$/, '')
+  const parts = s.split(/[\\/]/)
+  return parts[parts.length - 1] ?? ''
+}
+
+/**
+ * The directory names a risky DELETE would remove, as basenames (so `src/Foo/bin` and `./bin` both → `bin`),
+ * deduped and lower-cased. Empty for a non-delete risky rule, or when the targets are not plain names (a glob,
+ * `.`/`..`, a bare drive) — those are never offered a "never ask again", because the scope would be unclear.
+ * `risky` is a {rule, what} from {@link riskyCall}; `what` is the single segment that will run.
+ */
+export function forgetTokens(risky) {
+  if (!risky || !DELETE_RULES.has(risky.rule)) return []
+  const seg = String(risky.what ?? '')
+  const words = shellWords(seg)
+  const isDel = /\bdel\b/i.test(risky.rule) || /^del$/i.test(words[0] ?? '')
+  const targets = []
+  for (let i = 1; i < words.length; i++) {
+    const w = words[i]
+    if (/^-/.test(w)) {
+      // PowerShell -Path / -LiteralPath take the NEXT word as their value; other switches take none.
+      if (/^-(?:LiteralPath|Path)$/i.test(w) && words[i + 1] && !/^[-/]/.test(words[i + 1])) targets.push(words[++i])
+      continue
+    }
+    if (isDel && /^\/[a-z]$/i.test(w)) continue // a `del /s /q` switch, not a path
+    targets.push(w)
+  }
+  const toks = targets
+    .map((t) => baseName(t).toLowerCase())
+    .filter((t) => t && t !== '.' && t !== '..' && !/[*?]/.test(t) && !/^[a-z]:$/i.test(t))
+  return [...new Set(toks)]
+}
+
+/** Whether EVERY target of this call is already forgiven — then no card is filed. An empty `tokens` is never
+ *  forgiven (a call with no clear target still asks). Case-insensitive (Windows paths are). */
+export function isForgiven(forgiven, tokens) {
+  if (!Array.isArray(tokens) || tokens.length === 0) return false
+  const set = new Set((Array.isArray(forgiven) ? forgiven : []).map((s) => String(s).toLowerCase()))
+  return tokens.every((t) => set.has(String(t).toLowerCase()))
+}
+
+/** The allow-store with `tokens` added, deduped and lower-cased — what gets written back to approvals.json. */
+export function mergeForgiven(forgiven, tokens) {
+  const set = new Set((Array.isArray(forgiven) ? forgiven : []).map((s) => String(s).toLowerCase()).filter(Boolean))
+  for (const t of Array.isArray(tokens) ? tokens : []) { const v = String(t ?? '').toLowerCase(); if (v) set.add(v) }
+  return [...set]
+}
+
+/** The stable marker the card's "never ask again" button puts in the decision note, so the plugin (any
+ *  language) recognises the intent. The web composes the same string and renders it back as friendly text. */
+export const FORGET_MARKER = 'rany:forget:'
+export function forgetNote(tokens) {
+  const t = (Array.isArray(tokens) ? tokens : []).map((x) => String(x ?? '').toLowerCase()).filter(Boolean)
+  return t.length ? FORGET_MARKER + [...new Set(t)].join(',') : ''
+}
+
+/** The tokens named in a decision note's forget-marker (empty when there is none). The caller still intersects
+ *  these with the command's real {@link forgetTokens} before storing, so a stray note cannot forgive anything
+ *  the approved command would not itself delete. */
+export function parseForgetNote(note) {
+  const s = String(note ?? '')
+  const i = s.toLowerCase().indexOf(FORGET_MARKER)
+  if (i < 0) return []
+  return s.slice(i + FORGET_MARKER.length).split(/[,\s]+/).map((t) => t.trim().toLowerCase()).filter(Boolean)
+}

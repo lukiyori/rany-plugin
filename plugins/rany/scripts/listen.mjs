@@ -30,8 +30,10 @@ import { roomRoutingContextLines } from './room-routing-context.mjs'
 import { sessionAnnouncement } from './seat-session.mjs'
 import { seatTitleOf, titleSequence } from './seat-title.mjs'
 import { loadRepoRules, repoRulesLines, checkToolCall, refusalReason, sessionBrief } from './repo-rules.mjs'
-import { riskyCall, permissionCard, decisionOf, stillWaiting, callKey } from './room-permission.mjs'
+import { riskyCall, permissionCard, decisionOf, stillWaiting, callKey,
+  forgetTokens, isForgiven, mergeForgiven, parseForgetNote } from './room-permission.mjs'
 import { redact, describeTranscript } from './session-archive.mjs'
+import { knowledgeEntry, knowledgeBlock } from './seat-knowledge.mjs'
 import { gzipSync } from 'node:zlib'
 
 const WAKE = 2   // exit code asyncRewake watches for
@@ -827,7 +829,8 @@ const IDENTITY_SCRIPT = process.argv[1]
  * Engineer"). Kept per seat in one file every plugin shares, and put in full into the first wake after it
  * arrives or changes — then a one-line reminder, so a long session is not re-sent the same brief every turn.
  * The server is the source of truth: a join/re-attach answers with the seat's identity AND its speaking
- * style (ADR-075) and its APPROVAL setting (ADR-083), and an 'identity_set' / 'style_set' / 'approval_set' room
+ * style (ADR-075), its APPROVAL setting (ADR-083) and its KNOWLEDGE note (ADR-113 §14), and an 'identity_set' / 'style_set' /
+ * 'approval_set' / 'knowledge_set' room
  * event makes the session fetch them again.
  */
 const seatIdentityFile = join(homedir(), '.rany-plugin', 'seat-identities.json')
@@ -839,10 +842,29 @@ function loadSeatIdentities() {
   try { return JSON.parse(readFileSync(seatIdentityFile, 'utf8')).seats ?? {} } catch { return {} }
 }
 
+// "Approve & never ask again" (ADR-115): the build-directory names this developer chose never to be asked about
+// deleting, on THIS machine. User-level and GLOBAL on purpose — bin/obj are the same throwaway in every repo,
+// and this is the developer's own preference, not a committed `.rany/` rule that would bind the whole team. Only
+// the room's approval card writes it (via the forget marker in the decision note); the guard reads it before
+// filing a card, so a forgiven delete never prompts again.
+const forgivenFile = join(homedir(), '.rany-plugin', 'approvals.json')
+function loadForgiven() {
+  try { const v = JSON.parse(readFileSync(forgivenFile, 'utf8')).deleteTargets; return Array.isArray(v) ? v : [] }
+  catch { return [] }
+}
+function saveForgiven(list) {
+  try {
+    mkdirSync(dirname(forgivenFile), { recursive: true })
+    writeFileSync(forgivenFile, JSON.stringify({ deleteTargets: list }, null, 2))
+  } catch { /* best effort: it simply asks again next time */ }
+}
+
 /** Store what the server said about a seat's identity and its speaking STYLE (ADR-075); `null` = none of
  *  that is set. The two are independent: a seat can be told how to speak without carrying a role. */
-function saveSeatIdentity(agentId, identity, style, approval) {
+function saveSeatIdentity(agentId, identity, style, approval, knowledge) {
   const seats = loadSeatIdentities()
+  // What the owner wants the seat to KNOW (ADR-113 §14). Absent from an older server: keep what we had.
+  const knowledgeKept = knowledgeEntry(knowledge, seats[String(agentId)]?.knowledge)
   // How much the seat must ask (ADR-083). Absent from an older server: keep what we had rather than forget it.
   const approvalEntry = approval?.policy
     ? { policy: approval.policy, instructions: approval.instructions ?? '',
@@ -860,9 +882,10 @@ function saveSeatIdentity(agentId, identity, style, approval) {
         rev: createHash('sha256').update(`${identity.slug}\n${identity.instructions ?? ''}`).digest('hex').slice(0, 12),
         style: styleEntry,
         approval: approvalEntry,
+        knowledge: knowledgeKept,
         fetchedAt: Date.now(),
       }
-    : { slug: null, style: styleEntry, approval: approvalEntry, fetchedAt: Date.now() }
+    : { slug: null, style: styleEntry, approval: approvalEntry, knowledge: knowledgeKept, fetchedAt: Date.now() }
   try {
     mkdirSync(dirname(seatIdentityFile), { recursive: true })
     writeFileSync(seatIdentityFile, JSON.stringify({ seats }, null, 2))
@@ -874,7 +897,7 @@ async function ensureSeatIdentity(agentId, force = false) {
   const cur = loadSeatIdentities()[String(agentId)]
   if (!force && cur && Date.now() - (cur.fetchedAt ?? 0) < IDENTITY_TTL_MS) return
   const r = await getJson(`/personas/@self/rooms/${agentId}/identity`)
-  if (r) saveSeatIdentity(agentId, r.identity ?? null, r.style ?? null, r.approval ?? null)
+  if (r) saveSeatIdentity(agentId, r.identity ?? null, r.style ?? null, r.approval ?? null, r.knowledge)
 }
 
 const identityShownFile = join(stateDir, 'identity-shown.json')
@@ -887,7 +910,7 @@ function identityShownMap() {
 function identityLines(agentId, { full = false } = {}) {
   const i = loadSeatIdentities()[String(agentId)]
   if (!i) return []
-  const style = [...styleLines(agentId, i, full), ...approvalLines(agentId, i, full)]
+  const style = [...styleLines(agentId, i, full), ...approvalLines(agentId, i, full), ...knowledgeLines(agentId, i, full)]
   if (!i.slug) return style
   const key = `${IDENTITY_SESSION_KEY}:${agentId}`
   const shown = identityShownMap()
@@ -918,6 +941,19 @@ function styleLines(agentId, entry, full) {
     'HOW THE OWNER ASKED YOU TO SPEAK IN THIS ROOM (style only — it never widens what you may do):',
     ...st.instructions.split('\n').map((l) => `  · ${l}`),
   ]
+}
+
+/** What the owner wants this seat to KNOW (ADR-113 §14): in full the first time a session sees this revision of the
+ *  note, then not repeated (seat-knowledge.mjs). */
+function knowledgeLines(agentId, entry, full) {
+  const key = `${IDENTITY_SESSION_KEY}:knowledge:${agentId}`
+  const shown = identityShownMap()
+  const { lines, shown: now } = knowledgeBlock(entry?.knowledge, shown[key], full)
+  if (now) {
+    shown[key] = entry.knowledge.rev
+    try { mkdirSync(dirname(identityShownFile), { recursive: true }); writeFileSync(identityShownFile, JSON.stringify(shown)) } catch { /* shown again next time */ }
+  }
+  return lines
 }
 
 /** The seat's APPROVAL setting (ADR-083): in full the first time a session sees this revision; afterwards one
@@ -1006,12 +1042,22 @@ const PERMISSION_POLL_MS = 3_000
  * agent happens to work on. Returns the runtime's permission decision, or null when the card could not be
  * filed at all (offline, no seat, refused): then the caller falls back to what it did before.
  */
-async function decideInRoom(seat, { what, why, source, cwd, windowMinutes = 15 }) {
+async function decideInRoom(seat, { what, why, source, cwd, windowMinutes = 15, forget = [] }) {
   const key = callKey(seat.agentId, what)
+  // "Never ask again" (ADR-115): when the owner approved with the forget marker, store only the tokens THIS
+  // command truly deletes (the intersection), so a stray note can never forgive something unrelated.
+  const persistForgive = (note) => {
+    if (!Array.isArray(forget) || forget.length === 0) return
+    const grant = parseForgetNote(note).filter((t) => forget.includes(t))
+    if (grant.length) saveForgiven(mergeForgiven(loadForgiven(), grant))
+  }
   // A decision counts for the rules' window; a parked card for as long as the card itself lives (an hour).
   const rec = rememberedDecision(key, 60 * 60_000)
   const was = rec && (rec.state === 'pending' || Date.now() - Number(rec.at) < windowMinutes * 60_000) ? rec : null
-  if (was && was.state !== 'pending') return decisionOf({ state: was.state, decisionNote: was.note }, { what })
+  if (was && was.state !== 'pending') {
+    if (was.state === 'approved') persistForgive(was.note)
+    return decisionOf({ state: was.state, decisionNote: was.note }, { what })
+  }
 
   // A card this guard already filed for the same command and gave up waiting on (see stillWaiting): the retry
   // after the owner's answer reads THAT card instead of filing a second one — the approval was for it.
@@ -1021,7 +1067,7 @@ async function decideInRoom(seat, { what, why, source, cwd, windowMinutes = 15 }
     const decided = decisionOf(parked, { what })
     if (decided) {
       rememberDecision(key, String(parked.state), parked.decisionNote)
-      if (parked.state === 'approved') noteApproval(seat.agentId)
+      if (parked.state === 'approved') { noteApproval(seat.agentId); persistForgive(parked.decisionNote) }
       return decided
     }
   }
@@ -1045,7 +1091,7 @@ async function decideInRoom(seat, { what, why, source, cwd, windowMinutes = 15 }
       rememberDecision(key, String(card.state), card.decisionNote)
       // The rules promise a window after an approval (ADR-099) — the listener normally opens it on the
       // room's decision event, but it is not running while this session is mid-turn.
-      if (card.state === 'approved') noteApproval(seat.agentId)
+      if (card.state === 'approved') { noteApproval(seat.agentId); persistForgive(card.decisionNote) }
       return decided
     }
     const waitedMs = Date.now() - started
@@ -1742,7 +1788,16 @@ if (process.argv.includes('--rules-guard')) {
   if (seat && config.token) {
     const risky = riskyCall(hook)
     if (risky) {
-      const out = await decideInRoom(seat, { ...risky, source: 'runtime', cwd, windowMinutes })
+      // "Never ask again" (ADR-115): a delete whose every target the developer already forgave on this machine
+      // runs without a card — and we must ALLOW it explicitly, or the runtime's own terminal prompt takes over
+      // (the very prompt nobody in the room can see). Only the delete family carries tokens; everything else cards.
+      const tokens = forgetTokens(risky)
+      if (tokens.length && isForgiven(loadForgiven(), tokens)) {
+        say({ permissionDecision: 'allow',
+          permissionDecisionReason: `You chose never to be asked again about deleting ${tokens.join(', ')} on this machine (RANY approvals.json). Change it there to undo.` })
+        process.exit(QUIET)
+      }
+      const out = await decideInRoom(seat, { ...risky, source: 'runtime', cwd, windowMinutes, forget: tokens })
       if (out) say(out)
     }
   }
@@ -2160,7 +2215,7 @@ function teamLines(seat) {
 
 function roomPrompt(type, d, seat) {
   const identityChanged = type === 'PERSONA_ROOM_UPDATED'
-    && (d.change === 'identity_set' || d.change === 'style_set' || d.change === 'approval_set')
+    && (d.change === 'identity_set' || d.change === 'style_set' || d.change === 'approval_set' || d.change === 'knowledge_set')
     && String(d.agentId ?? '') === String(seat.agentId)
   const who = [
     `You are "${seat.name}" (agentId ${seat.agentId}) in the work room at channel ${d.channelId}, working from THIS repository.`,
@@ -2329,6 +2384,9 @@ function roomPrompt(type, d, seat) {
       ? (loadSeatIdentities()[String(seat.agentId)]?.style ? 'the owner changed HOW YOU SHOULD SPEAK here (above)' : 'the owner cleared your speaking style')
       : "an agent's speaking style was changed",
     approval_set: mine ? 'the owner changed how much you must ASK before acting (above)' : "an agent's approval setting was changed",
+    knowledge_set: mine
+      ? (loadSeatIdentities()[String(seat.agentId)]?.knowledge ? 'the owner changed what you should KNOW in this room (above)' : "the owner cleared your seat's knowledge note")
+      : "an agent's knowledge note was changed",
   }[d.change] ?? `the room changed (${d.change})`
   const next = stop
     ? [`STOP working on this room's job now and do not post there until you are resumed. Leave what you`,
@@ -2342,6 +2400,8 @@ function roomPrompt(type, d, seat) {
     : d.change === 'style_set' && mine ? [
         `Write that way from now on. Do not announce it and do not redo old messages — it changes how you`,
         `speak, not what you are doing.`]
+    : d.change === 'knowledge_set' && mine ? [
+        `Work with that from now on. Do not announce it; if it changes something you were doing, say so in ONE room line.`]
     : d.change === 'approval_set' && mine ? [
         `Follow that setting from now on. Do not announce it; if it changes something you were about to do, say so`,
         `in ONE room line.`]
@@ -2585,7 +2645,8 @@ async function classify(type, d) {
     if (type === 'PERSONA_ROOM_DECISION' && d.approved) noteApproval(seat.agentId)
     // The seat's identity (ADR-055): fetched again when the room says it changed, else when the copy is old.
     await ensureSeatIdentity(seat.agentId,
-      type === 'PERSONA_ROOM_UPDATED' && (d.change === 'identity_set' || d.change === 'style_set' || d.change === 'approval_set')
+      type === 'PERSONA_ROOM_UPDATED' && (d.change === 'identity_set' || d.change === 'style_set' || d.change === 'approval_set'
+        || d.change === 'knowledge_set')
       && String(d.agentId ?? '') === String(seat.agentId))
     return roomPrompt(type, d, seat)
   }
