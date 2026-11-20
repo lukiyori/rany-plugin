@@ -18,6 +18,11 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/listen.mjs" --resume
 Show the owner the list as it comes out, and say in one line that the command goes in a NEW terminal:
 **this** session cannot become another one. Launch nothing yourself.
 
+After a reboot, the owner wants every seat back at once, across every repository: that is `rany-restore`,
+typed in a plain terminal (ROOM-24). It lists the seats still in a room, opens the chosen ones in their own
+tabs on their last conversation, and each takes its seat back by itself. Mention it when the owner is
+restoring more than this one repository.
+
 ## What this decides
 
 Taking a seat back (`/rany-rejoin`, or the automatic re-attach at session start) returns the SEAT — the

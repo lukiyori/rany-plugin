@@ -1024,7 +1024,10 @@ async function reattachRememberedSeats({ dir, threadId, deliberate = false }) {
       lines.push(`RANY: seat "${h?.name ?? id}" in work room ${h?.channelId ?? '?'} is held by another open Codex thread of this repo; $rany-rejoin ${id} moves it here.`)
       continue
     }
-    if (!deliberate && !config.seats.autoReattach) { offer.push([id, h]); continue }
+    // A thread `rany-restore` opened for ONE seat carries RANY_REJOIN=<agentId>: that seat is taken as if
+    // $rany-rejoin had been typed, and only that one.
+    const wanted = String(process.env.RANY_REJOIN ?? '').trim()
+    if (!deliberate && !config.seats.autoReattach && id !== wanted) { offer.push([id, h]); continue }
     lines.push(await reattachSeat({ agentId: id, h, dir, threadId }))
   }
   // Named, not taken (ADR-068). One compact block, not the full identity brief a taken seat prints.

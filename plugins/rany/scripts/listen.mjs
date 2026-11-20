@@ -1865,6 +1865,39 @@ function prepareTerm() {
   } catch (e) { if (process.env.RANY_TERM_DEBUG) process.stderr.write(`prepareTerm: ${e?.message ?? e}\n`) }
 }
 
+/** `rany-restore` (after a reboot: list every seat this machine held, reopen the chosen ones in their own
+ *  terminals with their conversations). The script is copied to ~/.rany-plugin/restore — out of the
+ *  versioned plugin cache, which every update leaves behind — and a `rany-restore` command is written next
+ *  to the rany-term shims in ~/.rany-plugin/bin. Only rewritten when the bytes differ; silent on failure. */
+function refreshRestoreCommand() {
+  try {
+    const scripts = dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'))
+    const stable = join(homedir(), '.rany-plugin', 'restore')
+    const bin = join(homedir(), '.rany-plugin', 'bin')
+    const sync = (from, to) => {
+      const next = readFileSync(from)
+      let cur = null
+      try { cur = readFileSync(to) } catch { /* first time */ }
+      if (!cur || !cur.equals(next)) writeFileSync(to, next)
+    }
+    if (!existsSync(join(scripts, 'restore.mjs'))) return
+    mkdirSync(stable, { recursive: true })
+    mkdirSync(bin, { recursive: true })
+    sync(join(scripts, 'restore-core.mjs'), join(stable, 'restore-core.mjs')) // imported by restore.mjs: first
+    sync(join(scripts, 'restore.mjs'), join(stable, 'restore.mjs'))
+    const self = join(stable, 'restore.mjs')
+    if (process.platform === 'win32') {
+      const cmd = join(bin, 'rany-restore.cmd')
+      const body = `@echo off\r\nnode "${self}" %*\r\n`
+      if (!existsSync(cmd) || readFileSync(cmd, 'utf8') !== body) writeFileSync(cmd, body)
+    } else {
+      const sh = join(bin, 'rany-restore')
+      const body = `#!/bin/sh\nexec node "${self}" "$@"\n`
+      if (!existsSync(sh) || readFileSync(sh, 'utf8') !== body) { writeFileSync(sh, body); spawnSync('chmod', ['755', sh]) }
+    }
+  } catch { /* a convenience; never disturbs a session */ }
+}
+
 /** The commit a `git commit` just made, as a room-log breadcrumb (ADR-061) — read from git's own summary line
  *  ("[main 1a2b3c4] subject"), then the full sha and the remote from the checkout. Null for anything else,
  *  including a commit that failed (no summary line). A remote with credentials in it is cleaned server-side. */
@@ -1996,6 +2029,24 @@ prepareTerm()
 // The launcher that wrapped this window is holding its screen until it hears which seat this is (ADR-050).
 // The listener runs at the end of every turn, so this is the latest a re-attached seat can be told about.
 handoffHeldSeat()
+
+// `rany-restore` keeps a stable copy of itself and a `rany-restore` command in ~/.rany-plugin, so it can
+// be typed in a plain terminal after a reboot — before any agent is running. Silent, best effort.
+refreshRestoreCommand()
+
+// A window `rany-restore` opened for ONE seat (RANY_REJOIN=<agentId> in its environment): that seat is
+// what the window is for, so it is taken — the deliberate form of /rany-rejoin, typed for the owner.
+// Idempotent: once held, boardsHere() has it and nothing happens again. A seat the owner left, or one
+// another open window holds, is not taken (forgotten / heldByAnotherLiveSession).
+{
+  const want = String(process.env.RANY_REJOIN ?? '').trim()
+  const h = want && seatsForRepo().find(([id]) => id === want)?.[1]
+  if (sessionId && h && !boardsHere().includes(want) && !heldByAnotherLiveSession(want)) {
+    markReminded(sessionId) // the window's purpose is said; the generic seat/board offer would only repeat it
+    process.stdout.write((await reattachSeat(want, h)) + '\n')
+    process.exit(WAKE)
+  }
+}
 
 // Re-bind reminder (once per session): this repo has handled boards before, but a session-scoped
 // binding dies with its window, so a fresh session owns nothing until you say so. Rather than leave
