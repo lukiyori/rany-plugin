@@ -31,7 +31,8 @@ import { sessionAnnouncement } from './seat-session.mjs'
 import { seatTitleOf, titleSequence } from './seat-title.mjs'
 import { loadRepoRules, repoRulesLines, checkToolCall, refusalReason, sessionBrief } from './repo-rules.mjs'
 import { riskyCall, permissionCard, decisionOf, stillWaiting, callKey,
-  forgetTokens, isForgiven, mergeForgiven, parseForgetNote } from './room-permission.mjs'
+  forgetTokens, isForgiven, mergeForgiven, parseForgetNote,
+  normCommand, cardCommands, requestIdOf, cardAllows, cardAllowReason } from './room-permission.mjs'
 import { redact, describeTranscript } from './session-archive.mjs'
 import { knowledgeEntry, knowledgeBlock } from './seat-knowledge.mjs'
 import { gzipSync } from 'node:zlib'
@@ -1100,6 +1101,40 @@ function rememberDecision(key, state, note, requestId = null) {
   try { mkdirSync(dirname(guardFile), { recursive: true }); writeFileSync(guardFile, JSON.stringify(all)) } catch { /* ask again */ }
 }
 
+/**
+ * Cards the agent filed itself with `commands` (request_permission): requestId → { agentId, commands, at }.
+ * Written by the PostToolUse beat when the call returns, read by the guard. Only an INDEX — the guard asks the
+ * server for the card's text, state and decider before it allows anything (room-permission.mjs cardAllows).
+ */
+const cardCommandsFile = join(homedir(), '.rany-plugin', 'card-commands.json')
+function loadCardCommands() {
+  try { return JSON.parse(readFileSync(cardCommandsFile, 'utf8')) ?? {} } catch { return {} }
+}
+function noteCardCommands(hook) {
+  if (!/request_permission$/.test(String(hook?.tool_name ?? ''))) return
+  const commands = cardCommands(hook.tool_input)
+  const requestId = requestIdOf(hook.tool_response)
+  const agentId = String(hook.tool_input?.agentId ?? '')
+  if (!commands.length || !requestId || !/^\d+$/.test(agentId)) return
+  const cutoff = Date.now() - 2 * 3600_000
+  const all = Object.fromEntries(Object.entries(loadCardCommands()).filter(([, r]) => Number(r?.at) > cutoff))
+  all[requestId] = { agentId, commands, at: Date.now() }
+  try { mkdirSync(dirname(cardCommandsFile), { recursive: true }); writeFileSync(cardCommandsFile, JSON.stringify(all)) } catch { /* the push asks again */ }
+}
+/** The newest card of this seat that names `command` and that the server says a person approved in the window. */
+async function cardApproval(seat, command, windowMinutes) {
+  const cmd = normCommand(command)
+  if (!cmd) return null
+  const mine = Object.entries(loadCardCommands())
+    .filter(([, r]) => String(r?.agentId) === String(seat.agentId) && Array.isArray(r.commands) && r.commands.includes(cmd))
+    .sort(([, a], [, b]) => Number(b.at) - Number(a.at))
+  for (const [requestId] of mine.slice(0, 3)) {
+    const card = await getJson(`/personas/@self/rooms/${seat.agentId}/permission/${requestId}`)
+    if (cardAllows(card, cmd, { windowMs: windowMinutes * 60_000 })) return requestId
+  }
+  return null
+}
+
 /** How long the guard waits at a filed card before it holds the call back (stillWaiting) and lets the session end its turn. 25 minutes, not 4: the
  *  owner answers in the ROOM, often from a phone, and a card answered after the guard gave up changed nothing —
  *  the terminal was already asking, and the room's "Approve" landed on a prompt nobody was looking at (owner,
@@ -1843,6 +1878,18 @@ if (process.argv.includes('--rules-guard')) {
   const hit = rules && (seat || rules.policy.applyTo === 'all')
     ? checkToolCall(rules, { ...hook, cwd }, { approvedAt: seat ? lastApproval(seat.agentId) : 0 })
     : null
+  // A card the agent filed naming this exact command, approved by a person in the room inside the window: the
+  // room's answer reaches the runtime here and nowhere else (the auto-mode check counts only typed consent).
+  // A `never` rule still wins — no card opens what the repository forbids.
+  const shell = hook.tool_name === 'Bash' || hook.tool_name === 'PowerShell'
+  if (shell && seat && config.token && hit?.kind !== 'deny') {
+    const command = String(hook.tool_input?.command ?? '')
+    const requestId = await cardApproval(seat, command, windowMinutes)
+    if (requestId) {
+      say({ permissionDecision: 'allow', permissionDecisionReason: cardAllowReason(requestId, command) })
+      process.exit(QUIET)
+    }
+  }
   if (hit) {
     // An ask-first rule is the owner's question, so it goes to the owner's screen and waits there. Only
     // when the card cannot be filed at all does the agent get the old "file request_permission yourself".
@@ -1892,6 +1939,7 @@ if (process.argv.includes('--beat')) {
   handoffHeldSeat()
   if (config.token && seats.length > 0) {
     const hook = await readHookInput()
+    noteCardCommands(hook)
     feedScreen(typeof hook.transcript_path === 'string' ? hook.transcript_path : null)
     const line = toolLine(hook)
     // A commit is also a BREADCRUMB in the room log (ADR-061): the room's history shows what was committed
@@ -2371,7 +2419,9 @@ function roomPrompt(type, d, seat) {
     `    post_message with attachments:[{key, filename, contentType, size}]; images show inline;`,
     `  set_agent_status — the one line your tile shows (what you are doing now); keep it current;`,
     `  request_permission — when your seat's approval setting says so (default: BEFORE anything destructive,`,
-    `    production-facing, costly or outside this repo);`,
+    `    production-facing, costly or outside this repo); when the approval is for shell commands, pass them in`,
+    `    commands:["git push origin HEAD:master", …] exactly as you will run them — only then does the owner's`,
+    `    Approve reach your terminal's own permission check (run them unchanged, inside 15 minutes);`,
     `  propose_identities({channelId, agentId, identities}) — RIGHT AFTER you join: if you can play named`,
     `    roles, offer them (slug, title, name, summary) — the name is what your seat is CALLED with that role,`,
     `    so two seats of one product do not carry the same name; the owner picks one. Nothing to offer? Say`,

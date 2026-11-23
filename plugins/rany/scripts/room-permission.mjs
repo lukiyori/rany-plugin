@@ -132,6 +132,66 @@ export function callKey(agentId, what) {
 }
 
 // ---------------------------------------------------------------------------------------------------------
+// A card the AGENT filed that names its commands (request_permission `commands`)
+//
+// Claude Code's auto-mode check treats only what the owner TYPES in the terminal as consent; an answer from
+// the room reaches the agent as tool output, which it rightly refuses to count (anything could write
+// "the owner approved"). So an owner who approved `git push` on a card the agent filed saw the push stopped
+// anyway (2026-11-23: "neden card cevabini override edemiyor?"). The plugin's own PreToolUse hook is the
+// one place a room decision can reach the runtime: it allows a call when a PERSON approved a card that names
+// that exact command, inside the approval window. The server is the authority on all three — the card's text,
+// who decided it and when — so a local record written by anything else cannot forge an approval.
+
+/** One command as it is compared: trimmed, whitespace runs collapsed. Nothing else — `git push origin master`
+ *  and `git push origin HEAD:master` are different approvals. */
+export function normCommand(cmd) {
+  return String(cmd ?? '').trim().replace(/\s+/g, ' ')
+}
+
+/** The commands a request_permission call named, cleaned: one line each, at most 10, at most 500 chars. */
+export function cardCommands(input) {
+  const list = Array.isArray(input?.commands) ? input.commands : []
+  return [...new Set(list.map((c) => String(c ?? '')).filter((c) => c.trim() && !/[\r\n]/.test(c) && c.length <= 500)
+    .map(normCommand))].slice(0, 10)
+}
+
+/** The requestId out of a request_permission tool response (a JSON string, or MCP content blocks around one). */
+export function requestIdOf(response) {
+  const texts = []
+  const walk = (v) => {
+    if (typeof v === 'string') texts.push(v)
+    else if (Array.isArray(v)) v.forEach(walk)
+    else if (v && typeof v === 'object') { if (v.requestId) texts.push(JSON.stringify({ requestId: v.requestId })); else if (v.text) walk(v.text); else if (v.content) walk(v.content) }
+  }
+  walk(response)
+  for (const t of texts) {
+    try { const id = JSON.parse(t)?.requestId; if (id && /^\d+$/.test(String(id))) return String(id) } catch { /* not JSON */ }
+  }
+  return null
+}
+
+/**
+ * Whether the server's view of a card lets THIS call run now. `card` is GET …/permission/{id}: { state,
+ * question, decidedAt, byPerson }. All of: approved, by a person (a seat on `auto` approves its own cards —
+ * that must never get past the terminal's check), inside the window, and the card's own text names the
+ * exact command (so the approval is for what the owner READ, not what a local file claims).
+ */
+export function cardAllows(card, command, { now = Date.now(), windowMs = 15 * 60_000 } = {}) {
+  if (!card || card.state !== 'approved' || card.byPerson !== true) return false
+  const at = Date.parse(card.decidedAt ?? '')
+  if (!Number.isFinite(at) || now - at > windowMs || now < at - 60_000) return false
+  const cmd = normCommand(command)
+  if (!cmd) return false
+  return String(card.question ?? '').split('\n').some((line) => normCommand(line) === cmd)
+}
+
+/** What the runtime is told when a card allowed the call. */
+export function cardAllowReason(requestId, command) {
+  return `Your owner approved \`${normCommand(command)}\` on a work-room card (request ${requestId}). `
+    + 'The approval is for exactly that command and only for its window; anything else needs its own card.'
+}
+
+// ---------------------------------------------------------------------------------------------------------
 // "Approve & never ask again" (ADR-115)
 //
 // A risky call the owner keeps approving — deleting a build directory (bin/obj) gitignore already throws away —

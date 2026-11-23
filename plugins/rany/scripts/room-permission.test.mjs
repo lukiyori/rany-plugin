@@ -4,7 +4,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { riskyCall, permissionCard, decisionOf, stillWaiting, callKey, RISKY,
-  forgetTokens, isForgiven, mergeForgiven, forgetNote, parseForgetNote, FORGET_MARKER } from './room-permission.mjs'
+  forgetTokens, isForgiven, mergeForgiven, forgetNote, parseForgetNote, FORGET_MARKER,
+  normCommand, cardCommands, requestIdOf, cardAllows } from './room-permission.mjs'
 
 const bash = (command) => ({ tool_name: 'Bash', tool_input: { command } })
 const pwsh = (command) => ({ tool_name: 'PowerShell', tool_input: { command } })
@@ -163,4 +164,48 @@ test('forget note marker round-trips, and a plain note carries no tokens', () =>
   assert.deepEqual(parseForgetNote('looks fine to me'), [])
   assert.deepEqual(parseForgetNote(''), [])
   assert.deepEqual(parseForgetNote(forgetNote(['bin'])), ['bin'])
+})
+
+// ROOM-29: a card the agent filed with `commands` lets exactly those commands past the terminal's check, once a
+// PERSON approved it, inside the window — and nothing else.
+const now = Date.parse('2026-11-23T19:40:00Z')
+const card = (over = {}) => ({
+  state: 'approved', byPerson: true, decidedAt: '2026-11-23T19:35:00Z',
+  question: 'Push and build?\n\nCommands this approval covers (exactly):\n```\ngit push origin HEAD:master\nnpm run build\n```',
+  ...over,
+})
+
+test('an approved card lets its named command run', () => {
+  assert.equal(cardAllows(card(), 'git push origin HEAD:master', { now }), true)
+  assert.equal(cardAllows(card(), '  git push   origin HEAD:master ', { now }), true)
+  assert.equal(cardAllows(card(), 'npm run build', { now }), true)
+})
+
+test('a command the card does not name is not covered, not even a longer one that contains it', () => {
+  assert.equal(cardAllows(card(), 'git push origin HEAD:master --force', { now }), false)
+  assert.equal(cardAllows(card(), 'git push', { now }), false)
+  assert.equal(cardAllows(card(), 'git push origin HEAD:master && rm -rf .', { now }), false)
+  assert.equal(cardAllows(card(), '', { now }), false)
+})
+
+test('only a person\'s approval, only approved, only inside the window', () => {
+  assert.equal(cardAllows(card({ byPerson: false }), 'npm run build', { now }), false)
+  assert.equal(cardAllows(card({ byPerson: undefined }), 'npm run build', { now }), false)
+  assert.equal(cardAllows(card({ state: 'pending' }), 'npm run build', { now }), false)
+  assert.equal(cardAllows(card({ state: 'denied' }), 'npm run build', { now }), false)
+  assert.equal(cardAllows(card({ decidedAt: '2026-11-23T19:20:00Z' }), 'npm run build', { now }), false)
+  assert.equal(cardAllows(card({ decidedAt: null }), 'npm run build', { now }), false)
+  assert.equal(cardAllows(null, 'npm run build', { now }), false)
+})
+
+test('the commands a call names are cleaned; the request id is read from the tool response', () => {
+  assert.deepEqual(cardCommands({ commands: [' git  push ', 'git push', 'a\nb', '', 'x'.repeat(501), 'npm test'] }),
+    ['git push', 'npm test'])
+  assert.deepEqual(cardCommands({}), [])
+  assert.equal(normCommand(' a \t b '), 'a b')
+  assert.equal(requestIdOf('{"requestId":"118431534779727872","state":"pending"}'), '118431534779727872')
+  assert.equal(requestIdOf([{ type: 'text', text: '{"requestId":"42","state":"pending"}' }]), '42')
+  assert.equal(requestIdOf({ content: [{ type: 'text', text: '{"requestId":"7"}' }] }), '7')
+  assert.equal(requestIdOf({ requestId: '9' }), '9')
+  assert.equal(requestIdOf('not json'), null)
 })
