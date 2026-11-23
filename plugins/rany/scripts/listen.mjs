@@ -142,6 +142,65 @@ function handoffHeldSeat(sid = sessionId) {
   if (held) writeTermHandoff(held[0], held[1]?.room?.channelId ?? null, held[1]?.room?.name ?? null)
 }
 
+/**
+ * The Screen of a seat whose session has NO terminal mirror (screen-feed.mjs): Claude Code in the desktop app,
+ * in VS Code, or a terminal opened without the `claude` shim. The hooks register the seat's transcript in
+ * ~/.rany-plugin/screen-feeds/<seat>.json and make sure the one per-machine feeder is running; it tails the
+ * transcript into the seat's `/term` stream. Under `rany-term` the real screen is mirrored instead, so a
+ * registration for the seat is withdrawn — one seat, one source. Best effort, silent, never costs a turn.
+ */
+function feedScreen(transcript = null, sid = sessionId) {
+  try {
+    const held = heldSeat(sid)
+    if (!held) return
+    const feeds = join(homedir(), '.rany-plugin', 'screen-feeds')
+    const file = join(feeds, `${held[0]}.json`)
+    if (process.env.RANY_TERM) { if (existsSync(file)) unlinkSync(file); return }
+    const path = transcript && existsSync(transcript) ? transcript : transcriptPathOf(sid)
+    if (!path) return
+    const body = JSON.stringify({ agentId: held[0], transcript: path, sessionId: sid ?? null })
+    let cur = null
+    try { cur = readFileSync(file, 'utf8') } catch { /* first time */ }
+    if (cur !== body) { mkdirSync(feeds, { recursive: true }); writeFileSync(file, body) }
+    ensureScreenFeeder()
+  } catch { /* the Screen is a nicety */ }
+}
+
+/** Where Claude Code writes this session's transcript: <config>/projects/<dir with every non-alphanumeric
+ *  character as '-'>/<session>.jsonl. Null when it is not there (yet). */
+function transcriptPathOf(sid = sessionId) {
+  if (!sid) return null
+  const root = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude')
+  const p = join(root, 'projects', projectDir.replace(/[^A-Za-z0-9]/g, '-'), `${sid}.jsonl`)
+  return existsSync(p) ? p : null
+}
+
+/** Keep ~/.rany-plugin/screen current and its feeder running: copy the two modules when their bytes changed
+ *  (a changed copy replaces a running feeder), start one detached when none is alive. */
+function ensureScreenFeeder() {
+  const scripts = dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'))
+  const stable = join(homedir(), '.rany-plugin', 'screen')
+  if (!existsSync(join(scripts, 'screen-feed.mjs'))) return
+  mkdirSync(stable, { recursive: true })
+  let changed = false
+  for (const f of ['screen-render.mjs', 'screen-feed.mjs']) { // the imported module first
+    const next = readFileSync(join(scripts, f))
+    let cur = null
+    try { cur = readFileSync(join(stable, f)) } catch { /* first time */ }
+    if (!cur || !cur.equals(next)) { writeFileSync(join(stable, f), next); changed = true }
+  }
+  const pidFile = join(homedir(), '.rany-plugin', 'screen-feed.pid')
+  let pid = 0
+  try { pid = Number(JSON.parse(readFileSync(pidFile, 'utf8')).pid) || 0 } catch { /* none */ }
+  const running = pid > 0 && (() => { try { process.kill(pid, 0); return true } catch (e) { return e?.code === 'EPERM' } })()
+  if (running && !changed) return
+  if (running) { try { process.kill(pid) } catch { /* gone */ } try { unlinkSync(pidFile) } catch { /* gone */ } }
+  const child = spawn(process.execPath, [join(stable, 'screen-feed.mjs'), '--daemon'],
+    { detached: true, stdio: 'ignore', windowsHide: true, env: { ...process.env, RANY_PERSONA_TOKEN: config.token ?? '', RANY_API_URL: config.apiUrl ?? '' } })
+  child.on('error', () => { /* no node: no feed */ })
+  child.unref()
+}
+
 /** What the session holding a seat is called, "<seat> @ <room>" (seat-title.mjs); null without a seat. */
 function seatTitle(sid = sessionId) {
   return seatTitleOf(heldSeat(sid)?.[1]?.room)
@@ -1707,6 +1766,8 @@ if (process.argv.includes('--prompt')) {
   }
   const code = inviteCodeIn(hook.prompt)
   const joined = code && config.token ? await joinSeat(code, promptSid) : null
+  // No terminal mirror around this session (desktop app, VS Code, no shim): feed the Screen from the transcript.
+  feedScreen(typeof hook.transcript_path === 'string' ? hook.transcript_path : null, promptSid)
   const out = withTitle(joined ? { hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: joined } } : {})
   if (Object.keys(out).length) process.stdout.write(JSON.stringify(out) + '\n')
   process.exit(QUIET)
@@ -1831,6 +1892,7 @@ if (process.argv.includes('--beat')) {
   handoffHeldSeat()
   if (config.token && seats.length > 0) {
     const hook = await readHookInput()
+    feedScreen(typeof hook.transcript_path === 'string' ? hook.transcript_path : null)
     const line = toolLine(hook)
     // A commit is also a BREADCRUMB in the room log (ADR-061): the room's history shows what was committed
     // where, without the agent having to remember to say so. A repeated sha is refused server-side.
@@ -2046,6 +2108,8 @@ prepareTerm()
 // The launcher that wrapped this window is holding its screen until it hears which seat this is (ADR-050).
 // The listener runs at the end of every turn, so this is the latest a re-attached seat can be told about.
 handoffHeldSeat()
+// …and a session with no launcher around it gets its Screen from its transcript instead.
+feedScreen()
 
 // `rany-restore` keeps a stable copy of itself and a `rany-restore` command in ~/.rany-plugin, so it can
 // be typed in a plain terminal after a reboot — before any agent is running. Silent, best effort.
