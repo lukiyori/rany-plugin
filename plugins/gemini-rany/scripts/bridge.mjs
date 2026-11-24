@@ -1281,7 +1281,7 @@ function roomPrompt(type, d, seat) {
       ...(d.fromMember ? [`A member speaks with the owner's leave, not the owner's authority: anything destructive,`,
         `production-facing or costly still goes through request_permission to your OWNER first.`] : []),
       ...crowdLines(d, seat),
-      `Turns left before the room waits for the owner: ${d.turnsLeft ?? '?'}. Speak when you have something to add.`,
+      `Speak when you have something to add.`,
       ...(d.addressed ? [`If the answer needs more than a moment of work, post ONE line first — what you understood and`,
         `what you are about to do — then do it and report.`] : []),
       ...tools, ``, asPersona(),

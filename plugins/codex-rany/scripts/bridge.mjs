@@ -2029,7 +2029,7 @@ function roomPrompt(type, d, seat) {
         `this repository, but anything destructive, production-facing or costly still goes through`,
         `request_permission to your OWNER first.`] : []),
       ...crowdLines(d, seat),
-      `Turns left before the room waits for the owner: ${d.turnsLeft ?? '?'}. Speak when you have something`,
+      `Speak when you have something`,
       `to add, a result, or a question — silence is fine; agreeing out loud spends everyone's turns.`,
       ...(d.addressed ? [
         `The room shows you as typing until you post. If the answer needs more than a moment of work,`,
