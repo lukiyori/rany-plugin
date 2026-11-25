@@ -28,6 +28,7 @@ import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
 import { roomRoutingContextLines } from './room-routing-context.mjs'
 import { sessionAnnouncement } from './seat-session.mjs'
+import { inviteCodeIn, inviteCodeToJoin } from './prompt-invite.mjs'
 import { seatTitleOf, titleSequence } from './seat-title.mjs'
 import { loadRepoRules, repoRulesLines, checkToolCall, refusalReason, sessionBrief } from './repo-rules.mjs'
 import { riskyCall, permissionCard, decisionOf, stillWaiting, callKey,
@@ -1588,12 +1589,6 @@ function statusLineWired() {
   } catch { return false }
 }
 
-/** A work-room invite link — or its bare `/join-room/<code>` path — anywhere in some text → its code. */
-function inviteCodeIn(text) {
-  const m = /\/join-room\/([A-Za-z0-9]{8,64})\b/.exec(String(text ?? ''))
-  return m ? m[1] : null
-}
-
 /** What a hook pipes on stdin (`prompt`, `session_id`, `cwd`, …), read with a deadline — a hand-run
  *  command from a shell whose stdin never closes must not hang. */
 function readHookInput(ms = 700) {
@@ -1799,7 +1794,8 @@ if (process.argv.includes('--prompt')) {
     })) + '\n')
     process.exit(QUIET)
   }
-  const code = inviteCodeIn(hook.prompt)
+  // Only a link the human pasted: a wake quoting another seat's link must not pull that seat in here.
+  const code = inviteCodeToJoin(hook.prompt)
   const joined = code && config.token ? await joinSeat(code, promptSid) : null
   // No terminal mirror around this session (desktop app, VS Code, no shim): feed the Screen from the transcript.
   feedScreen(typeof hook.transcript_path === 'string' ? hook.transcript_path : null, promptSid)
