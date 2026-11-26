@@ -34,7 +34,12 @@ import { loadRepoRules, repoRulesLines, checkToolCall, refusalReason, sessionBri
 import { riskyCall, permissionCard, decisionOf, stillWaiting, callKey,
   forgetTokens, isForgiven, mergeForgiven, parseForgetNote, floorCardAppliesInMode,
   normCommand, cardCommands, requestIdOf, cardAllows, cardAllowReason } from './room-permission.mjs'
-import { redactSecrets } from './redact.mjs'
+import { redactSecrets as redactShapes, secretValuesFromEnv } from './redact.mjs'
+// Known-value masking (owner, 2026-11-26): mask the ACTUAL secret values this machine holds (env vars whose
+// name looks sensitive), not only recognised shapes — the layer the server cannot do. Collected once at start;
+// every room-bound redactSecrets call below runs through it via this wrapper, so no call site has to opt in.
+const ENV_SECRETS = secretValuesFromEnv(process.env)
+const redactSecrets = (t) => redactShapes(t, { values: ENV_SECRETS })
 import { redact, describeTranscript } from './session-archive.mjs'
 import { knowledgeEntry, knowledgeBlock } from './seat-knowledge.mjs'
 import { gzipSync } from 'node:zlib'
@@ -1869,6 +1874,38 @@ if (process.argv.includes('--rules-brief')) {
   if (lines.length) process.stdout.write(JSON.stringify({
     hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: lines.join('\n') },
   }) + '\n')
+  process.exit(QUIET)
+}
+
+/**
+ * `--post-guard` (PreToolUse on the MCP `post_message` tool): secret-redaction AT THE SOURCE (owner,
+ * 2026-11-26, "hiçbir şifre terminalden çıkmamalı"). The agent's own reply to the room is composed by the
+ * model and sent straight to the server by the MCP client — the plugin never renders it, so it is the one
+ * room surface the activity/screen/card scrubbing (which runs before postJson) does not cover. Here we
+ * rewrite the call's `content` in place with {@link redactSecrets} — including KNOWN-VALUE masking of the
+ * env secrets this machine holds, which the server cannot do — and allow the (now clean) call through.
+ *
+ * Rewriting a PreToolUse tool input is `hookSpecificOutput.updatedInput`, which replaces the WHOLE input
+ * object, so the other fields (channelId, agentId, actions, attachments…) are spread back unchanged. If
+ * nothing matched, we emit nothing and the call proceeds untouched. The server-side backstop still runs,
+ * so a skipped or mismatched hook never means an unscrubbed post — this layer additionally catches the
+ * known values the server has no way to see.
+ */
+if (process.argv.includes('--post-guard')) {
+  const hook = await readHookInput()
+  const input = hook?.tool_input
+  const content = input && typeof input.content === 'string' ? input.content : null
+  if (content) {
+    const clean = redactSecrets(content)
+    if (clean !== content) process.stdout.write(JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'allow',
+        permissionDecisionReason: 'RANY masked a secret in this room post before it was sent.',
+        updatedInput: { ...input, content: clean },
+      },
+    }) + '\n')
+  }
   process.exit(QUIET)
 }
 

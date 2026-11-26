@@ -28,7 +28,11 @@ import { spawn, spawnSync } from 'node:child_process'
 import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
 import { loadRepoRules, repoRulesLines, checkToolCall, refusalReason, sessionBrief } from './repo-rules.mjs'
-import { redactSecrets } from './redact.mjs'
+import { redactSecrets as redactShapes, secretValuesFromEnv } from './redact.mjs'
+import { knowledgeEntry, knowledgeBlock } from './seat-knowledge.mjs'
+// Known-value masking: also mask the actual secret values this machine holds (see rany/listen.mjs for the why).
+const ENV_SECRETS = secretValuesFromEnv(process.env)
+const redactSecrets = (t) => redactShapes(t, { values: ENV_SECRETS })
 
 /** Shared with the Claude Code and Codex plugins ON PURPOSE: a board belongs to a repository, not to
  *  whichever agent you happen to be running. Each plugin reads only its own entries. */
@@ -299,16 +303,19 @@ function loadSeatIdentities() {
 }
 
 /** Store what the server said about a seat's identity; `null` = the seat has none (cached as such). */
-function saveSeatIdentity(agentId, identity) {
+function saveSeatIdentity(agentId, identity, knowledge) {
   const seats = loadSeatIdentities()
+  // What the owner wants the seat to KNOW (ADR-113 §14). Absent from an older server: keep what we had.
+  const knowledgeKept = knowledgeEntry(knowledge, seats[String(agentId)]?.knowledge)
   seats[String(agentId)] = identity?.slug
     ? {
         slug: identity.slug, title: identity.title, emoji: identity.emoji ?? null,
         category: identity.categoryName ?? identity.category ?? null, instructions: identity.instructions ?? '',
         rev: createHash('sha256').update(`${identity.slug}\n${identity.instructions ?? ''}`).digest('hex').slice(0, 12),
+        knowledge: knowledgeKept,
         fetchedAt: Date.now(),
       }
-    : { slug: null, fetchedAt: Date.now() }
+    : { slug: null, knowledge: knowledgeKept, fetchedAt: Date.now() }
   try {
     mkdirSync(dirname(seatIdentityFile), { recursive: true })
     writeFileSync(seatIdentityFile, JSON.stringify({ seats }, null, 2))
@@ -320,7 +327,7 @@ async function ensureSeatIdentity(agentId, force = false) {
   const cur = loadSeatIdentities()[String(agentId)]
   if (!force && cur && Date.now() - (cur.fetchedAt ?? 0) < IDENTITY_TTL_MS) return
   const r = await getJson(`/personas/@self/rooms/${agentId}/identity`)
-  if (r) saveSeatIdentity(agentId, r.identity ?? null)
+  if (r) saveSeatIdentity(agentId, r.identity ?? null, r.knowledge)
 }
 
 const identityShownFile = join(HOME, 'gemini-identity-shown.json')
@@ -347,20 +354,35 @@ function identityShownMap() {
  *  afterwards one reminder line. Nothing for a seat without an identity. */
 function identityLines(agentId, { full = false, sessionKey } = {}) {
   const i = loadSeatIdentities()[String(agentId)]
-  if (!i?.slug) return []
+  const kn = knowledgeLines(agentId, i, { full, sessionKey })
+  if (!i?.slug) return kn
   const key = `${sessionKey ?? IDENTITY_SESSION_KEY}:${agentId}`
   const shown = identityShownMap()
   if (!full && shown[key] === i.rev)
     return [`Your identity in this room: ${i.emoji ? `${i.emoji} ` : ''}**${i.title}** (${i.slug}) — keep working as it`
-      + ` describes. The full brief again: node "${IDENTITY_SCRIPT}" --identity ${agentId}`]
+      + ` describes. The full brief again: node "${IDENTITY_SCRIPT}" --identity ${agentId}`, ...kn]
   shown[key] = i.rev
   try { mkdirSync(dirname(identityShownFile), { recursive: true }); writeFileSync(identityShownFile, JSON.stringify(shown)) } catch { /* shown again next time */ }
   return [
     `YOUR IDENTITY IN THIS ROOM: ${i.emoji ? `${i.emoji} ` : ''}${i.title} (${i.slug}). ${IDENTITY_RULE}`,
     `--- identity brief ---`, i.instructions, `--- end of identity brief ---`,
+    ...kn,
   ]
 }
 
+
+/** What the owner wants this seat to KNOW (ADR-113 §14): in full the first time a session sees this revision of
+ *  the note, then not repeated (seat-knowledge.mjs). */
+function knowledgeLines(agentId, entry, { full = false, sessionKey } = {}) {
+  const key = `${sessionKey ?? IDENTITY_SESSION_KEY}:knowledge:${agentId}`
+  const shown = identityShownMap()
+  const { lines, shown: now } = knowledgeBlock(entry?.knowledge, shown[key], full)
+  if (now) {
+    shown[key] = entry.knowledge.rev
+    try { mkdirSync(dirname(identityShownFile), { recursive: true }); writeFileSync(identityShownFile, JSON.stringify(shown)) } catch { /* shown again next time */ }
+  }
+  return lines
+}
 
 function logRoute(type, ids, decision) {
   try {
@@ -1112,7 +1134,7 @@ async function route(type, d) {
     d.identitySessionKey = pick.owner.threadId ?? pick.owner.sessionId ?? pick.owner.dir
     d.rulesDir = pick.owner.dir
     await ensureSeatIdentity(pick.s.agentId,
-      type === 'PERSONA_ROOM_UPDATED' && d.change === 'identity_set' && String(d.agentId ?? '') === String(pick.s.agentId))
+      type === 'PERSONA_ROOM_UPDATED' && (d.change === 'identity_set' || d.change === 'knowledge_set') && String(d.agentId ?? '') === String(pick.s.agentId))
     return { ...pick.owner, title, text: roomPrompt(type, d, pick.s) }
   }
 
@@ -1233,7 +1255,7 @@ function teamLines(seat) {
 }
 
 function roomPrompt(type, d, seat) {
-  const identityChanged = type === 'PERSONA_ROOM_UPDATED' && d.change === 'identity_set'
+  const identityChanged = type === 'PERSONA_ROOM_UPDATED' && (d.change === 'identity_set' || d.change === 'knowledge_set')
     && String(d.agentId ?? '') === String(seat.agentId)
   const who = [
     `You are "${seat.name}" (agentId ${seat.agentId}) in the work room at channel ${d.channelId}, working from THIS repository.`,
@@ -1330,10 +1352,13 @@ function roomPrompt(type, d, seat) {
     identity_set: mine
       ? (loadSeatIdentities()[String(seat.agentId)]?.slug ? 'the owner gave you a NEW IDENTITY (above)' : 'the owner CLEARED your identity')
       : 'an agent was given a different identity',
+    knowledge_set: mine
+      ? (loadSeatIdentities()[String(seat.agentId)]?.knowledge ? 'the owner changed what you should KNOW in this room (above)' : "the owner cleared your seat's knowledge note")
+      : "an agent's knowledge note was changed",
   }[d.change] ?? `the room changed (${d.change})`
   // Most room updates are about someone else: they are not worth a Gemini turn. Wake only for what changes
   // this seat's work.
-  const worthATurn = stop || d.change === 'budget_exhausted' || (mine && (d.change === 'agent_joined' || d.change === 'task_assigned' || d.change === 'agent_resumed' || d.change === 'identity_set'))
+  const worthATurn = stop || d.change === 'budget_exhausted' || (mine && (d.change === 'agent_joined' || d.change === 'task_assigned' || d.change === 'agent_resumed' || d.change === 'identity_set' || d.change === 'knowledge_set'))
   if (!worthATurn) return null
   const next = stop
     ? [`STOP working on this room's job now and do not post there until you are resumed. Leave what you were doing in a safe state.`]
@@ -1343,6 +1368,8 @@ function roomPrompt(type, d, seat) {
         loadSeatIdentities()[String(seat.agentId)]?.slug
           ? `Work as that identity from now on. If it changes your part of the job, say so in ONE room line.`
           : `Go back to working without a role brief; nothing else changes.`]
+    : d.change === 'knowledge_set' ? [
+        `Work with that from now on. Do not announce it; if it changes something you were doing, say so in ONE room line.`]
     : d.change === 'task_assigned' ? [
         `It is yours now. Read it with get_task({guildId:"${d.taskGuildId}", taskId:"${d.taskId}"}), do it in this repository,`,
         `report on the card with comment_task, move it with set_task_status, and say in one room line that you took it.`]

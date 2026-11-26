@@ -13,7 +13,10 @@
  */
 import { createHash } from 'node:crypto'
 import { commandMatches, commandSegments } from './repo-rules.mjs'
-import { redactSecrets } from './redact.mjs'
+import { redactSecrets as redactShapes, secretValuesFromEnv } from './redact.mjs'
+// Known-value masking: also mask the actual secret values this machine holds (see listen.mjs for the why).
+const ENV_SECRETS = secretValuesFromEnv(process.env)
+const redactSecrets = (t) => redactShapes(t, { values: ENV_SECRETS })
 
 /**
  * Calls a runtime does not run unattended, with the words for WHY each one is being asked. This is the

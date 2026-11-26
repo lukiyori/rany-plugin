@@ -23,7 +23,10 @@ import { homedir } from 'node:os'
 import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
 import { screenLines, A } from './screen-render.mjs'
-import { redactSecrets } from './redact.mjs'
+import { redactSecrets as redactShapes, secretValuesFromEnv } from './redact.mjs'
+// Known-value masking: also mask the actual secret values this machine holds (see listen.mjs for the why).
+const ENV_SECRETS = secretValuesFromEnv(process.env)
+const redactSecrets = (t) => redactShapes(t, { values: ENV_SECRETS })
 
 const STATE = join(homedir(), '.rany-plugin')
 export const FEEDS = join(STATE, 'screen-feeds')

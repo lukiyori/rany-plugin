@@ -70,13 +70,38 @@ function rules() {
 }
 
 /**
+ * KNOWN-VALUE masking — the one layer that does not depend on recognising a token's shape. Collect the VALUES
+ * of environment variables whose NAME looks sensitive (password / secret / token / key / …) and mask those
+ * literal strings wherever they appear, whatever form they take. This is finite and complete for the secrets
+ * we actually hold: the server can never do it (it has no access to the agent's local env), so it belongs at
+ * the source. Only sensitively-named vars are taken (PATH / HOME / LANG are never masked) and only values long
+ * enough not to be a flag or an ordinary word, so plain prose is left intact.
+ */
+export function secretValuesFromEnv(env = {}) {
+  const nameRe = new RegExp(SENS, 'i')
+  const out = []
+  for (const [k, v] of Object.entries(env)) {
+    if (typeof v !== 'string' || v.length < 6) continue
+    if (nameRe.test(k)) out.push(v)
+  }
+  // Longest first, so a value that contains a shorter one is masked whole before its substring is touched.
+  return [...new Set(out)].sort((a, b) => b.length - a.length)
+}
+
+/**
  * Return `text` with recognised secrets masked. Non-strings pass through unchanged (so a null line from a renderer
  * stays null). Idempotent: running it twice changes nothing (the mask has no secret shape).
+ *
+ * `opts.values` — extra LITERAL strings to mask wherever they appear (the known-value layer, typically from
+ * {@link secretValuesFromEnv}). Masked after the shape/structural passes, longest first, as plain substrings
+ * (no regex), so any secret we already hold is removed even in a shape nothing here would recognise.
  */
-export function redactSecrets(text) {
+export function redactSecrets(text, opts) {
   if (typeof text !== 'string' || text === '') return text
   let s = text
   for (const re of SHAPES) s = s.replace(re, REDACTED)
   for (const { re, to } of rules()) s = s.replace(re, to)
+  const values = opts && Array.isArray(opts.values) ? opts.values : null
+  if (values) for (const v of values) if (typeof v === 'string' && v.length > 0 && s.includes(v)) s = s.split(v).join(REDACTED)
   return s
 }

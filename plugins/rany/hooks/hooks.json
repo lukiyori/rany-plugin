@@ -87,6 +87,16 @@
             "timeout": 1800
           }
         ]
+      },
+      {
+        "matcher": "mcp__plugin_rany_rany__post_message",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/listen.mjs\" --post-guard",
+            "timeout": 10
+          }
+        ]
       }
     ]
   }

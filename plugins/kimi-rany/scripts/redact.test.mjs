@@ -4,11 +4,17 @@
 // Evaluated adversarially in 3 passes — coverage, false positives, robustness — and hardened accordingly.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { redactSecrets, REDACTED } from './redact.mjs'
+import { redactSecrets, secretValuesFromEnv, REDACTED } from './redact.mjs'
 
 const has = (s) => s.includes(REDACTED)
 const gone = (s, secret) => !s.includes(secret)
 const r = redactSecrets
+
+// These probes are DUMMY, non-real values that only need to MATCH the redactor's shapes. They are assembled from
+// fragments with `mk` so no contiguous secret-shaped literal (a Google key, a GitHub PAT, a PEM header…) ever sits
+// in the source — otherwise GitHub secret scanning flags the test file (it did, for the `AIza…` probe, 2026-11-26).
+// The redactor still sees the full joined string at runtime, so coverage is unchanged.
+const mk = (...parts) => parts.join('')
 
 // ── Coverage: every secret shape is masked, the surrounding label kept ──
 
@@ -34,7 +40,8 @@ test('env-var and connection-string passwords are masked, labels kept', () => {
 test('JSON and quoted keys are masked (the value, not the whole object)', () => {
   const j = r('{"db_password": "secret123", "user": "admin"}')
   assert.ok(gone(j, 'secret123') && j.includes('"user"') && j.includes('admin'))
-  assert.ok(gone(r("'apiKey' = 'AKIAsecretVALUE1'"), 'AKIAsecretVALUE1'))
+  const awsKey = mk('AKIA', 'secretVALUE1')
+  assert.ok(gone(r(`'apiKey' = '${awsKey}'`), awsKey))
 })
 
 test('CLI flags (incl. nuget/PowerShell/dashed-prefix) mask their argument', () => {
@@ -61,33 +68,35 @@ test('URL credentials, basic auth and auth headers are masked', () => {
   assert.ok(gone(basic, 'S3cretPass') && basic.includes('admin'))
   const basicLong = r('curl --user admin:OtherPass https://api')
   assert.ok(gone(basicLong, 'OtherPass') && basicLong.includes('admin'))
-  const h = r('curl -H "Authorization: Bearer eyJhbGc.payload.sig" https://api')
-  assert.ok(gone(h, 'eyJhbGc.payload.sig'))
+  const jwt = mk('eyJ', 'hbGc.payload.sig')
+  const h = r(`curl -H "Authorization: Bearer ${jwt}" https://api`)
+  assert.ok(gone(h, jwt))
 })
 
 test('token shapes are masked wherever they appear', () => {
   for (const secret of [
-    'rany_persona_abcDEF123456',
-    'ghp_0123456789abcdefghijABCDEFGHIJ0123456789',
-    'github_pat_11ABCDEFG0abcdefghijkl',
-    'xoxb-123456789012-abcdefABCDEF',
-    'AIzaSyA1234567890abcdefghijklmnopqrstuv',
-    'sk_live_abcdEFGH1234567890',
-    'whsec_abcdEFGH1234567890',
-    'sk-ant-api03-abcdefghijklmnop',
-    'npm_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789',
-    'SG.abcdefghijklmnop.qrstuvwxyz0123456789ABCDEF',
-    'AKIAIOSFODNN7EXAMPLE',
+    mk('rany_persona_', 'abcDEF123456'),
+    mk('ghp', '_0123456789abcdefghijABCDEFGHIJ0123456789'),
+    mk('github', '_pat_11ABCDEFG0abcdefghijkl'),
+    mk('xox', 'b-123456789012-abcdefABCDEF'),
+    mk('AIza', 'SyA1234567890abcdefghijklmnopqrstuv'),
+    mk('sk_', 'live_abcdEFGH1234567890'),
+    mk('whsec', '_abcdEFGH1234567890'),
+    mk('sk-', 'ant-api03-abcdefghijklmnop'),
+    mk('npm', '_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789'),
+    mk('SG', '.abcdefghijklmnop.qrstuvwxyz0123456789ABCDEF'),
+    mk('AKIA', 'IOSFODNN7EXAMPLE'),
   ]) {
     const out = r(`value here ${secret} trailing`)
     assert.ok(gone(out, secret), `leaked: ${out}`)
   }
-  assert.ok(gone(r('url=https://hooks.slack.com/services/T00/B00/XXXXsecretXXXX'), 'XXXXsecretXXXX'))
+  const slack = mk('https://hooks.slack.com/services/', 'T00/B00/XXXXsecretXXXX')
+  assert.ok(gone(r(`url=${slack}`), 'XXXXsecretXXXX'))
 })
 
 test('a PEM private key block is masked even when truncated (Screen clips output)', () => {
-  assert.ok(gone(r('-----BEGIN RSA PRIVATE KEY-----\nMIIExyz\nabc\n-----END RSA PRIVATE KEY-----'), 'MIIExyz'))
-  assert.ok(gone(r('-----BEGIN OPENSSH PRIVATE KEY-----\nMIIsecretBODY\nmoremore'), 'MIIsecretBODY')) // no END
+  assert.ok(gone(r(mk('-----BEGIN ', 'RSA PRIVATE KEY-----\nMIIExyz\nabc\n-----END RSA PRIVATE KEY-----')), 'MIIExyz'))
+  assert.ok(gone(r(mk('-----BEGIN ', 'OPENSSH PRIVATE KEY-----\nMIIsecretBODY\nmoremore')), 'MIIsecretBODY')) // no END
 })
 
 // ── False positives: ordinary command text must survive untouched ──
@@ -123,7 +132,7 @@ test('non-strings pass through; redaction is idempotent', () => {
   assert.equal(r(undefined), undefined)
   assert.equal(r(123), 123)
   assert.equal(r(''), '')
-  const once = r('PGPASSWORD=abc psql; token: eyJaaaaaa.bbbbbb.cccccc; https://u:p@h')
+  const once = r(mk('PGPASSWORD=abc psql; token: eyJ', 'aaaaaa.bbbbbb.cccccc; https://u:p@h'))
   assert.equal(r(once), once)
 })
 
@@ -139,4 +148,38 @@ test('a multiline Screen frame masks every secret and keeps the normal lines', (
   const out = r(frame)
   assert.ok(gone(out, 's3cr3t') && gone(out, 'Zm9v=='))
   assert.ok(out.includes('normal output line 42') && out.includes('run deploy'))
+})
+
+// ── Known-value masking: mask the actual secret VALUES we hold, whatever shape they take ──
+
+test('secretValuesFromEnv collects values of sensitively-named vars only, long enough', () => {
+  const vals = secretValuesFromEnv({
+    DB_PASSWORD: 'Tr0ub4dour',
+    MY_API_KEY: 'abcdef123456',
+    GITHUB_TOKEN: 'ghtokvalue9',
+    PATH: '/usr/bin:/bin',        // not sensitive → never collected (would mangle everything)
+    HOME: '/home/agent',          // not sensitive
+    SHORT_SECRET: 'abc',          // sensitive name but < 6 chars → skipped (too word-like)
+    LANG: 'en_US.UTF-8',
+  })
+  assert.ok(vals.includes('Tr0ub4dour') && vals.includes('abcdef123456') && vals.includes('ghtokvalue9'))
+  assert.ok(!vals.includes('/usr/bin:/bin') && !vals.includes('/home/agent') && !vals.includes('abc'))
+  // longest first, so a value containing a shorter one is masked whole first
+  for (let i = 1; i < vals.length; i++) assert.ok(vals[i - 1].length >= vals[i].length)
+})
+
+test('redactSecrets masks a known value in ANY shape, even one no pattern recognises', () => {
+  const secret = 'Zx9-quux-plain-nonpattern-value'   // no recognisable token shape, no sensitive key around it
+  assert.equal(r(`the setting is ${secret} now`), `the setting is ${secret} now`) // unknown by shape → survives
+  const out = r(`the setting is ${secret} now`, { values: [secret] })             // known by value → masked
+  assert.ok(gone(out, secret) && has(out) && out.includes('the setting is') && out.includes('now'))
+})
+
+test('known-value masking is idempotent and leaves ordinary text alone', () => {
+  const vals = ['SuperSecretValue123']
+  const once = r('key is SuperSecretValue123', { values: vals })
+  assert.equal(r(once, { values: vals }), once)
+  assert.equal(r('nothing to hide here', { values: vals }), 'nothing to hide here')
+  // empty/garbage value lists never throw or over-mask
+  assert.equal(r('plain text', { values: ['', null, undefined] }), 'plain text')
 })
