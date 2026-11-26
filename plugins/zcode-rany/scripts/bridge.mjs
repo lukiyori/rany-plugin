@@ -28,6 +28,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
 import { loadRepoRules, repoRulesLines, checkToolCall, refusalReason } from './repo-rules.mjs'
+import { redactSecrets } from './redact.mjs'
 
 /** Shared with the Claude Code and Codex plugins ON PURPOSE: a board belongs to a repository, not to
  *  whichever agent you happen to be running. Each plugin reads only its own entries. */
@@ -822,7 +823,7 @@ if (has('--start') || has('--prompt') || has('--beat') || has('--deliver')) {
 
   if (has('--beat') && config.token && sessionId && typeof hook.tool_name === 'string') {
     const seats = Object.entries(loadBindings()).filter(([, e]) => ownerOf(e)?.sessionId === sessionId && e.room).map(([id]) => id)
-    const line = seats.length ? toolLine(hook) : null
+    const line = seats.length ? redactSecrets(toolLine(hook)) : null
     if (line) await Promise.all(seats.map((id) => postJson(`/personas/@self/rooms/${id}/activity`, { lines: [{ kind: 'tool', text: line }] }, 4000)))
   }
 
@@ -924,7 +925,7 @@ if (has('--rules-guard')) {
       // The owner watching the room sees the refusal on the seat's line, not only the agent.
       if (seat && config.token)
         await postJson(`/personas/@self/rooms/${seat.agentId}/activity`,
-          { lines: [{ kind: 'tool', text: `Blocked by .rany/ (${hit.kind === 'deny' ? 'never' : 'ask first'}: ${hit.rule}) — ${hit.what}`.slice(0, 260) }] }, 2500)
+          { lines: [{ kind: 'tool', text: redactSecrets(`Blocked by .rany/ (${hit.kind === 'deny' ? 'never' : 'ask first'}: ${hit.rule}) — ${hit.what}`).slice(0, 260) }] }, 2500)
     }
   }
   process.exit(0)

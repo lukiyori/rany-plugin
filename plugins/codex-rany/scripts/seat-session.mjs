@@ -26,3 +26,18 @@ export function sessionAnnouncement(remembered, sessionId) {
   if (String(was?.id ?? '') !== String(sessionId)) return 'new'
   return was?.closedAt ? 'reopened' : 'none'
 }
+
+/**
+ * Does a seat's history show that THIS conversation held it before? The condition for session-matched
+ * reattach (ADR-068 as amended 2026-11-26): the SAME session reopening retakes its own seat — it is the
+ * deliberately-joined session returning, not an unrelated one, so it carries none of the re-sent-context
+ * cost ADR-068 was written against. A session that never held the seat does not auto-take it (it is only
+ * offered). Order-independent: a reopened session is not always the newest the seat remembers.
+ * @param {Array<{id?: string}>|undefined} remembered — the seat's sessions.
+ * @param {string|null|undefined} sessionId — the conversation that is live now.
+ * @returns {boolean}
+ */
+export function seatKnowsThread(remembered, sessionId) {
+  if (!sessionId) return false
+  return Array.isArray(remembered) && remembered.some((s) => String(s?.id ?? '') === String(sessionId))
+}

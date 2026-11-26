@@ -133,8 +133,22 @@ checkout, `.rany/` or not — `git reset`, `git clean`, `git checkout --` / `git
 pushing, moving a file. One approval is one command, remembered for the rules' window (default 15 min), so a
 retry does not file a second card and approving one call never opens another.
 
+The **floor** list (not the checkout's own `.rany/` rules) steps aside in Claude's **auto mode**
+(`bypassPermissions`) — where the owner has opted out of per-command prompts, so a room card is unwanted
+friction on top of that choice. It still asks in the other three modes: `default` (manual), `acceptEdits`
+(accept edits — it auto-accepts *edits* but still prompts for *commands*) and `plan`. A `.rany/rany.json` `deny`
+or `approval` rule is a deliberate per-repo choice and still asks in every mode. Tune the auto set with
+`approvals.autoModes` in `rany.json` (below); `[]` turns the stepping-aside off entirely (always card).
+
 Change the wait with `RANY_PERMISSION_WAIT_MS` (default `1500000` = 25 min, clamped to 5 s … 29 min); the hook's own
 timeout in `hooks/hooks.json` is the ceiling above it.
+
+**Secrets never leave the terminal in the clear.** Everything posted into the room from the terminal — the
+approval card's quoted command, the activity feed, the commit crumb and the Screen mirror — passes through a
+redaction gate (`scripts/redact.mjs`) first, which masks passwords, tokens, API keys, connection strings, URL
+credentials, auth headers and private keys (`PGPASSWORD=‹redacted› psql …`). The command that actually runs on
+approval is untouched; only what is shown is scrubbed. It is a floor (recognised shapes), not a proof — prefer not
+to put a secret on a command line at all; use an env var or a secret store.
 
 ## Seated sessions are archived (ADR-111)
 
@@ -217,9 +231,17 @@ never picks a conversation up — while forwards, tasks and workflow steps still
     "tasks": true, "comments": true, "forwards": true, "workflows": true, "asks": true,
     "addressed": true, "ownerMentions": false
   },
-  "seats": { "autoReattach": false }
+  "seats": { "autoReattach": false },
+  "approvals": { "autoModes": ["bypassPermissions"] }
 }
 ```
+
+`approvals.autoModes` is the set of Claude Code permission modes in which the built-in **floor** permission
+card (the standard-command list — `git`, `rm -rf`, a DB drop, …) steps aside, because the owner has opted out
+of per-command prompts there. Unset, it defaults to `["bypassPermissions"]` (Claude's "auto mode"). Set it to
+`[]` to always show the floor card regardless of mode, or widen it (e.g. `["acceptEdits", "bypassPermissions"]`)
+to also drop the card under accept-edits. A checkout's own `.rany/rany.json` `deny` / `approval` rules are
+unaffected and ask in every mode.
 
 `seats.autoReattach` is whether a session takes this repository's remembered work-room seats back by
 itself at start. Off, because opening a terminal in a directory is not a request to work for a room:

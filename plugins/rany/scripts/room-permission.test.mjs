@@ -5,6 +5,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { riskyCall, permissionCard, decisionOf, stillWaiting, callKey, RISKY,
   forgetTokens, isForgiven, mergeForgiven, forgetNote, parseForgetNote, FORGET_MARKER,
+  floorCardAppliesInMode, AUTO_PERMISSION_MODES,
   normCommand, cardCommands, requestIdOf, cardAllows } from './room-permission.mjs'
 
 const bash = (command) => ({ tool_name: 'Bash', tool_input: { command } })
@@ -208,4 +209,35 @@ test('the commands a call names are cleaned; the request id is read from the too
   assert.equal(requestIdOf({ content: [{ type: 'text', text: '{"requestId":"7"}' }] }), '7')
   assert.equal(requestIdOf({ requestId: '9' }), '9')
   assert.equal(requestIdOf('not json'), null)
+})
+
+// floorCardAppliesInMode (owner, 2026-11-26): the standard-command FLOOR card steps aside in an auto Claude Code
+// permission mode (the runtime runs under its own guard there); it still shows in manual/plan, and when the mode
+// is unknown/absent the safe default is to keep asking.
+test('the floor card is suppressed only in auto mode (bypassPermissions), kept in the other three', () => {
+  assert.equal(floorCardAppliesInMode('bypassPermissions'), false) // owner's "auto mode" → no card
+  assert.equal(floorCardAppliesInMode('acceptEdits'), true)        // accept edits still prompts for commands → card
+  assert.equal(floorCardAppliesInMode('default'), true)            // manual → card
+  assert.equal(floorCardAppliesInMode('plan'), true)               // plan → card
+})
+
+test('an unknown or missing permission mode keeps the card (safe default)', () => {
+  assert.equal(floorCardAppliesInMode(undefined), true)
+  assert.equal(floorCardAppliesInMode(''), true)
+  assert.equal(floorCardAppliesInMode('something-new'), true)
+  assert.equal(floorCardAppliesInMode(42), true)
+})
+
+test('the owner can override which modes count as auto', () => {
+  // Override to also treat acceptEdits as auto → it stops carding; a mode left out of the override cards.
+  assert.equal(floorCardAppliesInMode('acceptEdits', ['acceptEdits', 'bypassPermissions']), false)
+  assert.equal(floorCardAppliesInMode('default', ['acceptEdits', 'bypassPermissions']), true)
+  // An explicit empty / all-junk array means "no mode is auto" → always card (suppression turned off).
+  assert.equal(floorCardAppliesInMode('bypassPermissions', []), true)
+  assert.equal(floorCardAppliesInMode('bypassPermissions', [' ', 7]), true)
+  // Only a non-array (unset) falls back to the default set.
+  assert.equal(floorCardAppliesInMode('bypassPermissions', null), false)
+  assert.equal(floorCardAppliesInMode('bypassPermissions', undefined), false)
+  // The default set is auto mode only.
+  assert.deepEqual(AUTO_PERMISSION_MODES, ['bypassPermissions'])
 })

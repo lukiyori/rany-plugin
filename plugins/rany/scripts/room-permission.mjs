@@ -13,6 +13,7 @@
  */
 import { createHash } from 'node:crypto'
 import { commandMatches, commandSegments } from './repo-rules.mjs'
+import { redactSecrets } from './redact.mjs'
 
 /**
  * Calls a runtime does not run unattended, with the words for WHY each one is being asked. This is the
@@ -44,6 +45,33 @@ export const RISKY = [
   { rule: 'npm publish', why: 'publishes a package the public installs' },
 ]
 
+/**
+ * Claude Code permission mode the owner calls "auto mode": the runtime runs without asking, so the owner has
+ * explicitly opted out of per-command prompts and the built-in standard-command FLOOR card below is unwanted
+ * friction on top of that choice. The owner (2026-11-26) named Claude's four modes — plan, manual (`default`),
+ * accept edits (`acceptEdits`) and auto mode — and said "auto mode'da sormayacak": only in auto mode is the
+ * card suppressed. "auto mode" is Claude Code's `bypassPermissions`; `acceptEdits` is a DIFFERENT mode (it
+ * auto-accepts edits but STILL prompts for commands), so the card is KEPT there, as in `default` and `plan`. A
+ * `.rany/rany.json` deny or ask-first rule is a deliberate PER-REPO choice and is NOT governed by this — it
+ * still applies in every mode.
+ */
+export const AUTO_PERMISSION_MODES = ['bypassPermissions']
+
+/**
+ * Should the built-in floor risky card be surfaced for this Claude Code permission mode? True in the manual /
+ * plan modes (and when the mode is unknown/absent — the safe default is to keep asking); false in an auto mode.
+ * `autoModes` overrides the default set, so an owner whose "auto" is a different string can tune it: ANY array is
+ * taken as given (an explicit `[]` means "no mode is auto" → always ask, i.e. turn the suppression off), and only
+ * a non-array (unset) falls back to the default. Only the standard-command floor is affected — never `.rany/`
+ * deny or ask-first.
+ */
+export function floorCardAppliesInMode(permissionMode, autoModes) {
+  const auto = Array.isArray(autoModes)
+    ? autoModes.filter((m) => typeof m === 'string' && m.trim()).map((m) => m.trim())
+    : AUTO_PERMISSION_MODES
+  return !auto.includes(typeof permissionMode === 'string' ? permissionMode : '')
+}
+
 /** The one shell segment that tripped a rule, so the card quotes what will run and not a 400-character line. */
 function segmentFor(rule, cmd) {
   const seg = commandSegments(cmd).find((s) => commandMatches(rule, s))
@@ -74,7 +102,10 @@ export function permissionCard({ what, cwd, why, source = 'runtime' }) {
   const because = source === 'rules'
     ? `the repository's rules say it needs your approval (${why})`
     : `it ${why}`
-  return `Run \`${what}\`${where}? Asking because ${because}. `
+  // The card quotes the command the owner is deciding about — but a password / token / connection string in it
+  // must never reach the room (owner, 2026-11-26, critical). The REAL command still runs on approval; only the
+  // SHOWN text is scrubbed.
+  return `Run \`${redactSecrets(what)}\`${where}? Asking because ${because}. `
     + 'Approve and it runs now; deny and it does not run at all.'
 }
 

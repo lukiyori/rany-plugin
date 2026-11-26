@@ -32,8 +32,9 @@ import { inviteCodeIn, inviteCodeToJoin } from './prompt-invite.mjs'
 import { seatTitleOf, titleSequence } from './seat-title.mjs'
 import { loadRepoRules, repoRulesLines, checkToolCall, refusalReason, sessionBrief } from './repo-rules.mjs'
 import { riskyCall, permissionCard, decisionOf, stillWaiting, callKey,
-  forgetTokens, isForgiven, mergeForgiven, parseForgetNote,
+  forgetTokens, isForgiven, mergeForgiven, parseForgetNote, floorCardAppliesInMode,
   normCommand, cardCommands, requestIdOf, cardAllows, cardAllowReason } from './room-permission.mjs'
+import { redactSecrets } from './redact.mjs'
 import { redact, describeTranscript } from './session-archive.mjs'
 import { knowledgeEntry, knowledgeBlock } from './seat-knowledge.mjs'
 import { gzipSync } from 'node:zlib'
@@ -185,7 +186,7 @@ function ensureScreenFeeder() {
   if (!existsSync(join(scripts, 'screen-feed.mjs'))) return
   mkdirSync(stable, { recursive: true })
   let changed = false
-  for (const f of ['screen-render.mjs', 'screen-feed.mjs']) { // the imported module first
+  for (const f of ['redact.mjs', 'screen-render.mjs', 'screen-feed.mjs']) { // imported modules first
     const next = readFileSync(join(scripts, f))
     let cur = null
     try { cur = readFileSync(join(stable, f)) } catch { /* first time */ }
@@ -1192,7 +1193,7 @@ async function decideInRoom(seat, { what, why, source, cwd, windowMinutes = 15, 
   // The seat's own tile says what it is waiting for: a seat that goes quiet at a prompt nobody can see is
   // the whole fault being fixed here, so the waiting itself is on screen.
   await postJson(`/personas/@self/rooms/${seat.agentId}/activity`,
-    { lines: [{ kind: 'tool', text: `Waiting for your approval: ${what}`.slice(0, 260) }] }, 2500)
+    { lines: [{ kind: 'tool', text: redactSecrets(`Waiting for your approval: ${what}`).slice(0, 260) }] }, 2500)
 
   const started = Date.now()
   let card = filed.body
@@ -1376,6 +1377,18 @@ function loadConfig() {
     // rany.json, or per shell with RANY_AUTO_REATTACH=1.
     seats: {
       autoReattach: envFlag(process.env.RANY_AUTO_REATTACH) ?? file.seats?.autoReattach ?? false,
+    },
+    // The built-in "standard command" floor card (git, rm -rf, a DB drop, …) is the terminal's own permission
+    // prompt moved into the room. In Claude's "auto mode" (`bypassPermissions`) the owner has opted out of
+    // per-command prompts entirely, so that card is unwanted friction — the owner (2026-11-26): "auto mode'da
+    // sormayacak", only there; accept edits / manual / plan keep it. `autoModes` is the set of Claude
+    // permission_mode values treated as auto (card suppressed); unset → the default in room-permission.mjs
+    // (just `bypassPermissions`). A `.rany/rany.json` deny or ask-first rule is a deliberate per-repo choice and
+    // still asks in every mode. Override per machine: {"approvals": {"autoModes": ["acceptEdits","bypassPermissions"]}}.
+    approvals: {
+      autoModes: Array.isArray(file.approvals?.autoModes)
+        ? file.approvals.autoModes.filter((m) => typeof m === 'string' && m.trim()).map((m) => m.trim())
+        : null,
     },
   }
 }
@@ -1900,13 +1913,15 @@ if (process.argv.includes('--rules-guard')) {
     // The owner watching the room sees a refusal on the seat's terminal line, not only the agent.
     if (seat && config.token && out.permissionDecision === 'deny')
       await postJson(`/personas/@self/rooms/${seat.agentId}/activity`,
-        { lines: [{ kind: 'tool', text: `Blocked by .rany/ (${hit.kind === 'deny' ? 'never' : 'ask first'}: ${hit.rule}) — ${hit.what}`.slice(0, 260) }] }, 2500)
+        { lines: [{ kind: 'tool', text: redactSecrets(`Blocked by .rany/ (${hit.kind === 'deny' ? 'never' : 'ask first'}: ${hit.rule}) — ${hit.what}`).slice(0, 260) }] }, 2500)
     process.exit(QUIET)
   }
 
   // The floor, for a seated session in ANY checkout — including one with no `.rany/` at all, which is where
   // this was lost: the runtime would have stopped and asked, and the room is where that question belongs.
-  if (seat && config.token) {
+  // Skipped in an auto permission mode (the owner runs under Claude Code's own guard there and does not want
+  // standard commands re-asked via RANY — 2026-11-26); a `.rany/` deny/ask-first rule above is unaffected.
+  if (seat && config.token && floorCardAppliesInMode(hook.permission_mode, config.approvals?.autoModes)) {
     const risky = riskyCall(hook)
     if (risky) {
       // "Never ask again" (ADR-115): a delete whose every target the developer already forgave on this machine
@@ -1937,7 +1952,7 @@ if (process.argv.includes('--beat')) {
     const hook = await readHookInput()
     noteCardCommands(hook)
     feedScreen(typeof hook.transcript_path === 'string' ? hook.transcript_path : null)
-    const line = toolLine(hook)
+    const line = redactSecrets(toolLine(hook))
     // A commit is also a BREADCRUMB in the room log (ADR-061): the room's history shows what was committed
     // where, without the agent having to remember to say so. A repeated sha is refused server-side.
     const crumb = commitCrumb(hook)
@@ -2047,7 +2062,7 @@ function commitCrumb(hook) {
   const repo = origin ? origin.replace(/^git@([^:]+):(.+)$/, 'https://$1/$2') : null
   return {
     kind: 'commit',
-    title: m[3].trim().slice(0, 200),
+    title: redactSecrets(m[3].trim()).slice(0, 200),
     refs: [{ type: 'commit', value: sha, repo, branch: m[1] }],
   }
 }

@@ -23,6 +23,7 @@ import { homedir } from 'node:os'
 import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
 import { screenLines, A } from './screen-render.mjs'
+import { redactSecrets } from './redact.mjs'
 
 const STATE = join(homedir(), '.rany-plugin')
 export const FEEDS = join(STATE, 'screen-feeds')
@@ -96,7 +97,9 @@ function drain(t) {
     if (!l.trim()) continue
     let row
     try { row = JSON.parse(l) } catch { continue }
-    const s = screenLines(row, t.state)
+    // Scrub secrets before any frame leaves the terminal for the room's Screen (owner, 2026-11-26, critical):
+    // command text, tool output and transcript all pass through here, so this is the Screen's redaction gate.
+    const s = redactSecrets(screenLines(row, t.state))
     if (s) out.push(s)
   }
   return out

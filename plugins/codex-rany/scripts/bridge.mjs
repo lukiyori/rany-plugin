@@ -27,8 +27,9 @@ import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
 import { roomRoutingContextLines } from './room-routing-context.mjs'
 import { loadRepoRules, repoRulesLines, checkToolCall, refusalReason, sessionBrief } from './repo-rules.mjs'
-import { sessionAnnouncement } from './seat-session.mjs'
+import { sessionAnnouncement, seatKnowsThread } from './seat-session.mjs'
 import { statusLines } from './bridge-status.mjs'
+import { redactSecrets } from './redact.mjs'
 
 /** Shared with the Claude Code plugin ON PURPOSE: a board belongs to a repository, not to whichever
  *  agent you happen to be running. Bind once, and both bridges route it the same way. */
@@ -721,10 +722,12 @@ function loadConfig() {
       ownerMentions: false,
       ...(file.wake ?? {}),
     },
-    // Off by default (ADR-068): opening a thread in a directory is not a request to work for a room.
-    // A seat wakes its thread for room traffic and a wake re-sends the whole accumulated context, so
-    // a seat taken on the strength of a `cd` spends the owner's budget inside whatever they actually
-    // opened that thread to do. Remembered seats are NAMED at start; `$rany-rejoin` takes one.
+    // Off by default, but it no longer means a reopened seat goes deaf (ADR-068, amended 2026-11-26): a
+    // remembered seat is reattached automatically when the SAME Codex thread that held it reopens
+    // (session-matched reattach, see reattachRememberedSeats) — that is not an unrelated session, so it carries
+    // none of the ADR-068 cost. This flag is the AGGRESSIVE opt-in on top: take every remembered seat of the
+    // repo whatever thread this is (a bare `cd` grabs them), which does spend room budget on a wake's re-sent
+    // context — so it stays off. Turn it on with `seats.autoReattach:true` in codex.json, or RANY_AUTO_REATTACH=1.
     seats: {
       autoReattach: envFlag(process.env.RANY_AUTO_REATTACH) ?? file.seats?.autoReattach ?? false,
     },
@@ -1042,7 +1045,12 @@ async function reattachRememberedSeats({ dir, threadId, deliberate = false }) {
     // A thread `rany-restore` opened for ONE seat carries RANY_REJOIN=<agentId>: that seat is taken as if
     // $rany-rejoin had been typed, and only that one.
     const wanted = String(process.env.RANY_REJOIN ?? '').trim()
-    if (!deliberate && !config.seats.autoReattach && id !== wanted) { offer.push([id, h]); continue }
+    // Session-matched reattach (ADR-068 as amended 2026-11-26): a seat comes back by itself when THIS thread
+    // is one that already held it — the same Codex session reopened, so it is not "an unrelated session" and
+    // carries none of the ADR-068 cost. A DIFFERENT thread opened in the same repo is only OFFERED, unless the
+    // owner opted into the aggressive `autoReattach` (take every remembered seat, whatever thread this is).
+    const knownHere = seatKnowsThread(h?.sessions, threadId)
+    if (!deliberate && !config.seats.autoReattach && id !== wanted && !knownHere) { offer.push([id, h]); continue }
     lines.push(await reattachSeat({ agentId: id, h, dir, threadId }))
   }
   // Named, not taken (ADR-068). One compact block, not the full identity brief a taken seat prints.
@@ -1184,7 +1192,7 @@ if (has('--ensure') || has('--ping') || has('--beat')) {
     const threadId = typeof hook.session_id === 'string' && hook.session_id ? hook.session_id : null
     const seats = threadId ? Object.entries(loadBindings())
       .filter(([, e]) => e && typeof e === 'object' && e.room && String(e.threadId) === threadId).map(([id]) => id) : []
-    const line = seats.length ? toolLine(hook) : null
+    const line = seats.length ? redactSecrets(toolLine(hook)) : null
     if (line) await Promise.all(seats.map((id) =>
       postJson(`/personas/@self/rooms/${id}/activity`, { lines: [{ kind: 'tool', text: line }] }, 4000)))
   }
@@ -1520,7 +1528,7 @@ function commitCrumbOf(row) {
   const origin = git('remote', 'get-url', 'origin')
   return {
     kind: 'commit',
-    title: m[3].trim().slice(0, 200),
+    title: redactSecrets(m[3].trim()).slice(0, 200),
     refs: [{
       type: 'commit', value: git('rev-parse', '--verify', `${m[2]}^{commit}`) ?? m[2], branch: m[1],
       repo: origin ? origin.replace(/^git@([^:]+):(.+)$/, 'https://$1/$2') : null,
@@ -1554,7 +1562,7 @@ async function pumpTail(agentId, t) {
         if (!l.trim()) continue
         let row
         try { row = JSON.parse(l) } catch { continue }
-        const s = screenLine(row)
+        const s = redactSecrets(screenLine(row))
         if (s) out.push(s)
         const crumb = Date.parse(row.timestamp ?? '') >= t.since ? commitCrumbOf(row) : null
         if (crumb) await postJson(`/personas/@self/rooms/${agentId}/log`, crumb, 4000)
@@ -1732,7 +1740,10 @@ async function route(type, d) {
   // Work rooms (ADR-046): each event names the seats' BOARDS; the thread that bound one of them wakes.
   if (type === 'PERSONA_ROOM_MESSAGE' || type === 'PERSONA_ROOM_UPDATED' || type === 'PERSONA_ROOM_DECISION'
     || type === 'PERSONA_ROOM_ANSWER') {
-    if (config.wake.rooms === false) return null
+    if (config.wake.rooms === false) {
+      logRoute(type, { channelId: d.channelId }, 'skip (wake.rooms off)')
+      return null
+    }
     // Record a handoff whoever it is for: the card's assignment event, which follows, must not wake a
     // board-bound thread either (see taskSeatsFile).
     if (type === 'PERSONA_ROOM_UPDATED' && d.change === 'task_assigned') noteTaskSeat(d.taskId, d.agentId)
@@ -1832,7 +1843,14 @@ async function route(type, d) {
     }
   }
 
-  if (type !== 'MESSAGE_CREATED') return null
+  if (type !== 'MESSAGE_CREATED') {
+    // Not a type this bridge routes. Rare — the gateway only dispatches what the persona subscribed to —
+    // so log it rather than drop it in silence: "events arrive and nothing happens" was undiagnosable
+    // precisely because an unrouted event left no trace (a seat that goes deaf after a restart looks the
+    // same as one the gateway never addressed).
+    logRoute(type, { channelId: d.channelId, guildId: d.guildId }, 'skip (event type not routed)')
+    return null
+  }
 
   const recipients = Array.isArray(d.recipientIds) ? d.recipientIds : []
   const mentions = Array.isArray(d.mentions) ? d.mentions : []

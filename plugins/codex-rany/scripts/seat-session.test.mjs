@@ -3,7 +3,7 @@
 // ROOM-12: a seat that is answering is not shown as asleep.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { sessionAnnouncement } from './seat-session.mjs'
+import { sessionAnnouncement, seatKnowsThread } from './seat-session.mjs'
 
 test('a seat that has never reported a conversation reports this one', () => {
   assert.equal(sessionAnnouncement(undefined, 'a'), 'new')
@@ -35,4 +35,28 @@ test('no conversation id yet means nothing to say', () => {
 
 test('ids are compared as text, not by identity', () => {
   assert.equal(sessionAnnouncement([{ id: 123 }], '123'), 'none')
+})
+
+// ADR-068 (amended): session-matched reattach — the SAME thread reopening retakes its own seat, an
+// unrelated thread does not.
+test('seatKnowsThread: the same thread that held the seat is recognised', () => {
+  assert.equal(seatKnowsThread([{ id: 't1' }], 't1'), true)
+  // Not necessarily the newest the seat remembers — a resumed older thread still counts.
+  assert.equal(seatKnowsThread([{ id: 'newest' }, { id: 't-old' }], 't-old'), true)
+})
+
+test('seatKnowsThread: a thread that never held the seat is not recognised (no auto-take → offered)', () => {
+  assert.equal(seatKnowsThread([{ id: 't1' }], 'other'), false)
+  assert.equal(seatKnowsThread([], 't1'), false)
+  assert.equal(seatKnowsThread(undefined, 't1'), false)
+})
+
+test('seatKnowsThread: no live thread id yet means no match', () => {
+  assert.equal(seatKnowsThread([{ id: 't1' }], null), false)
+  assert.equal(seatKnowsThread([{ id: 't1' }], undefined), false)
+})
+
+test('seatKnowsThread: ids compared as text, malformed entries ignored', () => {
+  assert.equal(seatKnowsThread([{ id: 123 }], '123'), true)
+  assert.equal(seatKnowsThread([null, {}, { id: 't1' }], 't1'), true)
 })
